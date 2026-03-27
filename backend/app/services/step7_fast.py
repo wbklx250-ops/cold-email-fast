@@ -48,41 +48,46 @@ async def _run_powershell(script: str, timeout: int = 300) -> Dict[str, Any]:
     env["MSAL_DISABLE_WAM"] = "true"
     env["EXO_DISABLE_WAM"] = "true"
 
-    proc = await asyncio.create_subprocess_exec(
-        "pwsh", "-NoProfile", "-NonInteractive", "-Command", script,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=env,
-    )
-
+    import tempfile as _tf
+    with _tf.NamedTemporaryFile(mode="w", suffix=".ps1", delete=False, dir="/tmp") as _f:
+        _f.write(script)
+        _script_path = _f.name
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.communicate()
-        return {"success": False, "error": "PowerShell script timed out"}
-
-    stdout_text = stdout.decode("utf-8", errors="replace").strip()
-    stderr_text = stderr.decode("utf-8", errors="replace").strip()
-
-    if stderr_text:
-        logger.debug("PS stderr: %s", stderr_text[:500])
-
-    # Try to parse JSON from stdout (last JSON object wins)
-    try:
-        for line in reversed(stdout_text.split("\n")):
-            line = line.strip()
-            if line.startswith("{"):
-                return json.loads(line)
-    except (json.JSONDecodeError, ValueError):
-        pass
-
-    return {
-        "success": proc.returncode == 0,
-        "stdout": stdout_text,
-        "stderr": stderr_text,
-        "returncode": proc.returncode,
-    }
+        proc = await asyncio.create_subprocess_exec(
+            "pwsh", "-NoProfile", "-NonInteractive", "-File", _script_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            return {"success": False, "error": "PowerShell script timed out"}
+        stdout_text = stdout.decode("utf-8", errors="replace").strip()
+        stderr_text = stderr.decode("utf-8", errors="replace").strip()
+        if stderr_text:
+            logger.debug("PS stderr: %s", stderr_text[:500])
+        # Try to parse JSON from stdout (last JSON object wins)
+        try:
+            for line in reversed(stdout_text.split("\n")):
+                line = line.strip()
+                if line.startswith("{"):
+                    return json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            pass
+        return {
+            "success": proc.returncode == 0,
+            "stdout": stdout_text,
+            "stderr": stderr_text,
+            "returncode": proc.returncode,
+        }
+    finally:
+        try:
+            os.unlink(_script_path)
+        except Exception:
+            pass
 
 
 async def process_domain_fast(
@@ -290,7 +295,7 @@ try {{
                 f'Password="{_ps_escape(mb["password"])}"; '
                 f'Index={mailbox_start_index + i} }}'
             )
-        mailbox_array = ",`n".join(mailbox_entries)
+        mailbox_array = ",\n".join(mailbox_entries)
 
         # ONE PowerShell script that does EVERYTHING: connect, create, delegate, passwords
         master_script = _build_master_script(
@@ -524,15 +529,23 @@ Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue
 Write-Host "STEP5_GRAPH"
 try {{
     Import-Module Microsoft.Graph.Users -ErrorAction Stop
-    $sp2 = ConvertTo-SecureString "{escaped_password}" -AsPlainText -Force
-    $cred2 = New-Object System.Management.Automation.PSCredential("{escaped_email}", $sp2)
-    Connect-MgGraph -Credential $cred2 -NoWelcome -ErrorAction Stop
+    $body = @{{
+        grant_type = "password"
+        client_id = "1950a258-227b-4e31-a9cf-717495945fc2"
+        scope = "https://graph.microsoft.com/.default"
+        username = "{escaped_email}"
+        password = "{escaped_password}"
+    }}
+    $tenantDomain = "{escaped_email}".Split("@")[1]
+    $tok = Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$tenantDomain/oauth2/v2.0/token" -Body $body -ErrorAction Stop
+    $sec = ConvertTo-SecureString $tok.access_token -AsPlainText -Force
+    Connect-MgGraph -AccessToken $sec -NoWelcome -ErrorAction Stop
 
     foreach ($mb in $mailboxes) {{
         try {{
-            $user = Get-MgUser -Filter "mail eq ''$($mb.Email)''" -ErrorAction SilentlyContinue
+            $user = Get-MgUser -Filter "mail eq '$($mb.Email)'" -ErrorAction SilentlyContinue
             if (-not $user) {{
-                $user = Get-MgUser -Filter "userPrincipalName eq ''$($mb.Email)''" -ErrorAction SilentlyContinue
+                $user = Get-MgUser -Filter "userPrincipalName eq '$($mb.Email)'" -ErrorAction SilentlyContinue
             }}
             if ($user) {{
                 $params = @{{
