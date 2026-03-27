@@ -918,122 +918,190 @@ async def run_step6_for_tenant(tenant_id: UUID, domain_id: UUID = None, domain_i
                 raise
 
         # ========================================
-        # PHASE 2: Admin UI (Selenium) - Set passwords, enable accounts
+        # PHASE 2: Set passwords via Graph PowerShell (replaces slow Admin UI)
+        # Falls back to Admin UI if Graph fails
         # ========================================
         if not powershell_succeeded:
-            logger.info("[%s] Phase 2: Skipped Admin UI - PowerShell did not succeed", domain)
-            update_progress(tid_str, "set_passwords", "complete", "Skipped Admin UI - PowerShell not successful")
+            logger.info("[%s] Phase 2: Skipped password setting - PowerShell did not succeed", domain)
+            update_progress(tid_str, "set_passwords", "complete", "Skipped - PowerShell not successful")
         else:
-            # PROACTIVE BROWSER HEALTH CHECK before Phase 2
-            if not is_browser_alive(driver):
-                logger.warning("[%s] Browser died after Phase 1 - creating fresh Chrome instance for Phase 2", domain)
-                try:
-                    cleanup_driver(driver)
-                except Exception:
-                    pass
-                driver = create_driver(headless=settings.step6_headless)
-                if driver is None:
-                    raise Exception("Failed to create fresh Chrome browser for Phase 2")
-                _login_with_mfa(
-                    driver=driver,
-                    admin_email=tenant_data["admin_email"],
-                    admin_password=tenant_data["admin_password"],
-                    totp_secret=tenant_data["totp_secret"],
-                    domain=domain,
-                )
-                user_ops = UserOpsSelenium(driver, domain)
-                logger.info("[%s] Fresh Chrome instance created for Phase 2", domain)
-
             try:
                 if not needs_admin_ui:
-                    logger.info("[%s] Passwords already set, skipping Admin UI", domain)
+                    logger.info("[%s] Passwords already set, skipping Phase 2", domain)
                     update_progress(tid_str, "set_passwords", "complete", "Passwords already set")
                 else:
-                    logger.info("[%s] === PHASE 2: Admin UI STARTING ===", domain)
-                    logger.info("[%s] Phase 2: Admin UI operations", tid_str[:8])
-                    logger.info("[%s] passwords_set=%s", domain, tenant_data["step6_passwords_set"])
-                    update_progress(tid_str, "set_passwords", "in_progress", "Setting passwords via Admin UI")
+                    graph_password_success = False
 
-                    admin_ui_results = None
-                    admin_ui_retry_count = 0
-                    MAX_ADMIN_UI_RETRIES = 2
+                    # --- PRIMARY: Graph PowerShell (fast, ~1 min) ---
+                    if ps_service and ps_service.connected:
+                        logger.info("[%s] === PHASE 2: Graph PowerShell passwords STARTING ===", domain)
+                        update_progress(tid_str, "set_passwords", "in_progress", "Setting passwords via Graph API (fast)")
 
-                    while admin_ui_retry_count < MAX_ADMIN_UI_RETRIES and admin_ui_results is None:
                         try:
-                            admin_ui_retry_count += 1
-                            if admin_ui_retry_count > 1:
-                                update_progress(tid_str, "set_passwords", "in_progress",
-                                    f"Retrying Admin UI (attempt {admin_ui_retry_count}/{MAX_ADMIN_UI_RETRIES})")
-                                if driver:
-                                    try:
-                                        cleanup_driver(driver)
-                                    except Exception:
-                                        pass
-                                    driver = None
-                                driver = create_driver(headless=settings.step6_headless)
-                                _login_with_mfa(
-                                    driver=driver,
-                                    admin_email=tenant_data["admin_email"],
-                                    admin_password=tenant_data["admin_password"],
-                                    totp_secret=tenant_data["totp_secret"],
-                                    domain=domain,
+                            graph_pw_results = await ps_service.set_mailbox_passwords(
+                                mailboxes=mailbox_data_payload,
+                                admin_email=tenant_data["admin_email"],
+                                admin_password=tenant_data["admin_password"],
+                            )
+
+                            graph_updated = graph_pw_results.get("updated", [])
+                            graph_failed = graph_pw_results.get("failed", [])
+                            password_set_count = len(graph_updated)
+                            accounts_enabled_count = password_set_count  # Graph enables accounts too
+
+                            logger.info("[%s] Graph password results: set=%s, failed=%s",
+                                        domain, password_set_count, len(graph_failed))
+
+                            if graph_failed:
+                                failed_preview = "; ".join(
+                                    f"{item.get('email')}: {item.get('error')}" for item in graph_failed[:5]
                                 )
-                                user_ops = UserOpsSelenium(driver, domain)
+                                logger.warning("[%s] Graph password failures (first 5): %s", domain, failed_preview)
 
-                            admin_ui_results = user_ops.set_passwords_and_enable_via_admin_ui(
-                                password="#Sendemails1",
-                                exclude_users=[f"me1@{domain}"],
-                                expected_count=len(mailbox_list),
-                            )
-                        except Exception as admin_ui_error:
-                            error_str = str(admin_ui_error)
-                            is_connection_error = (
-                                "HTTPConnectionPool" in error_str or
-                                "NewConnectionError" in error_str or
-                                "target machine actively refused" in error_str or
-                                "session" in error_str.lower() and "delete" in error_str.lower()
-                            )
-                            if is_connection_error and admin_ui_retry_count < MAX_ADMIN_UI_RETRIES:
-                                logger.warning("[%s] Admin UI browser error (attempt %s/%s): %s - retrying...",
-                                               domain, admin_ui_retry_count, MAX_ADMIN_UI_RETRIES, error_str[:100])
-                                await asyncio.sleep(5)
+                            # Consider success if we set at least 90% of passwords
+                            threshold = int(len(mailbox_data_payload) * 0.9)
+                            if password_set_count >= threshold:
+                                graph_password_success = True
+                                logger.info("[%s] Graph passwords succeeded: %s/%s (threshold=%s)",
+                                            domain, password_set_count, len(mailbox_data_payload), threshold)
                             else:
-                                raise
+                                logger.warning("[%s] Graph passwords below threshold: %s/%s (threshold=%s) - will fallback to Admin UI",
+                                               domain, password_set_count, len(mailbox_data_payload), threshold)
 
-                    if admin_ui_results is None:
-                        raise Exception(f"Admin UI failed after {MAX_ADMIN_UI_RETRIES} attempts")
+                            # Save Graph results to DB
+                            async def _save_graph_password_progress(fresh_db):
+                                tenant_to_update = await fresh_db.get(Tenant, tenant_id_val)
+                                if tenant_to_update:
+                                    tenant_to_update.step6_passwords_set = password_set_count
+                                    tenant_to_update.step6_accounts_enabled = accounts_enabled_count
 
-                    if admin_ui_results.get("errors"):
-                        logger.warning("[%s] Admin UI errors: %s", domain, "; ".join(admin_ui_results["errors"]))
+                                if password_set_count > 0:
+                                    # Mark individual mailboxes that were updated
+                                    for email in graph_updated:
+                                        await fresh_db.execute(
+                                            update(Mailbox).where(Mailbox.email == email)
+                                            .values(password_set=True, account_enabled=True, password="#Sendemails1")
+                                        )
 
-                    password_set_count = admin_ui_results.get("passwords_set", 0)
-                    accounts_enabled_count = admin_ui_results.get("accounts_enabled", 0)
-
-                    logger.info("[%s] Saving Admin UI progress to database...", domain)
-
-                    async def _save_admin_ui_progress(fresh_db):
-                        tenant_to_update = await fresh_db.get(Tenant, tenant_id_val)
-                        if tenant_to_update:
-                            tenant_to_update.step6_passwords_set = password_set_count
-                            tenant_to_update.step6_accounts_enabled = accounts_enabled_count
-
-                        total_mb_count = len(mailbox_list)
-                        if password_set_count > 0:
-                            logger.info("[%s] Marking all %s mailboxes as password_set=True (Admin UI reported %s successes)",
-                                        domain, total_mb_count, password_set_count)
-                            await fresh_db.execute(
-                                update(Mailbox).where(Mailbox.tenant_id == tenant_id_val)
-                                .values(password_set=True, account_enabled=True, password="#Sendemails1")
+                            await save_to_db_with_retry(
+                                _save_graph_password_progress, description=f"{domain} graph passwords",
                             )
-                        else:
-                            logger.warning("[%s] Admin UI reported 0 passwords set", domain)
+                            logger.info("[%s] CHECKPOINT: Graph password progress saved: passwords_set=%s, accounts_enabled=%s",
+                                        domain, password_set_count, accounts_enabled_count)
+                            if graph_password_success:
+                                logger.info("[%s] === PHASE 2: Graph PowerShell passwords DONE ===", domain)
 
-                    await save_to_db_with_retry(
-                        _save_admin_ui_progress, description=f"{domain} admin UI progress",
-                    )
-                    logger.info("[%s] CHECKPOINT: Admin UI progress saved: passwords_set=%s, accounts_enabled=%s",
-                                domain, password_set_count, accounts_enabled_count)
-                    logger.info("[%s] === PHASE 2: Admin UI DONE ===", domain)
+                        except Exception as graph_err:
+                            logger.warning("[%s] Graph password setting failed: %s - falling back to Admin UI",
+                                           domain, _format_error(graph_err))
+                    else:
+                        logger.warning("[%s] PowerShell not connected for Graph passwords - falling back to Admin UI", domain)
+
+                    # --- FALLBACK: Admin UI (slow, ~5 min) ---
+                    if not graph_password_success:
+                        logger.info("[%s] === PHASE 2 FALLBACK: Admin UI STARTING ===", domain)
+                        update_progress(tid_str, "set_passwords", "in_progress", "Setting passwords via Admin UI (fallback)")
+
+                        # PROACTIVE BROWSER HEALTH CHECK before Admin UI fallback
+                        if not is_browser_alive(driver):
+                            logger.warning("[%s] Browser died - creating fresh Chrome instance for Admin UI fallback", domain)
+                            try:
+                                cleanup_driver(driver)
+                            except Exception:
+                                pass
+                            driver = create_driver(headless=settings.step6_headless)
+                            if driver is None:
+                                raise Exception("Failed to create fresh Chrome browser for Admin UI fallback")
+                            _login_with_mfa(
+                                driver=driver,
+                                admin_email=tenant_data["admin_email"],
+                                admin_password=tenant_data["admin_password"],
+                                totp_secret=tenant_data["totp_secret"],
+                                domain=domain,
+                            )
+                            user_ops = UserOpsSelenium(driver, domain)
+                            logger.info("[%s] Fresh Chrome instance created for Admin UI fallback", domain)
+
+                        admin_ui_results = None
+                        admin_ui_retry_count = 0
+                        MAX_ADMIN_UI_RETRIES = 2
+
+                        while admin_ui_retry_count < MAX_ADMIN_UI_RETRIES and admin_ui_results is None:
+                            try:
+                                admin_ui_retry_count += 1
+                                if admin_ui_retry_count > 1:
+                                    update_progress(tid_str, "set_passwords", "in_progress",
+                                        f"Retrying Admin UI (attempt {admin_ui_retry_count}/{MAX_ADMIN_UI_RETRIES})")
+                                    if driver:
+                                        try:
+                                            cleanup_driver(driver)
+                                        except Exception:
+                                            pass
+                                        driver = None
+                                    driver = create_driver(headless=settings.step6_headless)
+                                    _login_with_mfa(
+                                        driver=driver,
+                                        admin_email=tenant_data["admin_email"],
+                                        admin_password=tenant_data["admin_password"],
+                                        totp_secret=tenant_data["totp_secret"],
+                                        domain=domain,
+                                    )
+                                    user_ops = UserOpsSelenium(driver, domain)
+
+                                admin_ui_results = user_ops.set_passwords_and_enable_via_admin_ui(
+                                    password="#Sendemails1",
+                                    exclude_users=[f"me1@{domain}"],
+                                    expected_count=len(mailbox_list),
+                                )
+                            except Exception as admin_ui_error:
+                                error_str = str(admin_ui_error)
+                                is_connection_error = (
+                                    "HTTPConnectionPool" in error_str or
+                                    "NewConnectionError" in error_str or
+                                    "target machine actively refused" in error_str or
+                                    "session" in error_str.lower() and "delete" in error_str.lower()
+                                )
+                                if is_connection_error and admin_ui_retry_count < MAX_ADMIN_UI_RETRIES:
+                                    logger.warning("[%s] Admin UI browser error (attempt %s/%s): %s - retrying...",
+                                                   domain, admin_ui_retry_count, MAX_ADMIN_UI_RETRIES, error_str[:100])
+                                    await asyncio.sleep(5)
+                                else:
+                                    raise
+
+                        if admin_ui_results is None:
+                            raise Exception(f"Admin UI fallback failed after {MAX_ADMIN_UI_RETRIES} attempts")
+
+                        if admin_ui_results.get("errors"):
+                            logger.warning("[%s] Admin UI errors: %s", domain, "; ".join(admin_ui_results["errors"]))
+
+                        password_set_count = admin_ui_results.get("passwords_set", 0)
+                        accounts_enabled_count = admin_ui_results.get("accounts_enabled", 0)
+
+                        logger.info("[%s] Saving Admin UI fallback progress to database...", domain)
+
+                        async def _save_admin_ui_progress(fresh_db):
+                            tenant_to_update = await fresh_db.get(Tenant, tenant_id_val)
+                            if tenant_to_update:
+                                tenant_to_update.step6_passwords_set = password_set_count
+                                tenant_to_update.step6_accounts_enabled = accounts_enabled_count
+
+                            total_mb_count = len(mailbox_list)
+                            if password_set_count > 0:
+                                logger.info("[%s] Marking all %s mailboxes as password_set=True (Admin UI reported %s successes)",
+                                            domain, total_mb_count, password_set_count)
+                                await fresh_db.execute(
+                                    update(Mailbox).where(Mailbox.tenant_id == tenant_id_val)
+                                    .values(password_set=True, account_enabled=True, password="#Sendemails1")
+                                )
+                            else:
+                                logger.warning("[%s] Admin UI reported 0 passwords set", domain)
+
+                        await save_to_db_with_retry(
+                            _save_admin_ui_progress, description=f"{domain} admin UI progress",
+                        )
+                        logger.info("[%s] CHECKPOINT: Admin UI progress saved: passwords_set=%s, accounts_enabled=%s",
+                                    domain, password_set_count, accounts_enabled_count)
+                        logger.info("[%s] === PHASE 2 FALLBACK: Admin UI DONE ===", domain)
             except Exception as e:
                 logger.error("[%s] PHASE 2 FAILED: %s", domain, _format_error(e))
                 import traceback
