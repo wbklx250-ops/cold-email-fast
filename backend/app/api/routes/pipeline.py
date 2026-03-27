@@ -1748,7 +1748,13 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                 batch = await db.get(SetupBatch, batch_id)
                 display_name = f"{batch.persona_first_name or ''} {batch.persona_last_name or ''}".strip() if batch else ""
 
-            from app.services.azure_step6 import run_step6_for_batch as run_mailbox_creation
+            # Use fast mode (no Chrome, ROPC auth) — falls back to Selenium mode if ROPC fails
+            try:
+                from app.services.step7_fast import run_step7_fast as run_mailbox_creation
+                logger.info("Step 7: Using FAST MODE (no Chrome)")
+            except ImportError:
+                from app.services.azure_step6 import run_step6_for_batch as run_mailbox_creation
+                logger.info("Step 7: Using standard mode (Selenium)")
 
             for attempt in range(MAX_PIPELINE_RETRIES + 1):
                 if await _check_paused_or_stopped(batch_id):

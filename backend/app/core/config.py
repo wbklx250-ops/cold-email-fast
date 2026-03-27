@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     # Controls how many browser instances run simultaneously
     # 6 workers × ~300MB per Chrome = ~1.8GB RAM needed
     # Railway has upgraded memory to support this
-    max_parallel_browsers: int = 7
+    max_parallel_browsers: int = 20
     
     # Step 5 Browser Display Mode
     # False = visible browsers (useful for debugging/testing)
