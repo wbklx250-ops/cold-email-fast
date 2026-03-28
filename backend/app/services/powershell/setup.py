@@ -19,6 +19,7 @@ REQUIRED_MODULES = [
     "ExchangeOnlineManagement",
     "Microsoft.Graph.Authentication",
     "Microsoft.Graph.Users",
+    "Microsoft.Graph.Identity.DirectoryManagement",
 ]
 
 # Auto-detect PowerShell path based on OS

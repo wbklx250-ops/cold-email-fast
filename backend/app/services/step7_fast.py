@@ -144,6 +144,7 @@ $ErrorActionPreference = "Stop"
 try {{
     Import-Module Microsoft.Graph.Users -ErrorAction Stop
     Import-Module Microsoft.Graph.Users.Actions -ErrorAction SilentlyContinue
+    Import-Module Microsoft.Graph.Identity.DirectoryManagement -ErrorAction SilentlyContinue
 
     $sp = ConvertTo-SecureString "{escaped_password}" -AsPlainText -Force
     $cred = New-Object System.Management.Automation.PSCredential("{escaped_email}", $sp)
