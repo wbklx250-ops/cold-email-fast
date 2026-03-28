@@ -147,7 +147,17 @@ try {{
 
     $sp = ConvertTo-SecureString "{escaped_password}" -AsPlainText -Force
     $cred = New-Object System.Management.Automation.PSCredential("{escaped_email}", $sp)
-    Connect-MgGraph -Credential $cred -NoWelcome -ErrorAction Stop
+    $body2 = @{{
+        grant_type = "password"
+        client_id = "1950a258-227b-4e31-a9cf-717495945fc2"
+        scope = "https://graph.microsoft.com/.default"
+        username = "{escaped_email}"
+        password = "{escaped_password}"
+    }}
+    $td = "{escaped_email}".Split("@")[1]
+    $tok2 = Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$td/oauth2/v2.0/token" -Body $body2 -ErrorAction Stop
+    $sec2 = ConvertTo-SecureString $tok2.access_token -AsPlainText -Force
+    Connect-MgGraph -AccessToken $sec2 -NoWelcome -ErrorAction Stop
 
     # Check if user already exists
     $existing = Get-MgUser -Filter "userPrincipalName eq ''me1@{domain}''" -ErrorAction SilentlyContinue
