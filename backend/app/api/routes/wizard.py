@@ -7166,6 +7166,11 @@ async def csv_sequencer_upload(
                         continue
                     mailbox_list.append({"id": mb_id, "email": mb["email"], "password": mb["password"]})
                 
+                logger.info(
+                    f"[CSV Upload] Pre-filter complete: {len(mailbox_list)} to upload, "
+                    f"{csv_upload_jobs[job_id]['skipped']} skipped (existing)"
+                )
+                
                 if not mailbox_list:
                     csv_upload_jobs[job_id]["status"] = "completed"
                     csv_upload_jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()

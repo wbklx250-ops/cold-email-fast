@@ -105,14 +105,16 @@ class InstantlyAPI:
 
     def account_exists(self, email: str) -> bool:
         """Check if a specific account exists in Instantly.
-        Uses cache first, then does a targeted search if not cached."""
+        Uses cache authoritatively when loaded (load_all_accounts fetches ALL
+        accounts via pagination, so the cache is complete). Only falls back to
+        an individual API call when the cache has not been populated yet."""
         email_lower = email.strip().lower()
 
-        # Check cache
-        if self._cache_loaded and email_lower in self._known_emails:
-            return True
+        # When cache is loaded it is authoritative — no per-email API call needed
+        if self._cache_loaded:
+            return email_lower in self._known_emails
 
-        # Targeted search via API
+        # Cache not loaded — do a targeted API lookup
         try:
             r = self.session.get(
                 f"{self.BASE}/accounts/{email}",
