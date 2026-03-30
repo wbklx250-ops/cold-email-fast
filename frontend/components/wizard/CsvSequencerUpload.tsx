@@ -46,7 +46,9 @@ export default function CsvSequencerUpload() {
   const [isRunning, setIsRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState(false);
+  const [lostJob, setLostJob] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const notFoundCountRef = useRef(0);
 
   const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -78,14 +80,24 @@ export default function CsvSequencerUpload() {
   // Poll job status
   useEffect(() => {
     if (!jobId || !isRunning) return;
+    notFoundCountRef.current = 0;
     const poll = async () => {
       try {
         const res = await fetch(`${API_BASE}/api/v1/wizard/sequencer/csv-upload/${jobId}/status`);
         if (res.ok) {
+          notFoundCountRef.current = 0;
           const data = await res.json();
           setJob(data);
           if (data.status === "completed" || data.status === "failed") {
             setIsRunning(false);
+          }
+        } else if (res.status === 404) {
+          notFoundCountRef.current += 1;
+          // After 3 consecutive 404s (15s), the job is truly gone (e.g. server restarted)
+          if (notFoundCountRef.current >= 3) {
+            setIsRunning(false);
+            setLostJob(true);
+            setError("Upload job was lost — the server may have restarted. Please start a new upload.");
           }
         }
       } catch (_) {}
@@ -176,6 +188,8 @@ export default function CsvSequencerUpload() {
     setJob(null);
     setIsRunning(false);
     setError(null);
+    setLostJob(false);
+    notFoundCountRef.current = 0;
   };
 
   const allComplete = job && job.status === "completed";
@@ -354,10 +368,17 @@ export default function CsvSequencerUpload() {
             </div>
           )}
 
-          {job.status === "failed" && (
+          {job.status === "failed" && !lostJob && (
             <div className="rounded-lg border border-red-200 bg-red-50 p-4">
               <p className="text-lg font-semibold text-red-700">Upload Failed</p>
               <p className="mt-1 text-sm text-red-600">{job.errors?.join(", ") || "An error occurred during upload."}</p>
+            </div>
+          )}
+
+          {lostJob && (
+            <div className="rounded-lg border border-amber-300 bg-amber-50 p-4">
+              <p className="text-lg font-semibold text-amber-700">⚠️ Upload Job Lost</p>
+              <p className="mt-1 text-sm text-amber-600">The server appears to have restarted and the upload job tracking was lost. The upload may have partially completed — enable &quot;Skip already-uploaded emails&quot; when re-uploading to avoid duplicates.</p>
             </div>
           )}
 
