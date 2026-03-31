@@ -31,14 +31,17 @@ def create_driver(headless: bool = True) -> webdriver.Chrome:
     opts.add_argument("--disable-infobars")
     opts.add_argument("--disable-notifications")
     opts.add_argument("--disable-popup-blocking")
+    opts.add_argument("--disable-features=ThirdPartyCookieBlocking")
 
-    # Disable password manager popups
+    # Disable password manager popups & allow third-party cookies (required for Microsoft OAuth)
     opts.add_experimental_option(
         "prefs",
         {
             "credentials_enable_service": False,
             "profile.password_manager_enabled": False,
             "profile.password_manager_leak_detection": False,
+            "profile.cookie_controls_mode": 0,
+            "profile.block_third_party_cookies": False,
         },
     )
 

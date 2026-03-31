@@ -197,6 +197,13 @@ class InstantlyUploader:
             chrome_options.add_argument("--disable-backgrounding-occluded-windows")
             chrome_options.add_argument("--disable-renderer-backgrounding")
             chrome_options.add_argument("--window-size=1920,1080")
+            chrome_options.add_argument("--disable-features=ThirdPartyCookieBlocking")
+            
+            # Allow third-party cookies (required for Microsoft OAuth)
+            chrome_options.add_experimental_option("prefs", {
+                "profile.cookie_controls_mode": 0,
+                "profile.block_third_party_cookies": False,
+            })
             
             # For parallel processing, offset window positions
             if self.worker_id and isinstance(self.worker_id, int):

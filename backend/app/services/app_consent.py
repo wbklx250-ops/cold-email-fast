@@ -137,12 +137,15 @@ class AppConsentGranter:
             opts.add_argument("--disable-gpu")
             opts.add_argument("--window-size=1920,1080")
             opts.add_argument("--disable-blink-features=AutomationControlled")
+            opts.add_argument("--disable-features=ThirdPartyCookieBlocking")
             opts.add_experimental_option("excludeSwitches", ["enable-automation"])
 
             prefs = {
                 "credentials_enable_service": False,
                 "profile.password_manager_enabled": False,
                 "profile.password_manager_leak_detection": False,
+                "profile.cookie_controls_mode": 0,
+                "profile.block_third_party_cookies": False,
             }
             opts.add_experimental_option("prefs", prefs)
 
