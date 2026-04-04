@@ -149,6 +149,24 @@ def upgrade() -> None:
     # Mailbox tracking
     op.execute("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS mailboxes_generated BOOLEAN NOT NULL DEFAULT FALSE;")
     op.execute("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS mailboxes_created BOOLEAN NOT NULL DEFAULT FALSE;")
+
+    # Fix mailboxes_created if it was created as integer by an earlier migration (001)
+    op.execute("""
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'tenants'
+                AND column_name = 'mailboxes_created'
+                AND data_type = 'integer'
+            ) THEN
+                ALTER TABLE tenants ALTER COLUMN mailboxes_created
+                TYPE BOOLEAN USING CASE WHEN mailboxes_created = 0 THEN FALSE ELSE TRUE END;
+                ALTER TABLE tenants ALTER COLUMN mailboxes_created SET DEFAULT FALSE;
+            END IF;
+        END $$;
+    """)
+
     op.execute("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS mailboxes_created_at TIMESTAMP WITH TIME ZONE;")
     op.execute("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS delegation_completed BOOLEAN NOT NULL DEFAULT FALSE;")
     op.execute("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS mailbox_count INTEGER NOT NULL DEFAULT 0;")
