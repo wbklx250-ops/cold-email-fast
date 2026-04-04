@@ -267,7 +267,7 @@ async def create_and_start(
     # Initialize pipeline job tracking
     job_id = str(batch_id)
     pipeline_jobs[job_id] = {
-        "status": "running",
+        "status": "starting",
         "batch_id": job_id,
         "batch_name": batch_name,
         "started_at": datetime.utcnow().isoformat(),
