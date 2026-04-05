@@ -300,6 +300,21 @@ class InstantlyUploader:
         except Exception:
             pass
         
+    def dismiss_featurebase_overlay(self):
+        """Remove Featurebase and other overlay widgets that block clicks on Instantly UI."""
+        try:
+            self.driver.execute_script("""
+                document.querySelectorAll('[class*="featurebase"]').forEach(el => el.remove());
+                document.querySelectorAll('[class*="fb-"]').forEach(el => el.remove());
+                document.querySelectorAll('[class*="intercom"]').forEach(el => el.remove());
+            """)
+        except Exception:
+            pass
+
+    def _js_click(self, element):
+        """Click an element via JavaScript to bypass overlay interception."""
+        self.driver.execute_script("arguments[0].click();", element)
+
     def random_delay(self, min_sec: float = 1.0, max_sec: float = 3.0):
         """Add random delay to mimic human behavior"""
         delay = random.uniform(min_sec, max_sec)
@@ -336,9 +351,12 @@ class InstantlyUploader:
             logger.info(f"[Worker {self.worker_id}] Password entered")
             self.random_delay(1, 2)
             
+            # Dismiss Featurebase overlay before clicking
+            self.dismiss_featurebase_overlay()
+            
             # Click login button
             login_button = self.driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
-            login_button.click()
+            self._js_click(login_button)
             logger.info(f"[Worker {self.worker_id}] Login button clicked")
             
             # Wait for redirect to dashboard (URL should change)
@@ -417,6 +435,9 @@ class InstantlyUploader:
                 self.driver.get("https://app.instantly.ai/app/accounts")
                 self.random_delay(2, 3)
             
+            # Dismiss Featurebase overlay before interacting
+            self.dismiss_featurebase_overlay()
+            
             logger.info(f"[Worker {self.worker_id}] Checking if {account_email} already exists...")
             
             # Only check visible text elements containing @ (actual email displays)
@@ -467,6 +488,9 @@ class InstantlyUploader:
                 self.driver.get("https://app.instantly.ai/app/accounts")
                 self.random_delay(2, 3)
             
+            # Dismiss Featurebase overlay before any interaction
+            self.dismiss_featurebase_overlay()
+            
             # Step 1: Click Add New button on accounts page
             logger.info(f"[Worker {self.worker_id}] Looking for 'Add New' button...")
             
@@ -497,16 +521,18 @@ class InstantlyUploader:
                 # If button not found, try to navigate directly to connect page
                 logger.warning(f"[Worker {self.worker_id}] Add New button not found, navigating directly to connect page")
                 self.driver.get("https://app.instantly.ai/app/account/connect")
+                self.dismiss_featurebase_overlay()
             else:
                 self.driver.execute_script("arguments[0].scrollIntoView(true);", add_new_button)
                 self.random_delay()
-                add_new_button.click()
+                self._js_click(add_new_button)
                 logger.info(f"[Worker {self.worker_id}] Clicked 'Add New' button")
             
             # Wait for provider selection page
             WebDriverWait(self.driver, 10).until(
                 EC.url_contains("app.instantly.ai/app/account/connect")
             )
+            self.dismiss_featurebase_overlay()
             self.random_delay(2, 3)
             
             # Step 2: Click Microsoft option
@@ -534,12 +560,16 @@ class InstantlyUploader:
                 except TimeoutException:
                     continue
             
+            # Dismiss Featurebase overlay before clicking
+            self.dismiss_featurebase_overlay()
+            
             if microsoft_element:
-                microsoft_element.click()
+                self._js_click(microsoft_element)
                 logger.info(f"[Worker {self.worker_id}] Selected Microsoft provider")
             else:
                 # If Microsoft option not found, navigate directly
                 self.driver.get("https://app.instantly.ai/app/account/connect?provider=microsoft")
+                self.dismiss_featurebase_overlay()
                 logger.info(f"[Worker {self.worker_id}] Navigated directly to Microsoft provider page")
             
             self.random_delay(2, 3)
@@ -569,7 +599,8 @@ class InstantlyUploader:
             if smtp_button:
                 self.driver.execute_script("arguments[0].scrollIntoView(true);", smtp_button)
                 self.random_delay()
-                smtp_button.click()
+                self.dismiss_featurebase_overlay()
+                self._js_click(smtp_button)
                 logger.info(f"[Worker {self.worker_id}] Clicked SMTP confirmation button")
             
             # Step 4: Handle OAuth popup
@@ -585,6 +616,7 @@ class InstantlyUploader:
             if "accounts" not in self.driver.current_url:
                 self.driver.get("https://app.instantly.ai/app/accounts")
                 self.random_delay(3, 5)
+            self.dismiss_featurebase_overlay()
             
             # Look for the account in the list (more thorough check)
             try:
@@ -717,7 +749,7 @@ class InstantlyUploader:
                             continue
                     
                     if use_another_button:
-                        use_another_button.click()
+                        self._js_click(use_another_button)
                         logger.info(f"[Worker {self.worker_id}] Clicked 'Use another account'")
                         self.random_delay(2, 3)
             except Exception as e:
@@ -768,7 +800,7 @@ class InstantlyUploader:
                     continue
             
             if next_button:
-                next_button.click()
+                self._js_click(next_button)
                 logger.info(f"[Worker {self.worker_id}] Email entered, clicked Next")
             
             self.random_delay(2, 3)
@@ -828,7 +860,7 @@ class InstantlyUploader:
                     continue
             
             if signin_button:
-                signin_button.click()
+                self._js_click(signin_button)
                 logger.info(f"[Worker {self.worker_id}] Password entered, clicked Sign in")
             
             self.random_delay(3, 5)
@@ -871,7 +903,7 @@ class InstantlyUploader:
                     try:
                         checkbox = self.driver.find_element(By.ID, "KmsiCheckboxField")
                         if checkbox.is_selected():
-                            checkbox.click()
+                            self._js_click(checkbox)
                             logger.info(f"[Worker {self.worker_id}] Unchecked 'Don't show this again' checkbox")
                     except:
                         pass
@@ -895,7 +927,7 @@ class InstantlyUploader:
                             continue
                     
                     if no_button:
-                        no_button.click()
+                        self._js_click(no_button)
                         logger.info(f"[Worker {self.worker_id}] Clicked 'No' on 'Stay signed in?' prompt")
                         self.random_delay(2, 3)
                 else:
@@ -926,7 +958,7 @@ class InstantlyUploader:
                         continue
                 
                 if accept_button:
-                    accept_button.click()
+                    self._js_click(accept_button)
                     logger.info(f"[Worker {self.worker_id}] Clicked Accept - OAuth flow complete")
                 else:
                     logger.info(f"[Worker {self.worker_id}] No Accept button found - OAuth may have completed automatically")
