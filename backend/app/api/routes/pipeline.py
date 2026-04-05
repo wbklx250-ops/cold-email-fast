@@ -41,6 +41,8 @@ pipeline_jobs = {}
 
 MAX_PIPELINE_RETRIES = 4   # Max retries per tenant per step
 STEP5_MAX_WORKERS = 2      # Max parallel browsers for first login (Railway memory limit)
+STEP6_MAX_WORKERS = 2      # Max parallel browsers for M365 domain setup (Railway memory limit)
+STEP6_CHUNK_SIZE = 2        # Process 2 domains at a time, kill all browsers between chunks
 
 def _fmt_err(exc: Exception) -> str:
     """Format exception for logging — never returns empty string."""
@@ -1623,12 +1625,18 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                 pipeline_jobs[job_id]["steps"]["5"]["status"] = "completed"
 
         # ================================================================
-        # STEP 6: M365 Domain Setup + DKIM (WITH AUTO-RETRY)
+        # STEP 6: M365 Domain Setup + DKIM (WITH AUTO-RETRY, CHUNKED)
+        # Processes domains in chunks of STEP6_CHUNK_SIZE with full browser
+        # cleanup between chunks to prevent Chrome memory exhaustion (OOM).
+        # Matches Step 5's proven chunking pattern.
         # ================================================================
         if start_from_step <= 6:
           try:
+            # === THOROUGH PRE-STEP-6 CLEANUP ===
+            # Step 5 may leave zombie Chrome processes that eat into Step 6's memory budget
+            logger.info("Step 6: Pre-flight browser cleanup (killing any zombie Chrome from Step 5)...")
             kill_all_browsers()
-            await asyncio.sleep(3)
+            await asyncio.sleep(5)  # Extra time for OS to reclaim memory
             await _update_pipeline(batch_id, 6, "running", "Adding domains to M365 and configuring DKIM...")
             await log_activity(batch_id, 6, STEP_NAMES[6], status="started")
 
@@ -1659,7 +1667,11 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                     f"M365 setup attempt {attempt + 1} — {pending_m365} domains remaining...")
 
                 try:
-                    m365_result = await run_m365_setup(batch_id)
+                    m365_result = await run_m365_setup(
+                        batch_id,
+                        max_workers=STEP6_MAX_WORKERS,
+                        chunk_size=STEP6_CHUNK_SIZE,
+                    )
                     logger.info(f"Step 6 attempt {attempt + 1} result: {m365_result.get('processed', 0)} processed, {m365_result.get('failed', 0)} failed")
                 except Exception as e:
                     logger.error(f"Step 6 attempt {attempt + 1} failed: {e}")

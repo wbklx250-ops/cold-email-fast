@@ -268,7 +268,8 @@ async def _save_step6_result(domain_data: dict, selenium_result: dict):
 # ============================================================
 
 async def run_step5_for_batch(
-    batch_id: UUID, on_progress=None
+    batch_id: UUID, on_progress=None,
+    max_workers: int = None, chunk_size: int = None,
 ) -> Dict[str, Any]:
     """
     WORKER QUEUE for Step 6 — N workers pick up domains as they finish.
@@ -286,9 +287,13 @@ async def run_step5_for_batch(
     
     MAX_PIPELINE_RETRIES = 4  # Match pipeline.py constant
     
+    # Use caller-specified limits, or fall back to settings
+    effective_workers = max_workers if max_workers is not None else MAX_PARALLEL_BROWSERS
+    effective_chunk_size = chunk_size  # None means "no chunking, old behaviour"
+    
     # ============ WORKER QUEUE INDICATOR ============
     logger.info("=" * 60)
-    logger.info(f"=== WORKER QUEUE: {MAX_PARALLEL_BROWSERS} workers ===")
+    logger.info(f"=== WORKER QUEUE: {effective_workers} workers, chunk_size={effective_chunk_size} ===")
     logger.info("=" * 60)
     
     # ============================================================
@@ -374,17 +379,18 @@ async def run_step5_for_batch(
     total = len(domains_data)
     logger.info(f"Phase 1 complete: {total} domains ready for processing")
     logger.info(f"============================================================")
-    logger.info(f"=== WORKER QUEUE: {MAX_PARALLEL_BROWSERS} workers, {total} domains ===")
+    logger.info(f"=== WORKER QUEUE: {effective_workers} workers, chunk_size={effective_chunk_size}, {total} domains ===")
     logger.info(f"============================================================")
     
     # ============================================================
-    # PHASE 2: WORKER QUEUE — Semaphore controls parallelism
-    # Each domain: run Selenium → immediately save to DB
+    # PHASE 2: CHUNKED WORKER QUEUE — Process N domains at a time,
+    # kill all browsers between chunks to prevent memory exhaustion.
+    # Matches Step 5's proven pattern in pipeline.py.
     # ============================================================
     
-    logger.info(f"Phase 2: Starting worker queue with {MAX_PARALLEL_BROWSERS} workers...")
+    logger.info(f"Phase 2: Starting worker queue with {effective_workers} workers, chunk_size={effective_chunk_size}...")
     
-    semaphore = asyncio.Semaphore(MAX_PARALLEL_BROWSERS)
+    semaphore = asyncio.Semaphore(effective_workers)
     processed = 0
     failed = 0
     successful = 0
@@ -451,15 +457,39 @@ async def run_step5_for_batch(
                     failed += 1
                     processed += 1
     
-    # Launch all — semaphore controls actual parallelism
-    tasks = []
-    for i, domain_data in enumerate(domains_data):
-        # Small stagger between initial launches to avoid login detection
-        if i > 0 and i % MAX_PARALLEL_BROWSERS == 0:
-            await asyncio.sleep(3)
-        tasks.append(asyncio.create_task(process_one(domain_data, i)))
-    
-    await asyncio.gather(*tasks, return_exceptions=True)
+    if effective_chunk_size is not None and effective_chunk_size > 0:
+        # === CHUNKED MODE: Process N domains → kill all browsers → next N ===
+        # This prevents Chrome memory exhaustion on Railway (the whole point of this fix).
+        from app.services.selenium.browser import kill_all_browsers
+        
+        total_chunks = (total + effective_chunk_size - 1) // effective_chunk_size
+        
+        for chunk_idx in range(0, total, effective_chunk_size):
+            chunk = domains_data[chunk_idx:chunk_idx + effective_chunk_size]
+            chunk_num = (chunk_idx // effective_chunk_size) + 1
+            
+            logger.info(f"Step 6: Processing chunk {chunk_num}/{total_chunks} ({len(chunk)} domains)")
+            
+            tasks = []
+            for i, domain_data in enumerate(chunk):
+                tasks.append(asyncio.create_task(process_one(domain_data, chunk_idx + i)))
+            
+            await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # === CRITICAL: Kill ALL Chrome between chunks to reclaim memory ===
+            logger.info(f"Step 6: Cleaning up browsers after chunk {chunk_num}/{total_chunks}...")
+            kill_all_browsers()
+            await asyncio.sleep(5)  # Let OS reclaim memory
+    else:
+        # === LEGACY MODE: Launch all with semaphore (no chunking) ===
+        tasks = []
+        for i, domain_data in enumerate(domains_data):
+            # Small stagger between initial launches to avoid login detection
+            if i > 0 and i % effective_workers == 0:
+                await asyncio.sleep(3)
+            tasks.append(asyncio.create_task(process_one(domain_data, i)))
+        
+        await asyncio.gather(*tasks, return_exceptions=True)
     
     summary["successful"] = successful
     summary["failed"] = failed
