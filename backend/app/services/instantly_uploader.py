@@ -2,9 +2,9 @@
 Instantly.ai Uploader Service
 Automates uploading mailboxes to Instantly.ai via Selenium OAuth flow
 
-Enhanced with robust selector fallbacks, account existence checking,
-session clearing, improved OAuth flow handling, API verification,
-crash recovery, and preventive browser restarts.
+Ported from the hardened standalone script that is proven to work.
+Uses native clicks with scrollIntoView, image blocking to prevent
+overlay widgets from loading, and API-verified success.
 """
 import asyncio
 import logging
@@ -21,13 +21,10 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.action_chains import ActionChains
 from selenium.common.exceptions import (
     TimeoutException, WebDriverException, NoSuchElementException,
-    ElementClickInterceptedException, NoSuchWindowException,
-    InvalidSessionIdException
+    NoSuchWindowException, InvalidSessionIdException
 )
-from selenium_stealth import stealth
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -105,16 +102,12 @@ class InstantlyAPI:
 
     def account_exists(self, email: str) -> bool:
         """Check if a specific account exists in Instantly.
-        Uses cache authoritatively when loaded (load_all_accounts fetches ALL
-        accounts via pagination, so the cache is complete). Only falls back to
-        an individual API call when the cache has not been populated yet."""
+        Uses cache first, then does a targeted search if not cached."""
         email_lower = email.strip().lower()
 
-        # When cache is loaded it is authoritative — no per-email API call needed
-        if self._cache_loaded:
-            return email_lower in self._known_emails
+        if self._cache_loaded and email_lower in self._known_emails:
+            return True
 
-        # Cache not loaded — do a targeted API lookup
         try:
             r = self.session.get(
                 f"{self.BASE}/accounts/{email}",
@@ -152,16 +145,20 @@ class InstantlyAPI:
         return False
 
 
+# ---------------------------------------------------------------------------
+# Core Uploader — ported from working standalone script
+# ---------------------------------------------------------------------------
+
 class InstantlyUploader:
-    """Handles Selenium automation for uploading mailboxes to Instantly.ai"""
+    """Handles Selenium automation for uploading mailboxes to Instantly.ai.
     
+    Ported from the proven standalone instantly_automation_working.py script.
+    Uses native clicks with scrollIntoView, image blocking, and no
+    selenium_stealth to avoid overlay/widget interference.
+    """
+
     RESTART_EVERY_N = 30  # Preventive browser restart after N accounts
-    DEFAULT_USER_AGENT = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/121.0.0.0 Safari/537.36"
-    )
-    
+
     def __init__(
         self,
         instantly_email: str,
@@ -174,97 +171,131 @@ class InstantlyUploader:
         self.api = api
         self.worker_id = worker_id
         self.driver: Optional[webdriver.Chrome] = None
-        self.wait: Optional[WebDriverWait] = None
         self._accounts_since_restart = 0
-        
+
+    # ---- Browser Setup ----
+
     def setup_driver(self) -> bool:
-        """Initialize Chrome WebDriver with appropriate options"""
+        """Initialize Chrome WebDriver — matches working standalone script."""
         try:
-            chrome_options = Options()
-            chrome_options.binary_location = os.getenv("CHROME_PATH", "/usr/bin/chromium")
-            chrome_options.add_argument("--disable-popup-blocking")
-            chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-            chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-            chrome_options.add_experimental_option('useAutomationExtension', False)
-            chrome_options.add_argument(f"--user-agent={self.DEFAULT_USER_AGENT}")
-            
-            # Add options to improve stability
-            chrome_options.add_argument("--disable-extensions")
-            chrome_options.add_argument("--no-sandbox")
-            chrome_options.add_argument("--disable-dev-shm-usage")
-            chrome_options.add_argument("--disable-gpu")
-            chrome_options.add_argument("--disable-background-timer-throttling")
-            chrome_options.add_argument("--disable-backgrounding-occluded-windows")
-            chrome_options.add_argument("--disable-renderer-backgrounding")
-            chrome_options.add_argument("--window-size=1920,1080")
-            chrome_options.add_argument("--disable-features=ThirdPartyCookieBlocking")
-            
-            # Allow third-party cookies (required for Microsoft OAuth)
-            chrome_options.add_experimental_option("prefs", {
+            opts = Options()
+            # Use Railway chromium path if set, otherwise system default
+            chrome_path = os.getenv("CHROME_PATH")
+            if chrome_path:
+                opts.binary_location = chrome_path
+
+            opts.add_argument("--disable-popup-blocking")
+            opts.add_argument("--disable-blink-features=AutomationControlled")
+            opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+            opts.add_experimental_option("useAutomationExtension", False)
+            opts.add_argument("--disable-extensions")
+            opts.add_argument("--no-sandbox")
+            opts.add_argument("--disable-dev-shm-usage")
+            opts.add_argument("--disable-gpu")
+            opts.add_argument("--disable-background-timer-throttling")
+            opts.add_argument("--disable-backgrounding-occluded-windows")
+            opts.add_argument("--disable-renderer-backgrounding")
+            opts.add_argument("--window-size=1920,1080")
+            opts.add_argument("--disable-features=ThirdPartyCookieBlocking")
+
+            # Block images — prevents Featurebase/Intercom overlay widgets from loading
+            opts.add_experimental_option("prefs", {
+                "profile.managed_default_content_settings.images": 2,
                 "profile.cookie_controls_mode": 0,
                 "profile.block_third_party_cookies": False,
             })
-            
-            # For parallel processing, offset window positions
+
+            # Always headless on Railway
+            opts.add_argument("--headless=new")
+
             if self.worker_id and isinstance(self.worker_id, int):
                 offset = self.worker_id * 50
-                chrome_options.add_argument(f"--window-position={offset},{offset}")
-            
-            # Always run headless (deployed to Railway)
-            chrome_options.add_argument("--headless=new")
-            
-            self.driver = webdriver.Chrome(options=chrome_options)
+                opts.add_argument(f"--window-position={offset},{offset}")
+
+            self.driver = webdriver.Chrome(options=opts)
             self.driver.execute_script(
                 "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
             )
-            stealth(
-                self.driver,
-                languages=["en-US", "en"],
-                vendor="Google Inc.",
-                platform="Win32",
-                webgl_vendor="Intel Inc.",
-                renderer="Intel Iris OpenGL Engine",
-                fix_hairline=True,
-            )
             self.driver.set_page_load_timeout(60)
-            self.wait = WebDriverWait(self.driver, 30)
             self._accounts_since_restart = 0
-            
-            logger.info(f"[Worker {self.worker_id}] Chrome driver initialized (headless=True)")
+
+            logger.info(f"[Worker {self.worker_id}] Chrome initialized (headless, images blocked)")
             return True
         except Exception as e:
             logger.error(f"[Worker {self.worker_id}] Chrome setup failed: {e}")
             return False
-    
+
     def is_driver_alive(self) -> bool:
-        """Check if browser driver is still responsive"""
+        """Check if browser driver is still responsive."""
         try:
             _ = self.driver.current_url
             return True
-        except (InvalidSessionIdException, WebDriverException):
-            return False
         except Exception:
             return False
-    
+
     def restart_browser(self) -> bool:
-        """Restart browser and re-login to Instantly"""
+        """Restart browser and re-login to Instantly."""
         logger.info(f"[Worker {self.worker_id}] Restarting browser...")
         try:
             self.driver.quit()
         except Exception:
             pass
         self.driver = None
-        
+
         if not self.setup_driver():
             return False
         if not self.login_to_instantly():
             return False
-        
+
         logger.info(f"[Worker {self.worker_id}] Browser restarted successfully")
         return True
-    
+
+    def cleanup(self):
+        """Clean up WebDriver resources."""
+        if self.driver:
+            try:
+                self.driver.quit()
+                logger.info(f"[Worker {self.worker_id}] Chrome driver closed")
+            except Exception as e:
+                logger.error(f"[Worker {self.worker_id}] Error closing driver: {e}")
+
+    # ---- Helpers (from working script) ----
+
+    def delay(self, lo: float = 0.5, hi: float = 2.0):
+        """Random delay."""
+        time.sleep(random.uniform(lo, hi))
+
+    def _find_and_click(self, selectors, timeout=5, label="element") -> bool:
+        """Try multiple selectors, scrollIntoView, then native click.
+        This is the proven click pattern from the working standalone script."""
+        for sel_type, sel in selectors:
+            try:
+                el = WebDriverWait(self.driver, timeout).until(
+                    EC.element_to_be_clickable((sel_type, sel))
+                )
+                self.driver.execute_script("arguments[0].scrollIntoView(true);", el)
+                self.delay(0.3, 0.6)
+                el.click()
+                return True
+            except (TimeoutException, NoSuchElementException):
+                continue
+        return False
+
+    def _find_input(self, selectors, timeout=10):
+        """Try multiple selectors to find an input field."""
+        for sel_type, sel in selectors:
+            try:
+                return WebDriverWait(self.driver, timeout).until(
+                    EC.presence_of_element_located((sel_type, sel))
+                )
+            except (TimeoutException, NoSuchElementException):
+                continue
+        return None
+
+    # ---- Cookies ----
+
     def clear_microsoft_cookies(self):
-        """Clear ONLY Microsoft cookies, preserving Instantly session"""
+        """Clear ONLY Microsoft cookies, preserving Instantly session."""
         try:
             cookies = self.driver.get_cookies()
             ms_domains = [
@@ -281,7 +312,7 @@ class InstantlyUploader:
                     except Exception:
                         pass
             if deleted > 0:
-                logger.info(f"[Worker {self.worker_id}] Cleared {deleted} Microsoft cookies")
+                logger.info(f"[Worker {self.worker_id}] Cleared {deleted} MS cookies")
         except Exception:
             pass
 
@@ -299,742 +330,267 @@ class InstantlyUploader:
                 self.driver.switch_to.window(main)
         except Exception:
             pass
-        
-    def dismiss_featurebase_overlay(self):
-        """Remove Featurebase and other overlay widgets that block clicks on Instantly UI."""
-        try:
-            self.driver.execute_script("""
-                document.querySelectorAll('[class*="featurebase"]').forEach(el => el.remove());
-                document.querySelectorAll('[class*="fb-"]').forEach(el => el.remove());
-                document.querySelectorAll('[class*="intercom"]').forEach(el => el.remove());
-            """)
-        except Exception:
-            pass
 
-    def _js_click(self, element):
-        """Click an element via JavaScript to bypass overlay interception."""
-        self.driver.execute_script("arguments[0].click();", element)
+    # ---- Instantly Login (from working script) ----
 
-    def random_delay(self, min_sec: float = 1.0, max_sec: float = 3.0):
-        """Add random delay to mimic human behavior"""
-        delay = random.uniform(min_sec, max_sec)
-        time.sleep(delay)
-        
     def login_to_instantly(self) -> bool:
-        """
-        Log in to Instantly.ai
-        Returns True if successful, False otherwise
-        """
+        """Log in to Instantly.ai — matches working standalone script."""
         try:
-            logger.info(f"[Worker {self.worker_id}] Navigating to Instantly.ai login...")
+            logger.info(f"[Worker {self.worker_id}] Logging into Instantly...")
             self.driver.get("https://app.instantly.ai/auth/login")
-            self.random_delay(2, 4)
+            self.delay(2, 3)
 
-            # Wait for and fill email (Cloudflare challenge aware)
-            if not self._wait_for_login_form(timeout=30):
-                logger.error(f"[Worker {self.worker_id}] Login form not detected (possible Cloudflare challenge)")
-                self.log_page_diagnostics("login_form_missing")
-                return False
-
-            email_input = self.driver.find_element(
-                By.XPATH, "//input[@placeholder='Email']"
+            ef = WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.XPATH, "//input[@placeholder='Email']"))
             )
-            email_input.clear()
-            email_input.send_keys(self.instantly_email)
-            logger.info(f"[Worker {self.worker_id}] Email entered")
-            self.random_delay(1, 2)
-            
-            # Fill password
-            password_input = self.driver.find_element(By.XPATH, "//input[@placeholder='Password']")
-            password_input.clear()
-            password_input.send_keys(self.instantly_password)
-            logger.info(f"[Worker {self.worker_id}] Password entered")
-            self.random_delay(1, 2)
-            
-            # Dismiss Featurebase overlay before clicking
-            self.dismiss_featurebase_overlay()
-            
-            # Click login button
-            login_button = self.driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
-            self._js_click(login_button)
-            logger.info(f"[Worker {self.worker_id}] Login button clicked")
-            
-            # Wait for redirect to dashboard (URL should change)
-            self.wait.until(lambda d: "auth/login" not in d.current_url.lower())
-            logger.info(f"[Worker {self.worker_id}] Successfully logged in to Instantly.ai")
-            self.random_delay(2, 3)
+            ef.clear()
+            ef.send_keys(self.instantly_email)
+            self.delay(0.5, 1)
+
+            pf = self.driver.find_element(By.XPATH, "//input[@placeholder='Password']")
+            pf.clear()
+            pf.send_keys(self.instantly_password)
+            self.delay(0.5, 1)
+
+            self.driver.find_element(By.XPATH, "//button[@type='submit']").click()
+            WebDriverWait(self.driver, 15).until(lambda d: "auth/login" not in d.current_url)
+
+            # Navigate to accounts page and wait (important for subsequent operations)
+            self.driver.get("https://app.instantly.ai/app/accounts")
+            WebDriverWait(self.driver, 10).until(EC.url_contains("app.instantly.ai/app/accounts"))
+            self.delay(2, 3)
+
+            logger.info(f"[Worker {self.worker_id}] Logged into Instantly")
             return True
-            
         except Exception as e:
-            logger.error(f"[Worker {self.worker_id}] Failed to login to Instantly: {str(e)}")
-            self.log_page_diagnostics("login_failed")
+            logger.error(f"[Worker {self.worker_id}] Login failed: {e}")
             return False
-            
-    def save_debug_screenshot(self, label="debug"):
-        """Log diagnostics for debugging headless issues (URL, title, source snippet, screenshot base64)"""
-        self.log_page_diagnostics(label=label)
 
-    def log_page_diagnostics(self, label: str = "debug"):
-        """Log key diagnostics for Railway logs when headless issues occur."""
-        try:
-            current_url = self.driver.current_url if self.driver else "unknown"
-            title = self.driver.title if self.driver else "unknown"
-            page_source = self.driver.page_source if self.driver else ""
-            snippet = page_source[:500].replace("\n", " ")
-            screenshot_b64 = ""
-            try:
-                if self.driver:
-                    screenshot_b64 = self.driver.get_screenshot_as_base64()
-            except Exception:
-                screenshot_b64 = ""
+    # ---- Add Account via OAuth (from working script) ----
 
-            logger.info(
-                f"[Worker {self.worker_id}] Diagnostics ({label}) -> URL: {current_url} | Title: {title}"
-            )
-            if snippet:
-                logger.info(
-                    f"[Worker {self.worker_id}] Page source snippet ({label}): {snippet}"
-                )
-            if screenshot_b64:
-                logger.info(
-                    f"[Worker {self.worker_id}] Screenshot base64 ({label}): {screenshot_b64[:5000]}"
-                )
-        except Exception as e:
-            logger.warning(f"[Worker {self.worker_id}] Could not log diagnostics: {e}")
-
-    def _wait_for_login_form(self, timeout: int = 30) -> bool:
-        """Wait for login form, allowing Cloudflare challenge to pass if present."""
-        end_time = time.time() + timeout
-        while time.time() < end_time:
-            try:
-                email_input = self.driver.find_element(
-                    By.XPATH, "//input[@placeholder='Email']"
-                )
-                if email_input:
-                    return True
-            except NoSuchElementException:
-                pass
-
-            try:
-                title = (self.driver.title or "").lower()
-                if "just a moment" in title or "cloudflare" in title:
-                    time.sleep(2)
-                    continue
-            except Exception:
-                pass
-
-            time.sleep(1)
-
-        return False
-    
-    def check_account_exists(self, account_email: str) -> bool:
-        """Check if an account already exists in Instantly.ai (visible text only)"""
-        try:
-            # Ensure we're on the accounts page
-            if "accounts" not in self.driver.current_url:
-                self.driver.get("https://app.instantly.ai/app/accounts")
-                self.random_delay(2, 3)
-            
-            # Dismiss Featurebase overlay before interacting
-            self.dismiss_featurebase_overlay()
-            
-            logger.info(f"[Worker {self.worker_id}] Checking if {account_email} already exists...")
-            
-            # Only check visible text elements containing @ (actual email displays)
-            # Do NOT check page_source - it includes JS/CSS and causes false positives
-            try:
-                email_elements = self.driver.find_elements(By.XPATH, "//*[contains(text(), '@')]")
-                for element in email_elements:
-                    try:
-                        element_text = element.text.strip().lower()
-                        if account_email.lower() == element_text or account_email.lower() in element_text:
-                            logger.info(f"[Worker {self.worker_id}] Account {account_email} already exists")
-                            return True
-                    except:
-                        continue
-            except Exception:
-                pass
-            
-            logger.info(f"[Worker {self.worker_id}] Account {account_email} not found - proceeding with addition")
-            return False
-            
-        except Exception as e:
-            logger.warning(f"[Worker {self.worker_id}] Error checking if account exists: {e} - proceeding with addition")
-            self.log_page_diagnostics("login_failed")
-            return False
-    
     def add_microsoft_account(
         self,
         email: str,
         password: str,
         mailbox_id: str
     ) -> Dict[str, Any]:
-        """
-        Add a Microsoft account to Instantly.ai via OAuth
-        
-        Args:
-            email: Microsoft email address
-            password: Microsoft password
-            mailbox_id: Mailbox UUID for tracking
-            
-        Returns:
-            Dict with 'success' (bool), 'error' (str or None)
-        """
+        """Add a Microsoft account to Instantly.ai via OAuth.
+        Ported from the working standalone script's add_account method."""
         try:
             logger.info(f"[Worker {self.worker_id}] Starting upload for {email} (ID: {mailbox_id})")
-            
-            # Ensure we're on the accounts page
-            if "accounts" not in self.driver.current_url:
+
+            # Ensure we're on accounts page (not connect page from previous run)
+            current = self.driver.current_url
+            if "accounts" not in current or "connect" in current:
                 self.driver.get("https://app.instantly.ai/app/accounts")
-                self.random_delay(2, 3)
-            
-            # Dismiss Featurebase overlay before any interaction
-            self.dismiss_featurebase_overlay()
-            
-            # Step 1: Click Add New button on accounts page
-            logger.info(f"[Worker {self.worker_id}] Looking for 'Add New' button...")
-            
-            # Try multiple selectors for the Add New button
-            add_new_selectors = [
+                self.delay(2, 3)
+
+            # Click Add New
+            if not self._find_and_click([
                 (By.XPATH, "//button[contains(text(), 'Add New')]"),
                 (By.XPATH, "//button[contains(text(), 'Add new')]"),
-                (By.XPATH, "//button[contains(text(), 'ADD NEW')]"),
-                (By.XPATH, "//a[contains(text(), 'Add New')]"),
-                (By.XPATH, "//a[contains(text(), 'Add new')]"),
                 (By.XPATH, "//*[contains(text(), 'Add') and contains(text(), 'New')]"),
-                (By.CSS_SELECTOR, "button[data-testid*='add']"),
-                (By.CSS_SELECTOR, "a[href*='connect']")
-            ]
-            
-            add_new_button = None
-            for selector_type, selector in add_new_selectors:
-                try:
-                    add_new_button = WebDriverWait(self.driver, 5).until(
-                        EC.element_to_be_clickable((selector_type, selector))
-                    )
-                    logger.info(f"[Worker {self.worker_id}] Found Add New button using: {selector}")
-                    break
-                except TimeoutException:
-                    continue
-            
-            if not add_new_button:
-                # If button not found, try to navigate directly to connect page
-                logger.warning(f"[Worker {self.worker_id}] Add New button not found, navigating directly to connect page")
+            ], timeout=10):
                 self.driver.get("https://app.instantly.ai/app/account/connect")
-                self.dismiss_featurebase_overlay()
-            else:
-                self.driver.execute_script("arguments[0].scrollIntoView(true);", add_new_button)
-                self.random_delay()
-                self._js_click(add_new_button)
-                logger.info(f"[Worker {self.worker_id}] Clicked 'Add New' button")
-            
-            # Wait for provider selection page
+
             WebDriverWait(self.driver, 10).until(
                 EC.url_contains("app.instantly.ai/app/account/connect")
             )
-            self.dismiss_featurebase_overlay()
-            self.random_delay(2, 3)
-            
-            # Step 2: Click Microsoft option
-            logger.info(f"[Worker {self.worker_id}] Selecting Microsoft provider...")
-            
-            # Try multiple selectors for Microsoft option
-            microsoft_selectors = [
+            self.delay(1, 2)
+
+            # Select Microsoft
+            if not self._find_and_click([
                 (By.XPATH, "//p[text()='Microsoft']"),
                 (By.XPATH, "//div[contains(text(), 'Microsoft')]"),
-                (By.XPATH, "//div[contains(text(), 'Office 365')]"),
-                (By.XPATH, "//*[contains(text(), 'Office 365 / Outlook')]"),
-                (By.XPATH, "//*[contains(text(), 'Outlook')]"),
-                (By.CSS_SELECTOR, "[data-provider='microsoft']"),
-                (By.CSS_SELECTOR, "[data-testid*='microsoft']")
-            ]
-            
-            microsoft_element = None
-            for selector_type, selector in microsoft_selectors:
-                try:
-                    microsoft_element = WebDriverWait(self.driver, 5).until(
-                        EC.element_to_be_clickable((selector_type, selector))
-                    )
-                    logger.info(f"[Worker {self.worker_id}] Found Microsoft option using: {selector}")
-                    break
-                except TimeoutException:
-                    continue
-            
-            # Dismiss Featurebase overlay before clicking
-            self.dismiss_featurebase_overlay()
-            
-            if microsoft_element:
-                self._js_click(microsoft_element)
-                logger.info(f"[Worker {self.worker_id}] Selected Microsoft provider")
-            else:
-                # If Microsoft option not found, navigate directly
-                self.driver.get("https://app.instantly.ai/app/account/connect?provider=microsoft")
-                self.dismiss_featurebase_overlay()
-                logger.info(f"[Worker {self.worker_id}] Navigated directly to Microsoft provider page")
-            
-            self.random_delay(2, 3)
-            
-            # Step 3: Click "Yes, SMTP has been enabled" button
-            logger.info(f"[Worker {self.worker_id}] Looking for SMTP confirmation button...")
-            
-            smtp_selectors = [
+                (By.XPATH, "//*[contains(text(), 'Office 365')]"),
+            ], timeout=8):
+                return {"success": False, "error": "Microsoft option not found"}
+            self.delay(1, 2)
+
+            # SMTP confirm
+            self._find_and_click([
                 (By.XPATH, "//button[contains(text(), 'Yes, SMTP has been enabled')]"),
                 (By.XPATH, "//button[contains(text(), 'SMTP has been enabled')]"),
                 (By.XPATH, "//button[contains(text(), 'Continue')]"),
-                (By.XPATH, "//button[contains(text(), 'Next')]"),
-                (By.CSS_SELECTOR, "button[type='submit']")
-            ]
-            
-            smtp_button = None
-            for selector_type, selector in smtp_selectors:
-                try:
-                    smtp_button = WebDriverWait(self.driver, 5).until(
-                        EC.element_to_be_clickable((selector_type, selector))
-                    )
-                    logger.info(f"[Worker {self.worker_id}] Found SMTP button using: {selector}")
-                    break
-                except TimeoutException:
-                    continue
-            
-            if smtp_button:
-                self.driver.execute_script("arguments[0].scrollIntoView(true);", smtp_button)
-                self.random_delay()
-                self.dismiss_featurebase_overlay()
-                self._js_click(smtp_button)
-                logger.info(f"[Worker {self.worker_id}] Clicked SMTP confirmation button")
-            
-            # Step 4: Handle OAuth popup
-            self.random_delay(2, 3)
-            oauth_result = self._handle_oauth_flow(email, password)
-            if not oauth_result["success"]:
-                return oauth_result
-            
-            # Navigate back to accounts page and verify success
-            self.random_delay(3, 5)
-            
-            # Ensure we're on accounts page
-            if "accounts" not in self.driver.current_url:
-                self.driver.get("https://app.instantly.ai/app/accounts")
-                self.random_delay(3, 5)
-            self.dismiss_featurebase_overlay()
-            
-            # Look for the account in the list (more thorough check)
-            try:
-                # Try multiple ways to find the account
-                account_found = False
-                
-                # Method 1: Look for exact email match
-                try:
-                    WebDriverWait(self.driver, 8).until(
-                        EC.presence_of_element_located((By.XPATH, f"//*[contains(text(), '{email}')]"))
-                    )
-                    account_found = True
-                    logger.info(f"[Worker {self.worker_id}] ✓ Account {email} found in accounts list!")
-                except TimeoutException:
-                    pass
-                
-                # Method 2: Look for partial email match (username part)
-                if not account_found:
-                    try:
-                        username = email.split('@')[0]
-                        WebDriverWait(self.driver, 5).until(
-                            EC.presence_of_element_located((By.XPATH, f"//*[contains(text(), '{username}')]"))
-                        )
-                        account_found = True
-                        logger.info(f"[Worker {self.worker_id}] ✓ Account {email} found in accounts list (partial match)!")
-                    except TimeoutException:
-                        pass
-                
-                # Method 3: Check if page has "successfully" or similar success indicators
-                if not account_found:
-                    try:
-                        success_indicators = ["successfully", "added", "connected", "verified"]
-                        for indicator in success_indicators:
-                            try:
-                                WebDriverWait(self.driver, 2).until(
-                                    EC.presence_of_element_located((By.XPATH, f"//*[contains(text(), '{indicator}')]"))
-                                )
-                                account_found = True
-                                logger.info(f"[Worker {self.worker_id}] ✓ Success indicator '{indicator}' found - account likely added!")
-                                break
-                            except TimeoutException:
-                                continue
-                    except:
-                        pass
-                
-                if account_found:
-                    return {"success": True, "error": None}
-                else:
-                    # If OAuth completed without errors, assume success
-                    logger.info(f"[Worker {self.worker_id}] ✓ OAuth flow completed successfully - assuming account {email} was added")
-                    return {"success": True, "error": None}
-                        
-            except Exception as e:
-                # If OAuth completed, assume success even if verification fails
-                logger.info(f"[Worker {self.worker_id}] ✓ OAuth completed - assuming account {email} was added (verification failed: {e})")
+                (By.CSS_SELECTOR, "button[type='submit']"),
+            ], timeout=8)
+            self.delay(2, 4)
+
+            # Handle OAuth popup
+            ok, err = self._handle_oauth_flow(email, password)
+            if ok:
                 return {"success": True, "error": None}
-                
+            else:
+                return {"success": False, "error": err}
+
+        except InvalidSessionIdException:
+            return {"success": False, "error": "Browser session died"}
         except Exception as e:
-            error_msg = f"Unexpected error during upload: {str(e)}"
-            logger.error(f"[Worker {self.worker_id}] {error_msg}")
-            self.log_page_diagnostics("add_account_failed")
-            return {"success": False, "error": error_msg}
-            
-    def _handle_oauth_flow(self, email: str, password: str) -> Dict[str, Any]:
-        """
-        Handle Microsoft OAuth popup flow with robust selector fallbacks
-        
-        Args:
-            email: Microsoft email
-            password: Microsoft password
-            
-        Returns:
-            Dict with 'success' (bool), 'error' (str or None)
-        """
+            logger.error(f"[Worker {self.worker_id}] add_account error: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_oauth_flow(self, email: str, password: str) -> tuple:
+        """Handle Microsoft OAuth popup — ported from working standalone script.
+        Returns (success: bool, error: str)."""
         try:
-            # Wait for OAuth window to appear
-            self.random_delay(3, 5)
-            
-            # Store original window handle and switch to OAuth popup
-            all_windows = self.driver.window_handles
-            if len(all_windows) <= 1:
-                logger.error(f"[Worker {self.worker_id}] OAuth popup not found!")
-                self.save_debug_screenshot("no_oauth_popup")
-                return {"success": False, "error": "OAuth popup not found"}
-            
-            original_window = all_windows[0]
-            self.driver.switch_to.window(all_windows[-1])
-            logger.info(f"[Worker {self.worker_id}] Switched to OAuth window")
-            self.random_delay(2, 3)
-            
-            # Check if we're on account picker page ("Pick an account")
-            logger.info(f"[Worker {self.worker_id}] Checking for account picker page...")
-            try:
-                pick_account_indicators = [
-                    (By.XPATH, "//*[contains(text(), 'Pick an account')]"),
-                    (By.XPATH, "//*[contains(text(), 'Use another account')]"),
-                    (By.XPATH, "//div[contains(@class, 'table-cell') and contains(text(), 'Use another account')]")
-                ]
-                
-                account_picker_found = False
-                for selector_type, selector in pick_account_indicators:
-                    try:
-                        WebDriverWait(self.driver, 3).until(
-                            EC.presence_of_element_located((selector_type, selector))
-                        )
-                        account_picker_found = True
-                        break
-                    except TimeoutException:
-                        continue
-                
-                if account_picker_found:
-                    logger.info(f"[Worker {self.worker_id}] Account picker page detected - clicking 'Use another account'")
-                    
-                    # Click "Use another account"
-                    use_another_selectors = [
-                        (By.XPATH, "//div[contains(text(), 'Use another account')]"),
-                        (By.XPATH, "//*[contains(text(), 'Use another account')]"),
-                        (By.XPATH, "//div[contains(@class, 'table-cell') and contains(text(), 'Use another account')]"),
-                        (By.CSS_SELECTOR, "[data-test-id*='use-another-account']")
-                    ]
-                    
-                    use_another_button = None
-                    for selector_type, selector in use_another_selectors:
-                        try:
-                            use_another_button = WebDriverWait(self.driver, 5).until(
-                                EC.element_to_be_clickable((selector_type, selector))
-                            )
-                            break
-                        except TimeoutException:
-                            continue
-                    
-                    if use_another_button:
-                        self._js_click(use_another_button)
-                        logger.info(f"[Worker {self.worker_id}] Clicked 'Use another account'")
-                        self.random_delay(2, 3)
-            except Exception as e:
-                logger.info(f"[Worker {self.worker_id}] No account picker page detected, proceeding normally")
-            
-            # Step 1: Enter email with multiple selector fallbacks
-            logger.info(f"[Worker {self.worker_id}] Entering email in OAuth window...")
-            
-            email_selectors = [
+            self.delay(2, 4)
+            windows = self.driver.window_handles
+            if len(windows) < 2:
+                self.delay(3, 5)
+                windows = self.driver.window_handles
+            if len(windows) < 2:
+                return False, "OAuth popup did not open"
+
+            main_window = windows[0]
+            self.driver.switch_to.window(windows[-1])
+
+            # Account picker — click "Use another account" if present
+            self._find_and_click([
+                (By.XPATH, "//div[contains(text(), 'Use another account')]"),
+                (By.XPATH, "//*[contains(text(), 'Use another account')]"),
+            ], timeout=3)
+            self.delay(1, 2)
+
+            # Email
+            email_input = self._find_input([
                 (By.ID, "i0116"),
                 (By.NAME, "loginfmt"),
                 (By.XPATH, "//input[@type='email']"),
-                (By.XPATH, "//input[@placeholder*='email']")
-            ]
-            
-            email_input = None
-            for selector_type, selector in email_selectors:
-                try:
-                    email_input = WebDriverWait(self.driver, 10).until(
-                        EC.presence_of_element_located((selector_type, selector))
-                    )
-                    break
-                except TimeoutException:
-                    continue
-            
+                (By.XPATH, "//input[contains(@placeholder,'email')]"),
+            ], timeout=10)
             if not email_input:
-                logger.error(f"[Worker {self.worker_id}] Email input field not found")
-                self.log_page_diagnostics("email_input_not_found")
-                return {"success": False, "error": "Email input field not found"}
-            
+                self._close_popups(main_window)
+                return False, "Email field not found"
+
             email_input.clear()
             email_input.send_keys(email)
-            self.random_delay()
-            
-            # Click Next
-            next_selectors = [
+            self.delay(0.5, 1)
+
+            self._find_and_click([
                 (By.ID, "idSIButton9"),
                 (By.XPATH, "//input[@value='Next']"),
-                (By.XPATH, "//button[contains(text(), 'Next')]")
-            ]
-            
-            next_button = None
-            for selector_type, selector in next_selectors:
-                try:
-                    next_button = self.driver.find_element(selector_type, selector)
-                    break
-                except NoSuchElementException:
-                    continue
-            
-            if next_button:
-                self._js_click(next_button)
-                logger.info(f"[Worker {self.worker_id}] Email entered, clicked Next")
-            
-            self.random_delay(2, 3)
-            
-            # Check for "account doesn't exist" error
+            ], timeout=5)
+            self.delay(2, 3)
+
+            # Check for "doesn't exist"
             try:
                 err = self.driver.find_element(
                     By.XPATH, "//*[contains(text(), \"doesn't exist\") or contains(text(), 'account doesn')]"
                 )
                 if err:
-                    self._close_popups_safe()
-                    return {"success": False, "error": "Account doesn't exist in Microsoft"}
+                    self._close_popups(main_window)
+                    return False, "Account doesn't exist in Microsoft"
             except NoSuchElementException:
                 pass
-            
-            # Step 2: Enter password with multiple selector fallbacks
-            logger.info(f"[Worker {self.worker_id}] Entering password...")
-            
-            password_selectors = [
+
+            # Password
+            pw_input = self._find_input([
                 (By.ID, "i0118"),
                 (By.NAME, "passwd"),
-                (By.XPATH, "//input[@type='password']")
-            ]
-            
-            password_input = None
-            for selector_type, selector in password_selectors:
-                try:
-                    password_input = WebDriverWait(self.driver, 10).until(
-                        EC.presence_of_element_located((selector_type, selector))
-                    )
-                    break
-                except TimeoutException:
-                    continue
-            
-            if not password_input:
-                logger.error(f"[Worker {self.worker_id}] Password input field not found")
-                self.log_page_diagnostics("password_input_not_found")
-                return {"success": False, "error": "Password input field not found"}
-            
-            password_input.clear()
-            password_input.send_keys(password)
-            self.random_delay()
-            
-            # Click Sign in
-            signin_selectors = [
+                (By.XPATH, "//input[@type='password']"),
+            ], timeout=10)
+            if not pw_input:
+                self._close_popups(main_window)
+                return False, "Password field not found"
+
+            pw_input.clear()
+            pw_input.send_keys(password)
+            self.delay(0.5, 1)
+
+            self._find_and_click([
                 (By.ID, "idSIButton9"),
                 (By.XPATH, "//input[@value='Sign in']"),
-                (By.XPATH, "//button[contains(text(), 'Sign in')]")
-            ]
-            
-            signin_button = None
-            for selector_type, selector in signin_selectors:
-                try:
-                    signin_button = self.driver.find_element(selector_type, selector)
-                    break
-                except NoSuchElementException:
-                    continue
-            
-            if signin_button:
-                self._js_click(signin_button)
-                logger.info(f"[Worker {self.worker_id}] Password entered, clicked Sign in")
-            
-            self.random_delay(3, 5)
-            
-            # Check for wrong password or blocked sign-in
+            ], timeout=5)
+            self.delay(3, 5)
+
+            # Check wrong password
             try:
                 err = self.driver.find_element(
                     By.XPATH, "//*[contains(text(), 'password is incorrect') or contains(text(), 'sign-in was blocked')]"
                 )
                 if err:
-                    self._close_popups_safe()
-                    return {"success": False, "error": "Wrong password or sign-in blocked"}
+                    self._close_popups(main_window)
+                    return False, "Wrong password or blocked"
             except NoSuchElementException:
                 pass
-            
-            # Step 3: Handle "Stay signed in?" prompt - Click "No"
-            logger.info(f"[Worker {self.worker_id}] Checking for 'Stay signed in?' prompt...")
+
+            # Stay signed in? → No
             try:
-                stay_signed_indicators = [
+                for st, sv in [
                     (By.XPATH, "//*[contains(text(), 'Stay signed in?')]"),
-                    (By.XPATH, "//*[contains(text(), 'Do this to reduce the number of times')]"),
-                    (By.ID, "KmsiCheckboxField")
-                ]
-                
-                stay_signed_found = False
-                for selector_type, selector in stay_signed_indicators:
+                    (By.ID, "KmsiCheckboxField"),
+                ]:
                     try:
-                        WebDriverWait(self.driver, 5).until(
-                            EC.presence_of_element_located((selector_type, selector))
+                        WebDriverWait(self.driver, 4).until(
+                            EC.presence_of_element_located((st, sv))
                         )
-                        stay_signed_found = True
+                        self._find_and_click([
+                            (By.ID, "idBtn_Back"),
+                            (By.XPATH, "//input[@value='No']"),
+                        ], timeout=5)
+                        self.delay(2, 3)
                         break
                     except TimeoutException:
                         continue
-                
-                if stay_signed_found:
-                    logger.info(f"[Worker {self.worker_id}] 'Stay signed in?' prompt detected - clicking 'No'")
-                    
-                    # Uncheck the "Don't show this again" checkbox if checked
-                    try:
-                        checkbox = self.driver.find_element(By.ID, "KmsiCheckboxField")
-                        if checkbox.is_selected():
-                            self._js_click(checkbox)
-                            logger.info(f"[Worker {self.worker_id}] Unchecked 'Don't show this again' checkbox")
-                    except:
-                        pass
-                    
-                    # Click "No" button
-                    no_button_selectors = [
-                        (By.ID, "idBtn_Back"),
-                        (By.XPATH, "//input[@value='No']"),
-                        (By.XPATH, "//button[contains(text(), 'No')]"),
-                        (By.XPATH, "//input[@type='button' and @value='No']")
-                    ]
-                    
-                    no_button = None
-                    for selector_type, selector in no_button_selectors:
-                        try:
-                            no_button = WebDriverWait(self.driver, 5).until(
-                                EC.element_to_be_clickable((selector_type, selector))
-                            )
-                            break
-                        except TimeoutException:
-                            continue
-                    
-                    if no_button:
-                        self._js_click(no_button)
-                        logger.info(f"[Worker {self.worker_id}] Clicked 'No' on 'Stay signed in?' prompt")
-                        self.random_delay(2, 3)
-                else:
-                    logger.info(f"[Worker {self.worker_id}] No 'Stay signed in?' prompt found")
-                    
-            except Exception as e:
-                logger.info(f"[Worker {self.worker_id}] Error handling 'Stay signed in?' prompt: {e}")
-            
-            # Step 4: Accept permissions with multiple selector fallbacks
-            logger.info(f"[Worker {self.worker_id}] Looking for Accept button on permissions page...")
-            
-            accept_selectors = [
+            except Exception:
+                pass
+
+            # Accept permissions
+            self._find_and_click([
                 (By.XPATH, "//input[@value='Accept']"),
                 (By.XPATH, "//button[contains(text(), 'Accept')]"),
-                (By.XPATH, "//button[contains(text(), 'Yes')]"),
-                (By.ID, "idSIButton9")
-            ]
-            
-            accept_button = None
-            try:
-                for selector_type, selector in accept_selectors:
-                    try:
-                        accept_button = WebDriverWait(self.driver, 8).until(
-                            EC.element_to_be_clickable((selector_type, selector))
-                        )
-                        break
-                    except TimeoutException:
-                        continue
-                
-                if accept_button:
-                    self._js_click(accept_button)
-                    logger.info(f"[Worker {self.worker_id}] Clicked Accept - OAuth flow complete")
-                else:
-                    logger.info(f"[Worker {self.worker_id}] No Accept button found - OAuth may have completed automatically")
-            except Exception as e:
-                logger.info(f"[Worker {self.worker_id}] Accept button handling failed, but continuing: {e}")
-            
-            # Wait for OAuth completion - check if we're redirected back or window closes
-            oauth_completed = False
-            for wait_attempt in range(15):  # Wait up to 15 seconds
-                self.random_delay(1, 1)
-                current_windows = self.driver.window_handles
-                
-                # Check if OAuth window closed (success indicator)
-                if len(current_windows) == 1:
-                    self.driver.switch_to.window(current_windows[0])
-                    logger.info(f"[Worker {self.worker_id}] OAuth window closed - OAuth completed successfully")
-                    oauth_completed = True
-                    break
-                
-                # Check if we're still in OAuth window and redirected back to Instantly
+                (By.ID, "idSIButton9"),
+            ], timeout=8)
+
+            # Wait for popup to close (up to 20 seconds)
+            for _ in range(20):
+                time.sleep(1)
                 try:
+                    cur = self.driver.window_handles
+                    if len(cur) == 1:
+                        self.driver.switch_to.window(cur[0])
+                        return True, ""
                     if "instantly.ai" in self.driver.current_url:
-                        logger.info(f"[Worker {self.worker_id}] Redirected back to Instantly - OAuth completed successfully")
-                        oauth_completed = True
-                        break
-                except:
+                        self.driver.switch_to.window(main_window)
+                        return True, ""
+                except NoSuchWindowException:
+                    try:
+                        self.driver.switch_to.window(self.driver.window_handles[0])
+                    except Exception:
+                        pass
+                    return True, ""
+                except Exception:
                     pass
-            
-            # If still in popup, switch back to main window
-            if not oauth_completed:
-                try:
-                    all_windows = self.driver.window_handles
-                    if len(all_windows) > 1:
-                        self.driver.switch_to.window(all_windows[0])
-                        logger.info(f"[Worker {self.worker_id}] Switched back to main window manually")
-                    oauth_completed = True  # Assume success if we made it this far
-                except:
-                    pass
-            
-            # Clear any stored sessions by navigating to Microsoft logout
-            try:
-                logger.info(f"[Worker {self.worker_id}] Clearing Microsoft sessions...")
-                self.driver.execute_script("window.open('https://login.microsoftonline.com/logout.srf', '_blank');")
-                all_windows = self.driver.window_handles
-                if len(all_windows) > 1:
-                    self.driver.switch_to.window(all_windows[-1])
-                    self.random_delay(2, 3)
-                    self.driver.close()
-                    self.driver.switch_to.window(all_windows[0])
-                    logger.info(f"[Worker {self.worker_id}] Microsoft sessions cleared")
-            except Exception as e:
-                logger.info(f"[Worker {self.worker_id}] Could not clear Microsoft sessions: {e}")
-            
-            return {"success": True, "error": None}
-            
+
+            self._close_popups(main_window)
+            return True, ""  # Likely succeeded
+
         except NoSuchWindowException:
-            # OAuth window closed = success
             try:
                 self.driver.switch_to.window(self.driver.window_handles[0])
             except Exception:
                 pass
-            return {"success": True, "error": None}
+            return True, ""
+        except InvalidSessionIdException:
+            return False, "Browser session died"
         except Exception as e:
-            error_msg = f"OAuth flow error: {str(e)}"
-            logger.error(f"[Worker {self.worker_id}] {error_msg}")
-            self.log_page_diagnostics("oauth_failed")
-            # Try to switch back to original window
-            try:
-                if len(self.driver.window_handles) > 0:
-                    self.driver.switch_to.window(self.driver.window_handles[0])
-            except:
-                pass
-            return {"success": False, "error": error_msg}
-    
+            logger.error(f"[Worker {self.worker_id}] OAuth error: {e}")
+            self._close_popups_safe()
+            return False, str(e)
+
+    def _close_popups(self, main_window):
+        """Close all popup windows and switch back to main."""
+        try:
+            for w in self.driver.window_handles:
+                if w != main_window:
+                    self.driver.switch_to.window(w)
+                    self.driver.close()
+            self.driver.switch_to.window(main_window)
+        except Exception:
+            pass
+
     def _close_popups_safe(self):
-        """Safely close popup windows and return to main window"""
+        """Safely close popup windows and return to first window."""
         try:
             windows = self.driver.window_handles
             if len(windows) > 1:
@@ -1050,16 +606,11 @@ class InstantlyUploader:
                 self.driver.switch_to.window(windows[0])
         except Exception:
             pass
-            
-    def cleanup(self):
-        """Clean up WebDriver resources"""
-        if self.driver:
-            try:
-                self.driver.quit()
-                logger.info(f"[Worker {self.worker_id}] Chrome driver closed")
-            except Exception as e:
-                logger.error(f"[Worker {self.worker_id}] Error closing driver: {str(e)}")
 
+
+# ---------------------------------------------------------------------------
+# Synchronous mailbox processor (runs in ThreadPoolExecutor)
+# ---------------------------------------------------------------------------
 
 def process_mailbox_sync(
     uploader: InstantlyUploader,
@@ -1067,22 +618,15 @@ def process_mailbox_sync(
     max_retries: int = 2
 ) -> Dict[str, Any]:
     """
-    Synchronous function to process a single mailbox upload
-    Runs in ThreadPoolExecutor
-    
-    Args:
-        uploader: InstantlyUploader instance
-        mailbox_data: Dict with 'id', 'email', 'password'
-        max_retries: Maximum retry attempts
-        
-    Returns:
-        Dict with 'mailbox_id', 'success', 'error', 'retries', 'verified'
+    Synchronous function to process a single mailbox upload.
+    Runs in ThreadPoolExecutor. Includes cookie clearing after each
+    account (matching the working standalone script).
     """
     mailbox_id = mailbox_data["id"]
     email = mailbox_data["email"]
     password = mailbox_data["password"]
-    
-    # Pre-check: Skip if account already exists (API) 
+
+    # Pre-check: Skip if account already exists (API)
     if uploader.api and uploader.api.account_exists(email):
         logger.info(f"[Worker {uploader.worker_id}] ⊘ {email} — already in Instantly (API), skipping")
         return {
@@ -1091,10 +635,10 @@ def process_mailbox_sync(
             "error": None,
             "retries": 0,
             "verified": True,
-            "skipped": True
+            "skipped": True,
         }
-    
-    # Preventive browser restart after every N accounts to avoid memory leaks
+
+    # Preventive browser restart after every N accounts
     uploader._accounts_since_restart += 1
     if uploader._accounts_since_restart >= uploader.RESTART_EVERY_N:
         logger.info(
@@ -1102,10 +646,9 @@ def process_mailbox_sync(
             f"{uploader._accounts_since_restart} accounts"
         )
         if not uploader.restart_browser():
-            logger.error(f"[Worker {uploader.worker_id}] Preventive restart failed — attempting to continue")
-        # restart_browser() resets _accounts_since_restart via setup_driver()
-    
-    # Check driver health before attempting upload
+            logger.error(f"[Worker {uploader.worker_id}] Preventive restart failed — continuing")
+
+    # Check driver health
     if not uploader.is_driver_alive():
         logger.warning(f"[Worker {uploader.worker_id}] Driver not alive — restarting")
         if not uploader.restart_browser():
@@ -1116,64 +659,87 @@ def process_mailbox_sync(
                 "retries": 0,
                 "verified": False,
             }
-    
+
     # Try OAuth upload with retries
+    oauth_passed = False
+    last_error = ""
+
     for attempt in range(max_retries + 1):
         try:
+            if attempt > 0:
+                logger.info(f"[Worker {uploader.worker_id}] Retry {attempt} for {email}")
+                if not uploader.is_driver_alive():
+                    if not uploader.restart_browser():
+                        last_error = "Browser restart failed"
+                        break
+                try:
+                    uploader.driver.get("https://app.instantly.ai/app/accounts")
+                    uploader.delay(2, 3)
+                except Exception:
+                    if not uploader.restart_browser():
+                        last_error = "Browser restart failed"
+                        break
+
             result = uploader.add_microsoft_account(email, password, mailbox_id)
             if result["success"]:
-                # Verify via API if available
-                verified = True
-                if uploader.api:
-                    logger.info(f"[Worker {uploader.worker_id}] OAuth done for {email} — verifying via API...")
-                    verified = uploader.api.verify_account(email, max_wait=15, poll_interval=3)
-                    
-                    if verified:
-                        logger.info(f"[Worker {uploader.worker_id}] ✓ {email} — API CONFIRMED")
-                    else:
-                        logger.warning(f"[Worker {uploader.worker_id}] ⚠ {email} — OAuth passed but NOT found in API")
-                        return {
-                            "mailbox_id": mailbox_id,
-                            "success": False,
-                            "error": "OAuth completed but account not found in Instantly API",
-                            "retries": attempt,
-                            "verified": False
-                        }
-                
-                return {
-                    "mailbox_id": mailbox_id,
-                    "success": True,
-                    "error": None,
-                    "retries": attempt,
-                    "verified": verified
-                }
-            else:
-                if attempt < max_retries:
-                    logger.warning(f"[Worker {uploader.worker_id}] Attempt {attempt + 1} failed for {email}, retrying...")
-                    time.sleep(3)
-                else:
-                    logger.error(f"[Worker {uploader.worker_id}] All {max_retries + 1} attempts failed for {email}")
-                    return {
-                        "mailbox_id": mailbox_id,
-                        "success": False,
-                        "error": result["error"],
-                        "retries": attempt,
-                        "verified": False
-                    }
+                oauth_passed = True
+                break
+            last_error = result["error"] or "Unknown error"
+
+            # Clear MS cookies between retries
+            if uploader.is_driver_alive():
+                uploader.clear_microsoft_cookies()
+
         except Exception as e:
-            error_msg = f"Exception during upload: {str(e)}"
-            logger.error(f"[Worker {uploader.worker_id}] {error_msg}")
+            last_error = f"Exception during upload: {str(e)}"
+            logger.error(f"[Worker {uploader.worker_id}] {last_error}")
             if attempt < max_retries:
                 time.sleep(3)
+
+    # Always clear MS cookies after each account (matching working script)
+    if uploader.is_driver_alive():
+        uploader.clear_microsoft_cookies()
+
+    # API Verification
+    if oauth_passed:
+        verified = True
+        if uploader.api:
+            logger.info(f"[Worker {uploader.worker_id}] OAuth done for {email} — verifying via API...")
+            verified = uploader.api.verify_account(email, max_wait=15, poll_interval=3)
+
+            if verified:
+                logger.info(f"[Worker {uploader.worker_id}] ✓ {email} — API CONFIRMED")
             else:
+                logger.warning(f"[Worker {uploader.worker_id}] ⚠ {email} — OAuth passed but NOT found in API")
                 return {
                     "mailbox_id": mailbox_id,
                     "success": False,
-                    "error": error_msg,
+                    "error": "OAuth completed but account not found in Instantly API",
                     "retries": attempt,
-                    "verified": False
+                    "verified": False,
                 }
 
+        return {
+            "mailbox_id": mailbox_id,
+            "success": True,
+            "error": None,
+            "retries": attempt,
+            "verified": verified,
+        }
+    else:
+        logger.error(f"[Worker {uploader.worker_id}] All attempts failed for {email}: {last_error}")
+        return {
+            "mailbox_id": mailbox_id,
+            "success": False,
+            "error": last_error,
+            "retries": max_retries,
+            "verified": False,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Async batch orchestrator
+# ---------------------------------------------------------------------------
 
 async def run_instantly_upload_for_batch(
     batch_id: str,
@@ -1187,67 +753,51 @@ async def run_instantly_upload_for_batch(
     """
     Main async function to upload all mailboxes in a batch to Instantly.ai
     Uses parallel browser workers for faster processing.
-    
+
     After the main upload pass, automatically retries failed mailboxes
     up to batch_retry_rounds times to handle transient failures.
-    
-    Args:
-        batch_id: SetupBatch UUID
-        instantly_email: Instantly.ai account email
-        instantly_password: Instantly.ai account password
-        instantly_api_key: Instantly.ai API key for verification (optional)
-        num_workers: Number of parallel browser workers (1-3, default 2)
-        skip_uploaded: Skip mailboxes already uploaded
-        batch_retry_rounds: Number of retry rounds for failed uploads (default 3)
-        
-    Returns:
-        Dict with summary: total, uploaded, failed, skipped, errors
     """
     # Cap workers at 5 for Railway stability
     num_workers = min(num_workers, 5)
     logger.info(f"Starting Instantly upload for batch {batch_id} with {num_workers} workers")
-    
+
     # Initialize API client if key provided
     api = None
     if instantly_api_key:
         api = InstantlyAPI(instantly_api_key)
         if api.test_connection():
-            logger.info(f"Instantly API connected - verification enabled")
-            # Pre-load all existing accounts for faster checking
+            logger.info("Instantly API connected - verification enabled")
             existing = api.load_all_accounts()
             logger.info(f"Loaded {len(existing)} existing accounts from Instantly")
         else:
-            logger.warning(f"Instantly API test failed - proceeding without verification")
+            logger.warning("Instantly API test failed - proceeding without verification")
             api = None
-    
+
     # Fetch mailboxes from database
     async with async_session_factory() as session:
-        # Get batch to verify it exists
         batch_result = await session.execute(
             select(SetupBatch).where(SetupBatch.id == batch_id)
         )
         batch = batch_result.scalar_one_or_none()
         if not batch:
             return {"error": "Batch not found", "total": 0, "uploaded": 0, "failed": 0, "skipped": 0}
-        
-        # Get all mailboxes for tenants in this batch
+
         query = (
             select(Mailbox)
             .join(Tenant, Mailbox.tenant_id == Tenant.id)
             .where(Tenant.batch_id == batch_id)
         )
-        
+
         if skip_uploaded:
             query = query.where(Mailbox.instantly_uploaded == False)
-            
+
         result = await session.execute(query)
         mailboxes = result.scalars().all()
-        
+
         if not mailboxes:
             logger.info(f"No mailboxes to upload for batch {batch_id}")
             return {"total": 0, "uploaded": 0, "failed": 0, "skipped": 0, "errors": []}
-        
-        # Prepare mailbox data for workers
+
         mailbox_list = [
             {
                 "id": str(mb.id),
@@ -1257,7 +807,7 @@ async def run_instantly_upload_for_batch(
             for mb in mailboxes
         ]
 
-        # Pre-filter against Instantly API cache (if available)
+        # Pre-filter against Instantly API cache
         if api and api._cache_loaded:
             existing_emails = api._known_emails
             if existing_emails:
@@ -1285,22 +835,20 @@ async def run_instantly_upload_for_batch(
                         mb for mb in mailbox_list
                         if mb["email"].strip().lower() not in existing_emails
                     ]
-    
+
     logger.info(f"Found {len(mailbox_list)} mailboxes to upload")
-    
-    # ---------- helper: single upload pass over a list of mailbox dicts ----------
+
+    # ---------- helper: single upload pass ----------
     async def _run_upload_pass(
         mb_list: List[Dict[str, Any]],
         pass_label: str = "main",
     ) -> Dict[str, Any]:
-        """Run one full upload pass. Returns {uploaded, failed, errors, failed_mailboxes}."""
         uploaded = 0
         failed = 0
         errs: List[str] = []
         failed_mbs: List[Dict[str, Any]] = []
 
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            # Create one uploader per worker
             uploaders: List[InstantlyUploader] = []
             for i in range(num_workers):
                 upl = InstantlyUploader(
@@ -1339,14 +887,14 @@ async def run_instantly_upload_for_batch(
                     future_to_mb[fut] = mb_data
 
                 for fut in as_completed(futures):
-                    result = fut.result()
+                    res = fut.result()
                     mb_data = future_to_mb[fut]
 
                     async with async_session_factory() as session:
-                        if result["success"]:
+                        if res["success"]:
                             await session.execute(
                                 update(Mailbox)
-                                .where(Mailbox.id == result["mailbox_id"])
+                                .where(Mailbox.id == res["mailbox_id"])
                                 .values(
                                     instantly_uploaded=True,
                                     instantly_uploaded_at=datetime.utcnow(),
@@ -1357,14 +905,14 @@ async def run_instantly_upload_for_batch(
                         else:
                             await session.execute(
                                 update(Mailbox)
-                                .where(Mailbox.id == result["mailbox_id"])
+                                .where(Mailbox.id == res["mailbox_id"])
                                 .values(
                                     instantly_uploaded=False,
-                                    instantly_upload_error=result["error"],
+                                    instantly_upload_error=res["error"],
                                 )
                             )
                             failed += 1
-                            errs.append(result["error"])
+                            errs.append(res["error"])
                             failed_mbs.append(mb_data)
 
                         await session.commit()
@@ -1392,7 +940,7 @@ async def run_instantly_upload_for_batch(
     all_errors = list(pass_result["errors"])
     remaining_failed = list(pass_result["failed_mailboxes"])
 
-    # ---------- Batch retry rounds for failed uploads ----------
+    # ---------- Batch retry rounds ----------
     for retry_round in range(1, batch_retry_rounds + 1):
         if not remaining_failed:
             break
@@ -1402,10 +950,8 @@ async def run_instantly_upload_for_batch(
             f"{len(remaining_failed)} failed mailboxes ==="
         )
 
-        # Brief pause between rounds to let things settle
         await asyncio.sleep(5)
 
-        # Clear upload errors in DB so they can be retried cleanly
         async with async_session_factory() as session:
             for mb_data in remaining_failed:
                 await session.execute(
@@ -1423,10 +969,9 @@ async def run_instantly_upload_for_batch(
         )
 
         total_uploaded += retry_result["uploaded"]
-        # Update failed count (replace, don't add — these are the same mailboxes)
         total_failed = retry_result["failed"]
         remaining_failed = list(retry_result["failed_mailboxes"])
-        all_errors = list(retry_result["errors"])  # keep only latest errors
+        all_errors = list(retry_result["errors"])
 
         if retry_result["failed"] == 0:
             logger.info(f"All failures resolved in retry round {retry_round}!")
@@ -1442,5 +987,5 @@ async def run_instantly_upload_for_batch(
         "uploaded": total_uploaded,
         "failed": total_failed,
         "skipped": 0,
-        "errors": all_errors[:10],  # Limit to first 10 errors
+        "errors": all_errors[:10],
     }
