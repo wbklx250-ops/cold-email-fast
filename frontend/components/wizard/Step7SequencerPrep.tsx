@@ -287,12 +287,11 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
       {/* Header */}
       <div>
         <h2 className="text-xl font-semibold text-gray-900">
-          Step 7: Security Defaults + SMTP Auth + {appName} Consent
+          Step 7: SMTP Auth + {appName} Consent
         </h2>
         <p className="mt-1 text-sm text-gray-500">
-          Disables Security Defaults in Entra ID, then enables SMTP
-          Authentication at the organization level and grants {appName}
-          admin consent so mailboxes can be connected to
+          Enables SMTP Authentication at the organization level and grants{" "}
+          {appName} admin consent so mailboxes can be connected to
           <strong> {appName}</strong> or other email sequencers.
         </p>
       </div>
@@ -331,15 +330,10 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
       <div className="rounded-lg border border-blue-200 bg-blue-50 p-4 text-sm text-blue-700">
         <p className="font-medium">What this does:</p>
         <p className="mt-1">
-          1) Tries Exchange Online PowerShell to enable SMTP Auth and verify
-          the setting.
+          1) Enables SMTP Auth via Exchange Online PowerShell.
         </p>
         <p className="mt-1">
-          2) If MFA blocks PowerShell, it disables Security Defaults in Entra
-          ID, then retries PowerShell.
-        </p>
-        <p className="mt-1">
-          3) Grants {appName} admin consent so OAuth connections succeed.
+          2) Grants {appName} admin consent so OAuth connections succeed.
         </p>
         <p className="mt-2 text-blue-600">
           This can take a few minutes per tenant on Railway or low-resource

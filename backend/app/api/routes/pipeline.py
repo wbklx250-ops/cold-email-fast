@@ -1716,8 +1716,8 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                 pipeline_jobs[job_id]["steps"]["6"]["status"] = "completed"
             logger.info(f"Step 6 complete: {m365_ok} domains M365 configured, {m365_skipped} skipped")
 
-            # === Clean up all Chrome processes before Step 7 ===
-            logger.info("Cleaning up browser processes between Step 6 and Step 7...")
+            # === Clean up all Chrome processes before Security Defaults ===
+            logger.info("Cleaning up browser processes between Step 6 and Security Defaults...")
             kill_all_browsers()
             await asyncio.sleep(5)
 
@@ -1733,6 +1733,77 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
             logger.info(f"Skipping Step 6 (starting from step {start_from_step})")
             if job_id in pipeline_jobs:
                 pipeline_jobs[job_id]["steps"]["6"]["status"] = "completed"
+
+        # ================================================================
+        # STEP 6.5: Disable Security Defaults (before mailbox creation)
+        # ================================================================
+        if start_from_step <= 7:
+          try:
+            kill_all_browsers()
+            await asyncio.sleep(3)
+            await _update_pipeline(batch_id, 7, "running", "Disabling Security Defaults in Entra ID...")
+            logger.info("Step 6.5: Disabling Security Defaults for all tenants...")
+
+            from app.services.step8_security_defaults import SecurityDefaultsDisabler, TenantCredentials as SDTenantCredentials
+
+            async with SessionLocal() as db:
+                sd_tenants = (await db.execute(
+                    select(Tenant).where(
+                        Tenant.batch_id == batch_id,
+                        Tenant.security_defaults_disabled.is_not(True),
+                        Tenant.totp_secret.isnot(None),
+                    )
+                )).scalars().all()
+
+            sd_ok = 0
+            sd_fail = 0
+            for t in sd_tenants:
+                if await _check_paused_or_stopped(batch_id):
+                    return
+                domain = t.custom_domain or t.name
+                try:
+                    worker_id = int(str(t.id).replace("-", "")[:6], 16) % 10000
+                    disabler = SecurityDefaultsDisabler(headless=True, worker_id=worker_id)
+                    creds = SDTenantCredentials(
+                        tenant_id=str(t.id),
+                        domain=domain,
+                        admin_email=t.admin_email,
+                        admin_password=t.admin_password,
+                        totp_secret=t.totp_secret,
+                    )
+                    sd_result = await asyncio.to_thread(disabler.disable_for_tenant, creds)
+                    async with SessionLocal() as db:
+                        tenant = await db.get(Tenant, t.id)
+                        if tenant:
+                            if sd_result.get("success"):
+                                tenant.security_defaults_disabled = True
+                                tenant.security_defaults_error = None
+                                tenant.security_defaults_disabled_at = datetime.utcnow()
+                                sd_ok += 1
+                                logger.info(f"[{domain}] Security Defaults disabled")
+                            else:
+                                tenant.security_defaults_error = sd_result.get("error") or "Unknown"
+                                sd_fail += 1
+                                logger.warning(f"[{domain}] Security Defaults failed: {tenant.security_defaults_error}")
+                            await db.commit()
+                except Exception as e:
+                    sd_fail += 1
+                    logger.error(f"[{domain}] Security Defaults exception: {e}")
+                    async with SessionLocal() as db:
+                        tenant = await db.get(Tenant, t.id)
+                        if tenant:
+                            tenant.security_defaults_error = str(e)
+                            await db.commit()
+
+            logger.info(f"Step 6.5 complete: {sd_ok} disabled, {sd_fail} failed out of {len(sd_tenants)} tenants")
+
+            kill_all_browsers()
+            await asyncio.sleep(5)
+
+          except Exception as step_error:
+            logger.error(f"Step 6.5 (Security Defaults) CRASHED (continuing): {_fmt_err(step_error)}")
+            import traceback
+            logger.error(traceback.format_exc())
 
         # ================================================================
         # STEP 7: Create Mailboxes + Delegate (WITH AUTO-RETRY, DOMAIN-BASED)

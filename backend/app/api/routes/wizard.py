@@ -604,6 +604,7 @@ async def start_auto_run(
         "progress": {
             "step4": {"status": "pending", "total": 0, "completed": 0, "failed": 0, "skipped": 0},
             "step5": {"status": "pending", "total": 0, "completed": 0, "failed": 0, "skipped": 0},
+            "step5_5": {"status": "pending", "total": 0, "completed": 0, "failed": 0, "skipped": 0},
             "step6": {"status": "pending", "total": 0, "completed": 0, "failed": 0, "skipped": 0},
             "step7": {"status": "pending", "total": 0, "completed": 0, "failed": 0, "skipped": 0},
         },
@@ -629,8 +630,9 @@ async def start_auto_run(
         "steps_to_run": [
             "Step 4: First Login",
             "Step 5: Email Setup",
+            "Step 5.5: Disable Security Defaults",
             "Step 6: Mailboxes",
-            f"Step 7: Security Defaults + SMTP Auth + {sequencer_config['name']} Consent",
+            f"Step 7: SMTP Auth + {sequencer_config['name']} Consent",
         ],
         "note": "Use GET /batches/{batch_id}/auto-run/status to track progress"
     }
@@ -674,6 +676,18 @@ async def _run_auto_progression(batch_id: UUID, new_password: str, display_name:
         await _run_step5_with_retry(batch_id, job_id)
 
         auto_run_jobs[job_id]["progress"]["step5"]["status"] = "completed"
+        await _persist_auto_run_state(batch_id)
+
+        # === STEP 5.5: Disable Security Defaults ===
+        auto_run_jobs[job_id]["current_step"] = 5.5
+        auto_run_jobs[job_id]["current_step_name"] = "Disable Security Defaults"
+        auto_run_jobs[job_id]["message"] = "Disabling Security Defaults in Entra ID..."
+        auto_run_jobs[job_id]["progress"]["step5_5"]["status"] = "running"
+        await _persist_auto_run_state(batch_id)
+
+        await _run_security_defaults_with_retry(batch_id, job_id)
+
+        auto_run_jobs[job_id]["progress"]["step5_5"]["status"] = "completed"
         await _persist_auto_run_state(batch_id)
 
         # === STEP 6: Mailbox Creation ===
@@ -853,6 +867,89 @@ async def _run_step5_with_retry(batch_id: UUID, job_id: str):
         if batch:
             batch.current_step = 6
             await db.commit()
+
+
+async def _run_security_defaults_with_retry(batch_id: UUID, job_id: str):
+    """Run Security Defaults disabling with auto-retry for failures.
+    
+    Targets tenants that have completed Step 5 (or DKIM enabled) but
+    haven't yet had Security Defaults disabled. Uses the Selenium-based
+    SecurityDefaultsDisabler to navigate Entra ID.
+    """
+    import asyncio
+    from app.services.step8_security_defaults import SecurityDefaultsDisabler, TenantCredentials as SDTenantCredentials
+
+    for attempt in range(MAX_AUTO_RETRIES + 1):
+        async with async_session_factory() as db:
+            # Find tenants needing Security Defaults disabled
+            result = await db.execute(
+                select(Tenant).where(
+                    Tenant.batch_id == batch_id,
+                    ((Tenant.step5_complete == True) | (Tenant.dkim_enabled == True)),
+                    Tenant.security_defaults_disabled.is_not(True),
+                    Tenant.totp_secret.isnot(None),
+                )
+            )
+            tenants = result.scalars().all()
+
+            if not tenants:
+                break
+
+            auto_run_jobs[job_id]["progress"]["step5_5"]["total"] = len(tenants)
+
+        # Process each tenant
+        for tenant in tenants:
+            tenant_id = tenant.id
+            domain = tenant.custom_domain or tenant.name
+            admin_email = tenant.admin_email
+            admin_password = tenant.admin_password
+            totp_secret = tenant.totp_secret
+
+            if not admin_email or not admin_password or not totp_secret:
+                logger.warning(f"[{domain}] Step 5.5: Skipping - missing credentials or TOTP")
+                auto_run_jobs[job_id]["progress"]["step5_5"]["skipped"] += 1
+                continue
+
+            try:
+                logger.info(f"[{domain}] Step 5.5: Disabling Security Defaults (attempt {attempt + 1}/{MAX_AUTO_RETRIES + 1})")
+                worker_id = int(str(tenant_id).replace("-", "")[:6], 16) % 10000
+                disabler = SecurityDefaultsDisabler(headless=True, worker_id=worker_id)
+                creds = SDTenantCredentials(
+                    tenant_id=str(tenant_id),
+                    domain=domain,
+                    admin_email=admin_email,
+                    admin_password=admin_password,
+                    totp_secret=totp_secret,
+                )
+                sd_result = await asyncio.to_thread(disabler.disable_for_tenant, creds)
+
+                async with async_session_factory() as db:
+                    t = await db.get(Tenant, tenant_id)
+                    if t:
+                        if sd_result.get("success"):
+                            t.security_defaults_disabled = True
+                            t.security_defaults_error = None
+                            t.security_defaults_disabled_at = datetime.utcnow()
+                            auto_run_jobs[job_id]["progress"]["step5_5"]["completed"] += 1
+                            logger.info(f"[{domain}] Step 5.5: Security Defaults disabled successfully")
+                        else:
+                            t.security_defaults_error = sd_result.get("error") or "Unknown error"
+                            auto_run_jobs[job_id]["progress"]["step5_5"]["failed"] += 1
+                            logger.warning(f"[{domain}] Step 5.5: Failed - {t.security_defaults_error}")
+                        await db.commit()
+
+            except Exception as e:
+                logger.error(f"[{domain}] Step 5.5: Exception - {e}")
+                async with async_session_factory() as db:
+                    t = await db.get(Tenant, tenant_id)
+                    if t:
+                        t.security_defaults_error = str(e)
+                        await db.commit()
+                auto_run_jobs[job_id]["progress"]["step5_5"]["failed"] += 1
+
+        # Brief pause before retry
+        if attempt < MAX_AUTO_RETRIES:
+            await asyncio.sleep(10)
 
 
 async def _run_step6_with_retry(batch_id: UUID, display_name: str, job_id: str):
