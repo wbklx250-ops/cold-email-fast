@@ -23,7 +23,8 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
 from selenium.common.exceptions import (
     TimeoutException, WebDriverException, NoSuchElementException,
-    NoSuchWindowException, InvalidSessionIdException
+    NoSuchWindowException, InvalidSessionIdException,
+    ElementClickInterceptedException
 )
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -277,6 +278,15 @@ class InstantlyUploader:
                 self.delay(0.3, 0.6)
                 el.click()
                 return True
+            except ElementClickInterceptedException:
+                logger.warning(f"[Worker {self.worker_id}] Click intercepted by overlay — dismissing and retrying")
+                self._dismiss_overlays()
+                time.sleep(0.5)
+                try:
+                    self.driver.execute_script("arguments[0].click()", el)
+                    return True
+                except Exception:
+                    continue
             except (TimeoutException, NoSuchElementException):
                 continue
         return False
@@ -361,6 +371,7 @@ class InstantlyUploader:
             self.delay(2, 3)
 
             logger.info(f"[Worker {self.worker_id}] Logged into Instantly")
+            self._dismiss_overlays()
             return True
         except Exception as e:
             logger.error(f"[Worker {self.worker_id}] Login failed: {e}")
@@ -384,6 +395,9 @@ class InstantlyUploader:
             if "accounts" not in current or "connect" in current:
                 self.driver.get("https://app.instantly.ai/app/accounts")
                 self.delay(2, 3)
+
+            # Dismiss any Featurebase/changelog overlays before clicking
+            self._dismiss_overlays()
 
             # Click Add New
             if not self._find_and_click([
@@ -604,6 +618,40 @@ class InstantlyUploader:
                 self.driver.switch_to.window(main)
             elif windows:
                 self.driver.switch_to.window(windows[0])
+        except Exception:
+            pass
+
+    def _dismiss_overlays(self):
+        """Dismiss Featurebase changelog popups and any other overlays that block clicks."""
+        try:
+            # Remove Featurebase changelog overlay (most common blocker)
+            self.driver.execute_script("""
+                document.querySelectorAll(
+                    '.fb-changelog-popup-overlay, [data-featurebase-widget], [class*="featurebase"]'
+                ).forEach(el => el.remove());
+            """)
+
+            # Also try clicking any visible close/dismiss buttons on popups
+            dismiss_selectors = [
+                "//button[contains(@aria-label, 'Close')]",
+                "//button[contains(text(), 'Got it')]",
+                "//button[contains(text(), 'Dismiss')]",
+                "//button[contains(text(), 'Not now')]",
+            ]
+            self.driver.implicitly_wait(0)
+            for selector in dismiss_selectors:
+                try:
+                    btns = self.driver.find_elements(By.XPATH, selector)
+                    for btn in btns:
+                        try:
+                            if btn is not None and btn.is_displayed():
+                                btn.click()
+                                time.sleep(0.3)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            self.driver.implicitly_wait(10)
         except Exception:
             pass
 
