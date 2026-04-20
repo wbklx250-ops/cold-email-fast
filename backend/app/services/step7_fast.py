@@ -127,16 +127,15 @@ async def process_domain_fast(
 
         licensed_user_upn = None
         async with BackgroundSessionLocal() as db:
-            # Check domain-level first, then tenant-level
+            # Check DOMAIN-level only. Each domain gets its own licensed user
+            # (me1@{domain}) because UPN is tied to the domain name. The tenant-level
+            # fallback was legacy from the 1-domain-per-tenant era and broke
+            # multi-domain: Domain1 would mark the tenant as "has licensed user",
+            # causing Domain2/Domain3 to skip creation and reuse Domain1's user.
             d = await db.get(Domain, domain_id)
             if d and d.licensed_user_created and d.licensed_user_upn:
                 licensed_user_upn = d.licensed_user_upn
                 logger.info("[%s] Licensed user already exists (domain): %s", domain, licensed_user_upn)
-            else:
-                t = await db.get(Tenant, tenant_id)
-                if t and t.licensed_user_created and t.licensed_user_upn:
-                    licensed_user_upn = t.licensed_user_upn
-                    logger.info("[%s] Licensed user already exists (tenant): %s", domain, licensed_user_upn)
 
         if not licensed_user_upn:
             create_user_script = f'''
@@ -200,13 +199,10 @@ try {{
 
             licensed_user_upn = f"me1@{domain}"
 
-            # Save to DB (both tenant and domain records)
+            # Save to DOMAIN record only. Licensed user is per-domain in the
+            # multi-domain architecture — writing to the Tenant record causes
+            # sibling domains to skip their own licensed user creation.
             async def _save_licensed_user(db):
-                t = await db.get(Tenant, tenant_id)
-                if t:
-                    t.licensed_user_created = True
-                    t.licensed_user_upn = licensed_user_upn
-                    t.licensed_user_password = mailbox_password
                 d = await db.get(Domain, domain_id)
                 if d:
                     d.licensed_user_created = True
