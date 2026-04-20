@@ -597,37 +597,66 @@ class SecurityDefaultsDisabler:
         self._screenshot("nav_error_manage_link")
         return False
     
-    def _verify_panel_open(self) -> bool:
-        """Verify the Security defaults panel is open by checking for the dropdown."""
+    def _verify_panel_open(self) -> str:
+        """
+        Verify the Security defaults panel is open AND detect current state.
+
+        Returns:
+            "opened_enabled"  — panel open, dropdown shows "Enabled (recommended)"
+            "opened_disabled" — panel open, dropdown shows "Disabled (not recommended)"
+            "opened_unknown"  — panel open but state indeterminate
+            ""                — panel not detected
+        """
         self._log("Verifying panel opened...")
-        
+
         # Wait for panel to appear
         for i in range(10):
             time.sleep(1)
-            
-            # Check for the dropdown toggle (definitive sign panel is open)
-            found = self.driver.execute_script("""
+
+            state = self.driver.execute_script("""
                 // Check for the toggle button that's in the panel
                 var toggle = document.querySelector('span[role="button"][aria-label="Toggle"]');
-                if (toggle && toggle.offsetParent !== null) return 'toggle_found';
-                
-                // Check for dropdown with Enabled/Disabled
+                var panelPresent = !!(toggle && toggle.offsetParent !== null);
+
+                if (!panelPresent) {
+                    // Secondary check: panel text content
+                    var src = document.body.innerHTML;
+                    if (src.includes('Enabled (recommended)') && src.includes('Security defaults')) {
+                        panelPresent = true;
+                    } else if (src.includes('Disabled (not recommended)') && src.includes('Security defaults')) {
+                        panelPresent = true;
+                    }
+                }
+
+                if (!panelPresent) return '';
+
+                // Panel is open — inspect current dropdown value
                 var dropdown = document.querySelector('.fxc-dropdown-input');
-                if (dropdown && dropdown.textContent.includes('Enabled')) return 'dropdown_found';
-                
-                // Check for the panel content
-                if (document.body.innerHTML.includes('Enabled (recommended)') &&
-                    document.body.innerHTML.includes('Security defaults')) return 'content_found';
-                
-                return null;
+                var dropText = dropdown ? (dropdown.textContent || '').trim() : '';
+
+                // Also look for the explicit text anywhere visible in the open panel
+                var bodyText = document.body.innerText || '';
+
+                if (dropText.startsWith('Disabled') ||
+                    (bodyText.includes('Disabled (not recommended)') &&
+                     !bodyText.includes('Enabled (recommended)'))) {
+                    return 'opened_disabled';
+                }
+
+                if (dropText.startsWith('Enabled') ||
+                    bodyText.includes('Enabled (recommended)')) {
+                    return 'opened_enabled';
+                }
+
+                return 'opened_unknown';
             """)
-            
-            if found:
-                self._log(f"Panel verified open: {found}")
-                return True
-        
+
+            if state:
+                self._log(f"Panel verified open: {state}")
+                return state
+
         self._log("Panel not detected after waiting")
-        return False
+        return ""
     
     # =========================================================================
     # DISABLE SECURITY DEFAULTS
@@ -669,11 +698,37 @@ class SecurityDefaultsDisabler:
             return False
         
         # Step 5: Click Disable confirmation if it appears
-        self._click_disable_confirmation()
-        
-        self._log("Security Defaults disabled successfully!")
-        self._screenshot("disable_complete")
-        return True
+        if not self._click_disable_confirmation():
+            self._log("Disable confirmation dialog was present but all click methods failed", "error")
+            self._screenshot("disable_error_confirmation")
+            return False
+
+        # Step 6: Post-save verification — re-read panel state to confirm the
+        # change actually persisted. Microsoft sometimes rolls back the save
+        # silently if there's a downstream validation error.
+        self._log("Post-save verification...")
+        time.sleep(self.WAIT_AFTER_ACTION)
+        final_state = self._verify_panel_open()
+        if final_state == "opened_disabled":
+            self._log("Post-save verification: SD confirmed disabled ✓")
+            self._screenshot("disable_complete")
+            return True
+
+        # Panel may have closed after save — try re-opening it once to re-read state
+        self._log(f"Post-save state is '{final_state}', re-opening panel to re-verify...")
+        if self._navigate_to_security_defaults():
+            final_state = self._verify_panel_open()
+            if final_state == "opened_disabled":
+                self._log("Post-save re-verification: SD confirmed disabled ✓")
+                self._screenshot("disable_complete")
+                return True
+
+        self._log(
+            f"Post-save verification FAILED: panel state is '{final_state}' (expected 'opened_disabled')",
+            "error",
+        )
+        self._screenshot("disable_error_post_save_verify")
+        return False
     
     def _click_dropdown(self) -> bool:
         """Click the dropdown toggle to open options."""
@@ -1020,41 +1075,94 @@ class SecurityDefaultsDisabler:
         self._screenshot("disable_05_after_save")
         return True
     
+    def _is_confirmation_dialog_present(self) -> bool:
+        """
+        Detect whether a confirmation modal/dialog is currently on screen.
+
+        Used to decide whether a failed 'Disable' click is a real error or
+        simply the "no confirm modal needed" Microsoft variant.
+        """
+        try:
+            return bool(self.driver.execute_script("""
+                // Look for obvious modal/dialog indicators carrying 'Disable' text
+                var dialogs = document.querySelectorAll(
+                    '[role="dialog"], .fxs-portal-dialog, .fxc-dialog, [class*="dialog"], [class*="Dialog"]'
+                );
+                for (var i = 0; i < dialogs.length; i++) {
+                    var d = dialogs[i];
+                    if (d.offsetParent !== null && d.textContent.includes('Disable')) {
+                        return true;
+                    }
+                }
+                // Generic: a visible button with just the word 'Disable' on a layer above panel
+                var btns = document.querySelectorAll('span.fxs-button-text, button');
+                for (var i = 0; i < btns.length; i++) {
+                    if (btns[i].textContent.trim() === 'Disable' && btns[i].offsetParent !== null) {
+                        return true;
+                    }
+                }
+                return false;
+            """))
+        except Exception:
+            return False
+
     def _click_disable_confirmation(self) -> bool:
-        """Click Disable confirmation button if it appears."""
+        """
+        Click the Disable confirmation button if a confirmation dialog appeared.
+
+        Return semantics:
+          True  — button was clicked successfully OR no confirmation dialog
+                  was needed (panel went straight to saved state).
+          False — a dialog IS present (button visible) but every click
+                  method we tried failed. This is a genuine error.
+        """
         self._log("Checking for Disable confirmation...")
-        
+
         from selenium.webdriver.common.action_chains import ActionChains
-        
+
         time.sleep(self.WAIT_AFTER_ACTION)
-        
+
+        # Track whether we ever saw the confirm button — if we saw it and
+        # still couldn't click it, that's a real failure.
+        saw_button = False
+
         # Method 1: Selenium click
         try:
             buttons = self.driver.find_elements(By.CSS_SELECTOR, 'span.fxs-button-text, button')
             for btn in buttons:
                 if btn.text.strip() == 'Disable' and btn.is_displayed():
+                    saw_button = True
                     self._log("Clicking Disable confirmation with Selenium...")
-                    btn.click()
-                    time.sleep(self.WAIT_AFTER_ACTION)
-                    self._screenshot("disable_06_confirmed")
-                    return True
+                    try:
+                        btn.click()
+                        time.sleep(self.WAIT_AFTER_ACTION)
+                        self._screenshot("disable_06_confirmed")
+                        return True
+                    except Exception as e:
+                        self._log(f"Selenium click raised: {e}")
+                        break  # Fall through to ActionChains
         except Exception as e:
-            self._log(f"Selenium Disable click failed: {e}")
-        
+            self._log(f"Selenium Disable click enumeration failed: {e}")
+
         # Method 2: ActionChains
         try:
             buttons = self.driver.find_elements(By.CSS_SELECTOR, 'span.fxs-button-text, button')
             for btn in buttons:
                 if btn.text.strip() == 'Disable' and btn.is_displayed():
+                    saw_button = True
                     self._log("Clicking Disable with ActionChains...")
-                    actions = ActionChains(self.driver)
-                    actions.move_to_element(btn).pause(0.3).click().perform()
-                    time.sleep(self.WAIT_AFTER_ACTION)
-                    self._screenshot("disable_06_confirmed")
-                    return True
+                    try:
+                        actions = ActionChains(self.driver)
+                        actions.move_to_element(btn).pause(0.3).click().perform()
+                        time.sleep(self.WAIT_AFTER_ACTION)
+                        self._screenshot("disable_06_confirmed")
+                        return True
+                    except Exception as e:
+                        self._log(f"ActionChains click raised: {e}")
+                        break
         except Exception as e:
-            self._log(f"ActionChains Disable click failed: {e}")
-        
+            self._log(f"ActionChains Disable click enumeration failed: {e}")
+
         # Method 3: JavaScript
         result = self.driver.execute_script("""
             var buttons = document.querySelectorAll('span.fxs-button-text, button');
@@ -1068,19 +1176,140 @@ class SecurityDefaultsDisabler:
             }
             return 'not_found';
         """)
-        
-        self._log(f"Disable confirmation result: {result}")
-        
-        if result != 'not_found':
+
+        self._log(f"Disable confirmation JS result: {result}")
+
+        if result == 'js_clicked':
             time.sleep(self.WAIT_AFTER_ACTION)
             self._screenshot("disable_06_confirmed")
-        
-        return True  # Not finding it is OK
+            return True
+
+        # Nothing clicked via JS. Decide success vs failure based on
+        # whether a dialog was present when we started.
+        if not saw_button and not self._is_confirmation_dialog_present():
+            self._log("No Disable confirmation dialog present — Microsoft likely skipped it")
+            return True
+
+        # Dialog IS present but every click method failed — genuine error
+        self._log(
+            "Disable confirmation dialog was present but all click methods failed",
+            "error",
+        )
+        self._screenshot("disable_error_confirm_clicks_failed")
+        return False
     
     # =========================================================================
     # MAIN ENTRY POINT
     # =========================================================================
     
+    def _pre_check_already_disabled(self, creds: TenantCredentials) -> Optional[bool]:
+        """
+        Non-Selenium pre-check: try to mint a Graph token and read SD state.
+
+        Returns:
+            True  — SD is already disabled (full Selenium flow can be skipped)
+            False — SD is enabled (proceed with Selenium)
+            None  — could not determine (token failed / transient error)
+
+        This is best-effort: ANY failure returns None so the caller proceeds
+        with the full Selenium flow.
+        """
+        try:
+            import asyncio as _asyncio
+            from app.services.sd_graph import verify_or_repair_sd  # type: ignore
+
+            # Use admin_email's onmicrosoft domain for the token URL.
+            # creds.domain is the onmicrosoft sub-domain (e.g. "contoso")
+            tenant_domain = creds.domain
+            if "." not in tenant_domain:
+                tenant_domain = f"{tenant_domain}.onmicrosoft.com"
+            elif not tenant_domain.endswith(".onmicrosoft.com"):
+                # admin_email should be authoritative
+                if "@" in creds.admin_email:
+                    td = creds.admin_email.split("@", 1)[1]
+                    if td.endswith(".onmicrosoft.com"):
+                        tenant_domain = td
+
+            async def _run():
+                return await verify_or_repair_sd(
+                    tenant_domain=tenant_domain,
+                    admin_email=creds.admin_email,
+                    admin_password=creds.admin_password,
+                    auto_fix=False,
+                )
+
+            try:
+                loop = _asyncio.get_event_loop()
+                if loop.is_running():
+                    # We're being called from async context — we shouldn't be,
+                    # but just bail out and let Selenium run.
+                    return None
+            except RuntimeError:
+                pass
+
+            res = _asyncio.run(_run())
+            action = (res or {}).get("action")
+            if action == "already_disabled":
+                return True
+            if action in ("drift_detected",):
+                return False
+            # token_failed / unfixable / anything else — inconclusive
+            return None
+        except Exception as e:
+            self._log(f"pre-check exception (non-fatal): {e}")
+            return None
+
+    def verify_sd_disabled(self, creds: TenantCredentials) -> Dict:
+        """
+        Read-only Selenium fallback: open the Security Defaults panel and
+        report whether SD is currently disabled WITHOUT attempting to change it.
+
+        Used by the reconciliation layer when Graph ROPC is unavailable and
+        we need to know the true state before deciding whether to run a
+        repair.
+
+        Returns:
+            {"success": bool, "sd_disabled": bool|None, "error": str|None, "domain": str}
+        """
+        result: Dict = {
+            "success": False,
+            "sd_disabled": None,
+            "error": None,
+            "domain": creds.domain,
+            "tenant_id": creds.tenant_id,
+        }
+        try:
+            if not self._setup_driver():
+                result["error"] = "Browser setup failed"
+                return result
+            if not self._login(creds):
+                result["error"] = "Login failed"
+                return result
+            if not self._navigate_to_security_defaults():
+                result["error"] = "Navigation failed"
+                return result
+
+            state = self._verify_panel_open()
+            if state == "opened_disabled":
+                result["success"] = True
+                result["sd_disabled"] = True
+            elif state == "opened_enabled":
+                result["success"] = True
+                result["sd_disabled"] = False
+            else:
+                result["error"] = f"Could not determine SD state (panel state='{state}')"
+        except Exception as e:
+            self._log(f"[{creds.domain}] verify_sd_disabled error: {e}", "error")
+            result["error"] = str(e)
+        finally:
+            if self.driver:
+                try:
+                    self.driver.quit()
+                except Exception:
+                    pass
+                self.driver = None
+        return result
+
     def disable_for_tenant(self, creds: TenantCredentials) -> Dict:
         """
         Complete flow to disable Security Defaults for one tenant.
@@ -1089,7 +1318,18 @@ class SecurityDefaultsDisabler:
             {"success": bool, "error": str|None, "domain": str}
         """
         result = {"success": False, "error": None, "domain": creds.domain, "tenant_id": creds.tenant_id}
-        
+
+        # Graph pre-check: if SD is already disabled, skip the whole Selenium flow.
+        try:
+            precheck = self._pre_check_already_disabled(creds)
+            if precheck is True:
+                self._log(f"[{creds.domain}] Graph pre-check: SD already disabled — skipping Selenium flow")
+                result["success"] = True
+                result["already_disabled"] = True
+                return result
+        except Exception as e:
+            self._log(f"[{creds.domain}] Pre-check failed (continuing with Selenium): {e}")
+
         try:
             # Setup browser
             if not self._setup_driver():
@@ -1105,7 +1345,16 @@ class SecurityDefaultsDisabler:
             if not self._navigate_to_security_defaults():
                 result["error"] = "Navigation failed"
                 return result
-            
+
+            # If the panel is already showing Disabled (Selenium-only path),
+            # treat this as success to avoid churn.
+            current_state = self._verify_panel_open()
+            if current_state == "opened_disabled":
+                self._log(f"[{creds.domain}] Panel shows SD already disabled — no action needed")
+                result["success"] = True
+                result["already_disabled"] = True
+                return result
+
             # Disable Security Defaults
             if not self._disable_security_defaults():
                 result["error"] = "Failed to disable Security Defaults"

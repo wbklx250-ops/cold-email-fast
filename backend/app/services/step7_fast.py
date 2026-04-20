@@ -159,31 +159,60 @@ try {{
     $sec2 = ConvertTo-SecureString $tok2.access_token -AsPlainText -Force
     Connect-MgGraph -AccessToken $sec2 -NoWelcome -ErrorAction Stop
 
-    # Check if user already exists
-    $existing = Get-MgUser -Filter "userPrincipalName eq ''me1@{domain}''" -ErrorAction SilentlyContinue
-    if ($existing) {{
-        @{{ success=$true; email="me1@{domain}"; action="already_exists" }} | ConvertTo-Json -Compress
-        Disconnect-MgGraph -ErrorAction SilentlyContinue
-        exit 0
+    # Step 1: Get-or-create user — idempotent. Handles the case where a prior
+    # attempt created the user in M365 but the Python side failed to save it to
+    # the DB (e.g. license assignment threw afterward). Uses Get-MgUser -UserId
+    # (direct UPN lookup), NOT -Filter. The -Filter form can silently return
+    # nothing due to Graph replication lag / missing ConsistencyLevel headers,
+    # which is what caused New-MgUser to throw "Another object with the same
+    # value for property userPrincipalName already exists" on 109 sibling
+    # domains and fail out after 4 retries.
+    $userId = $null
+    $wasCreated = $false
+
+    try {{
+        $existing = Get-MgUser -UserId "me1@{domain}" -ErrorAction Stop
+        $userId = $existing.Id
+    }} catch {{
+        $passwordProfile = @{{
+            Password = "{_ps_escape(mailbox_password)}"
+            ForceChangePasswordNextSignIn = $false
+        }}
+
+        try {{
+            $newUser = New-MgUser -DisplayName "me1" -MailNickname "me1" -UserPrincipalName "me1@{domain}" -PasswordProfile $passwordProfile -AccountEnabled -ErrorAction Stop
+            $userId = $newUser.Id
+            $wasCreated = $true
+        }} catch {{
+            # Race condition fallback: Get-MgUser missed (replication lag) but
+            # New-MgUser sees the conflict. Fetch the now-visible user.
+            if ($_.Exception.Message -like "*already exists*") {{
+                $fallback = Get-MgUser -UserId "me1@{domain}" -ErrorAction Stop
+                $userId = $fallback.Id
+            }} else {{
+                throw
+            }}
+        }}
     }}
 
-    # Create user with license
-    $passwordProfile = @{{
-        Password = "{_ps_escape(mailbox_password)}"
-        ForceChangePasswordNextSignIn = $false
+    # Step 2: Assign license only if the user doesn't already have one.
+    # Previous attempts may have created the user but failed at license
+    # assignment, leaving the user unlicensed; we must be able to fix that
+    # on retry without trying to recreate the user.
+    $userWithLic = Get-MgUser -UserId $userId -Property "AssignedLicenses" -ErrorAction Stop
+    $hasLicense = $userWithLic.AssignedLicenses -and $userWithLic.AssignedLicenses.Count -gt 0
+
+    if (-not $hasLicense) {{
+        $skus = Get-MgSubscribedSku -ErrorAction Stop
+        $sku = $skus | Where-Object {{ ($_.SkuPartNumber -like "*EXCHANGE*" -or $_.SkuPartNumber -like "*BUSINESS*" -or $_.SkuPartNumber -like "*ENTERPRISE*" -or $_.SkuPartNumber -like "*STANDARDPACK*") -and ($_.ConsumedUnits -lt $_.PrepaidUnits.Enabled) }} | Select-Object -First 1
+
+        if ($sku) {{
+            Set-MgUserLicense -UserId $userId -AddLicenses @(@{{SkuId=$sku.SkuId}}) -RemoveLicenses @() -ErrorAction Stop
+            $hasLicense = $true
+        }}
     }}
 
-    $newUser = New-MgUser -DisplayName "me1" -MailNickname "me1" -UserPrincipalName "me1@{domain}" -PasswordProfile $passwordProfile -AccountEnabled -ErrorAction Stop
-
-    # Get available license SKU
-    $skus = Get-MgSubscribedSku -ErrorAction Stop
-    $sku = $skus | Where-Object {{ $_.SkuPartNumber -like "*EXCHANGE*" -or $_.SkuPartNumber -like "*BUSINESS*" -or $_.SkuPartNumber -like "*ENTERPRISE*" }} | Select-Object -First 1
-
-    if ($sku) {{
-        Set-MgUserLicense -UserId $newUser.Id -AddLicenses @(@{{SkuId=$sku.SkuId}}) -RemoveLicenses @() -ErrorAction Stop
-    }}
-
-    @{{ success=$true; email="me1@{domain}"; user_id=$newUser.Id; action="created" }} | ConvertTo-Json -Compress
+    @{{ success=$true; email="me1@{domain}"; user_id=$userId; was_created=$wasCreated; has_license=$hasLicense }} | ConvertTo-Json -Compress
     Disconnect-MgGraph -ErrorAction SilentlyContinue
 }} catch {{
     @{{ success=$false; error=$_.Exception.Message }} | ConvertTo-Json -Compress

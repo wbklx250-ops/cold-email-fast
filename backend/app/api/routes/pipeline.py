@@ -63,6 +63,7 @@ STEP_NAMES = {
     8: "Enable SMTP Auth",
     9: "Export Credentials",
     10: "Upload to Sequencer",
+    11: "Reconciliation & Verification",
 }
 
 
@@ -278,7 +279,7 @@ async def create_and_start(
         "message": "Starting pipeline...",
         "total_domains": len(domains),
         "total_tenants": validation["summary"]["credentials_matched"],
-        "steps": {str(i): {"status": "pending", "completed": 0, "failed": 0, "total": 0} for i in range(1, 11)},
+        "steps": {str(i): {"status": "pending", "completed": 0, "failed": 0, "total": 0} for i in range(1, 12)},
         "errors": [],
         "activity_log": [],
     }
@@ -994,7 +995,7 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                 "message": f"Resuming from step {start_from_step}...",
                 "total_domains": batch.total_domains or 0,
                 "total_tenants": batch.total_tenants or 0,
-                "steps": {str(i): {"status": "pending", "completed": 0, "failed": 0, "total": 0} for i in range(1, 11)},
+                "steps": {str(i): {"status": "pending", "completed": 0, "failed": 0, "total": 0} for i in range(1, 12)},
                 "errors": [],
                 "activity_log": [],
             }
@@ -2111,9 +2112,62 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                 pipeline_jobs[job_id]["steps"]["10"]["status"] = "skipped"
 
         # ================================================================
+        # STEP 11: Reconciliation & Verification (Graph-first, Selenium fallback)
+        # ================================================================
+        if start_from_step <= 11:
+          try:
+            await _update_pipeline(batch_id, 11, "running", "Reconciling SD + SMTP state for all tenants...")
+            await log_activity(batch_id, 11, STEP_NAMES[11], status="started")
+
+            from app.services.batch_reconciliation import reconcile_batch
+
+            recon_summary = await reconcile_batch(batch_id, auto_fix=True)
+
+            if job_id in pipeline_jobs:
+                pipeline_jobs[job_id]["reconciliation"] = recon_summary
+                pipeline_jobs[job_id]["steps"]["11"]["completed"] = (
+                    recon_summary.get("sd_ok", 0)
+                    + recon_summary.get("sd_drift_fixed", 0)
+                )
+                pipeline_jobs[job_id]["steps"]["11"]["failed"] = (
+                    recon_summary.get("sd_drift_unfixable", 0)
+                    + recon_summary.get("smtp_drift_unfixable", 0)
+                )
+                pipeline_jobs[job_id]["steps"]["11"]["total"] = recon_summary.get("total_tenants", 0)
+                pipeline_jobs[job_id]["steps"]["11"]["status"] = (
+                    "completed" if recon_summary.get("status") == "completed" else "error"
+                )
+
+            await log_activity(
+                batch_id, 11, STEP_NAMES[11],
+                status="completed",
+                message=(
+                    f"SD ok={recon_summary.get('sd_ok', 0)} "
+                    f"fixed={recon_summary.get('sd_drift_fixed', 0)} "
+                    f"unfixable={recon_summary.get('sd_drift_unfixable', 0)} | "
+                    f"SMTP ok={recon_summary.get('smtp_ok', 0)} "
+                    f"fixed={recon_summary.get('smtp_drift_fixed', 0)} "
+                    f"unfixable={recon_summary.get('smtp_drift_unfixable', 0)} | "
+                    f"errors={len(recon_summary.get('errors', []))}"
+                ),
+            )
+          except Exception as step_error:
+            logger.error(f"Step 11 CRASHED (continuing): {_fmt_err(step_error)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            await log_activity(batch_id, 11, STEP_NAMES[11], status="error", message=_fmt_err(step_error))
+            if job_id in pipeline_jobs:
+                pipeline_jobs[job_id]["steps"]["11"]["status"] = "error"
+                pipeline_jobs[job_id]["errors"].append({"step": 11, "error": _fmt_err(step_error)})
+        else:
+            logger.info(f"Skipping Step 11 (starting from step {start_from_step})")
+            if job_id in pipeline_jobs:
+                pipeline_jobs[job_id]["steps"]["11"]["status"] = "skipped"
+
+        # ================================================================
         # PIPELINE COMPLETE
         # ================================================================
-        await _update_pipeline(batch_id, 10, "completed", "Pipeline complete!")
+        await _update_pipeline(batch_id, 11, "completed", "Pipeline complete!")
 
         async with SessionLocal() as db:
             batch = await db.get(SetupBatch, batch_id)
@@ -2128,7 +2182,7 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
             pipeline_jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
 
         logger.info(f"✅ Pipeline COMPLETE for batch {batch_id}")
-        await log_activity(batch_id, 10, "Pipeline Complete", status="completed", message="All steps finished")
+        await log_activity(batch_id, 11, "Pipeline Complete", status="completed", message="All steps finished")
 
     except Exception as e:
         logger.error(f"💥 Pipeline CRASHED: {_fmt_err(e)}")

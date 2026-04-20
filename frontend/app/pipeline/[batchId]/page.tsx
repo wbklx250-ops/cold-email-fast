@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { useParams } from "next/navigation";
+import BatchDetail from "@/components/batches/BatchDetail";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -16,6 +17,7 @@ const STEP_NAMES: Record<number, string> = {
   8: "Enable SMTP Auth",
   9: "Export Credentials",
   10: "Upload to Sequencer",
+  11: "Reconciliation & Verification",
 };
 
 interface PipelineStatus {
@@ -414,6 +416,9 @@ export default function PipelineDashboard() {
           );
         })}
       </div>
+
+      {/* Verify & Repair — Graph + PowerShell reconciliation (Step 11) */}
+      <BatchDetail batchId={batchId} />
 
       {/* Domain Status Panel — shows when pipeline is stuck or user clicks "View Domains" */}
       {(showDomainPanel || isError || isPaused) && failedDomains && (
