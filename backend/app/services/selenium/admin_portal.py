@@ -29,6 +29,91 @@ SCREENSHOT_DIR = "/tmp/screenshots"
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
 
+def dismiss_mfa_setup_interrupt(driver, domain: str = "unknown", max_attempts: int = 2) -> bool:
+    """
+    Dismiss the 'You need to set up multifactor authentication' admin center
+    interrupt by clicking 'Skip for now'. Returns True if dismissed, False if
+    not present.
+
+    Safe to call anytime after admin portal login — no-op if interrupt absent.
+    """
+    from selenium.webdriver.common.by import By
+    import time
+
+    for attempt in range(max_attempts):
+        try:
+            current_url = (driver.current_url or "").lower()
+
+            # Detect by URL first (fastest)
+            on_mfa_setup = "mfasetup" in current_url or "registered=false" in current_url
+
+            # Also detect by page text (in case URL doesn't match but modal is overlaid)
+            if not on_mfa_setup:
+                try:
+                    page_text = driver.find_element(By.TAG_NAME, "body").text.lower()
+                    on_mfa_setup = (
+                        "you need to set up multifactor authentication" in page_text
+                        and "skip for now" in page_text
+                    )
+                except Exception:
+                    pass
+
+            if not on_mfa_setup:
+                return False
+
+            logger.info(f"[{domain}] MFA setup interrupt detected, clicking 'Skip for now'")
+
+            # Try in order: most specific → least specific. Skip for now is a LINK
+            # (anchor/button with link styling), Set up now is the primary button.
+            skip_selectors = [
+                (By.XPATH, "//a[normalize-space()='Skip for now']"),
+                (By.XPATH, "//button[normalize-space()='Skip for now']"),
+                (By.XPATH, "//*[normalize-space()='Skip for now']"),
+                (By.XPATH, "//a[contains(normalize-space(), 'Skip for now')]"),
+                (By.XPATH, "//button[contains(normalize-space(), 'Skip for now')]"),
+                (By.PARTIAL_LINK_TEXT, "Skip for now"),
+            ]
+
+            for by, sel in skip_selectors:
+                try:
+                    elems = driver.find_elements(by, sel)
+                    for elem in elems:
+                        if elem.is_displayed():
+                            # JS click bypasses any lingering overlays
+                            driver.execute_script("arguments[0].click();", elem)
+                            logger.info(f"[{domain}] Clicked 'Skip for now' via {sel}")
+                            time.sleep(2)
+                            # Verify dismissed
+                            new_url = (driver.current_url or "").lower()
+                            if "mfasetup" not in new_url:
+                                logger.info(f"[{domain}] MFA setup interrupt dismissed")
+                                return True
+                except Exception as e:
+                    logger.debug(f"[{domain}] Selector {sel} failed: {e}")
+                    continue
+
+            logger.warning(f"[{domain}] Could not find 'Skip for now' on attempt {attempt + 1}")
+            time.sleep(1.5)
+
+        except Exception as e:
+            logger.warning(f"[{domain}] Error during MFA interrupt dismiss attempt {attempt + 1}: {e}")
+            time.sleep(1)
+
+    # Last resort: try navigating away directly. If the interrupt hard-blocks this,
+    # at least we'll see the failure in logs instead of a stuck session.
+    try:
+        logger.warning(f"[{domain}] Falling back to direct navigation to escape MFA interrupt")
+        driver.get("https://admin.microsoft.com/Adminportal/Home#/Domains")
+        time.sleep(3)
+        final_url = (driver.current_url or "").lower()
+        if "mfasetup" not in final_url:
+            return True
+    except Exception as e:
+        logger.error(f"[{domain}] Fallback navigation failed: {e}")
+
+    return False
+
+
 def _cleanup_driver(driver):
     """Properly close driver and cleanup temp profile directory."""
     if not driver:
@@ -627,6 +712,14 @@ def _login_with_mfa(driver, admin_email: str, admin_password: str, totp_secret: 
     except Exception:
         logger.debug(f"[{domain}] No stay signed in prompt")
 
+    # Dismiss the "You need to set up multifactor authentication" interrupt
+    # that admin.cloud.microsoft/mfasetup shows after login even when TOTP
+    # is already enrolled via SSPR. We always click "Skip for now".
+    try:
+        dismiss_mfa_setup_interrupt(driver, domain)
+    except Exception as e:
+        logger.warning(f"[{domain}] MFA setup interrupt dismiss raised: {e}")
+
 
 def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_password, totp_secret, cloudflare_service=None, headless=False):
     """Complete M365 domain setup following EXACT wizard flow.
@@ -712,6 +805,11 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     time.sleep(5)  # Extra wait after login
     
     # ===== STEP 2: NAVIGATE TO DOMAINS =====
+    # Dismiss MFA-setup interrupt if it's still lingering before we navigate
+    try:
+        dismiss_mfa_setup_interrupt(driver, domain)
+    except Exception:
+        pass
     logger.info(f"[{domain}] Step 2: Navigate to domains page")
     driver.get("https://admin.microsoft.com/#/Domains")
     wait_for_page_load(driver, timeout=30)
@@ -737,6 +835,11 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
         safe_click(driver, add_btn, "Add domain button")
     except:
         logger.info(f"[{domain}] Add domain button not found, navigating to wizard directly")
+        # Dismiss MFA setup interrupt if it intercepted the page
+        try:
+            dismiss_mfa_setup_interrupt(driver, domain)
+        except Exception:
+            pass
         driver.get("https://admin.microsoft.com/#/Domains/Wizard")
         wait_for_page_load(driver, timeout=30)
     time.sleep(5)  # Increased from 3
@@ -1639,6 +1742,11 @@ async def enable_org_smtp_auth(
         # The correct URL is: https://admin.cloud.microsoft.com/exchange#/settings
         # This shows a list with: List view preference, Mail flow, Hybrid setup
         logger.info(f"[{domain}] Step 7: Opening Exchange Admin Center Settings...")
+        # Dismiss MFA setup interrupt if the admin portal threw it at us
+        try:
+            dismiss_mfa_setup_interrupt(driver, domain)
+        except Exception:
+            pass
         driver.get("https://admin.cloud.microsoft.com/exchange#/settings")
         wait_for_page_load(driver, timeout=60)
         time.sleep(8)  # Extra time for Settings page to fully load

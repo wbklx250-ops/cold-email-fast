@@ -425,6 +425,15 @@ def _do_login(
     except (NoSuchElementException, Exception):
         pass
 
+    # --- DISMISS MFA SETUP INTERRUPT ---
+    # admin.cloud.microsoft/mfasetup?registered=false shows after every login
+    # even when TOTP is already enrolled via SSPR. We always click "Skip for now".
+    try:
+        from app.services.selenium.admin_portal import dismiss_mfa_setup_interrupt
+        dismiss_mfa_setup_interrupt(driver, tenant_name)
+    except Exception as e:
+        logger.warning(f"[{tenant_name}] MFA setup interrupt dismiss raised: {e}")
+
     # --- VERIFY WE'RE IN THE ADMIN PORTAL ---
     time.sleep(2)
     current_url = driver.current_url.lower()

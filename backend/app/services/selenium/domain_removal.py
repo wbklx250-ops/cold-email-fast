@@ -679,7 +679,16 @@ def do_login(driver, admin_email, admin_password, totp_secret=None):
         time.sleep(3)
     except TimeoutException:
         pass
-    
+
+    # Dismiss the "You need to set up multifactor authentication" admin center
+    # interrupt (admin.cloud.microsoft/mfasetup?registered=false) that Microsoft
+    # shows after every login even when TOTP is enrolled via SSPR.
+    try:
+        from app.services.selenium.admin_portal import dismiss_mfa_setup_interrupt
+        dismiss_mfa_setup_interrupt(driver, admin_email.split("@")[0])
+    except Exception as e:
+        logger.warning(f"MFA setup interrupt dismiss raised: {e}")
+
     time.sleep(5)
     current = driver.current_url
     if "admin.microsoft.com" in current or "admin.cloud.microsoft" in current:
