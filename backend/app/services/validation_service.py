@@ -301,6 +301,19 @@ def cross_validate(
     if len(first_name) < 2 or len(last_name) < 2:
         errors.append("First and last name must each be at least 2 characters for email generation")
 
+    # 3b. Range guard for mailboxes_per_tenant (must be 25-100)
+    if mailboxes_per_tenant < 25 or mailboxes_per_tenant > 100:
+        errors.append(f"mailboxes_per_tenant must be between 25 and 100 (got {mailboxes_per_tenant})")
+
+    # 3c. Warn when a short persona name is combined with a high mailbox count —
+    # the pattern generator may not produce enough unique variations.
+    if mailboxes_per_tenant > 50 and (len(first_name) + len(last_name)) < 9:
+        warnings.append(
+            f"Short name ({first_name} {last_name}) may not generate "
+            f"{mailboxes_per_tenant} unique patterns. "
+            f"Consider a longer persona name or fewer mailboxes."
+        )
+
     # 4. Calculate expected mailboxes
     expected_mailboxes = len(tenants) * domains_per_tenant * mailboxes_per_tenant
 
