@@ -326,8 +326,10 @@ async def run_step6_for_tenant(tenant_id: UUID, domain_id: UUID = None, domain_i
     needs_powershell = True
     needs_admin_ui = True
 
-    # Compute mailbox start index from domain_index (0→1, 1→51, 2→101, etc.)
-    mailbox_start_index = domain_index * 50 + 1
+    # Compute default mailbox start index from domain_index (0→1, 1→51, 2→101, etc.)
+    # Will be recomputed after batch_data is loaded if mailboxes_per_tenant differs from 50.
+    mailboxes_per_tenant = 50
+    mailbox_start_index = domain_index * mailboxes_per_tenant + 1
 
     async with async_session_factory() as db:
         tenant = await db.get(Tenant, tenant_id)
@@ -485,7 +487,11 @@ async def run_step6_for_tenant(tenant_id: UUID, domain_id: UUID = None, domain_i
                 "persona_first_name": batch.persona_first_name,
                 "persona_last_name": batch.persona_last_name,
                 "custom_mailbox_map": batch.custom_mailbox_map,
+                "mailboxes_per_tenant": batch.mailboxes_per_tenant or 50,
             }
+            # Recompute start index with the batch-configured mailbox count
+            mailboxes_per_tenant = batch_data["mailboxes_per_tenant"]
+            mailbox_start_index = domain_index * mailboxes_per_tenant + 1
 
         # Load existing mailboxes into plain dicts
         # When domain_id is provided, only load mailboxes for this specific domain
@@ -684,11 +690,11 @@ async def run_step6_for_tenant(tenant_id: UUID, domain_id: UUID = None, domain_i
                 if not mailbox_data:
                     logger.warning("[%s] Custom mailbox map had no valid entries - falling back to auto-generate", domain)
                     mailbox_data = generate_emails_for_domain(
-                        display_name=persona_display_name, domain=domain, count=50,
+                        display_name=persona_display_name, domain=domain, count=mailboxes_per_tenant,
                     )
             else:
                 mailbox_data = generate_emails_for_domain(
-                    display_name=persona_display_name, domain=domain, count=50,
+                    display_name=persona_display_name, domain=domain, count=mailboxes_per_tenant,
                 )
 
             # Save new mailboxes with fresh session

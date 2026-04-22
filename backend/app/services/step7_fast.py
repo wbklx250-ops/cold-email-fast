@@ -100,6 +100,7 @@ async def process_domain_fast(
     batch_id: UUID,
     batch_data: Dict[str, Any] = None,
     domain_index: int = 0,
+    mailboxes_per_tenant: int = 50,
 ) -> Dict[str, Any]:
     """
     Process a single domain: create licensed user, generate mailboxes, create in Exchange,
@@ -114,7 +115,9 @@ async def process_domain_fast(
     escaped_email = _ps_escape(admin_email)
     escaped_password = _ps_escape(admin_password)
     mailbox_password = MAILBOX_PASSWORD
-    mailbox_start_index = domain_index * 50 + 1
+    # Each domain gets its own mailbox range within the tenant:
+    # domain_index=0 → 1..N, domain_index=1 → N+1..2N, etc.
+    mailbox_start_index = domain_index * mailboxes_per_tenant + 1
 
     logger.info("[%s] === FAST PROCESSING START (no Chrome) ===", domain)
     start_time = time.time()
@@ -259,7 +262,7 @@ try {{
                 or 0
             )
 
-        if existing_count >= 50:
+        if existing_count >= mailboxes_per_tenant:
             logger.info("[%s] Mailboxes already generated (%s exist)", domain, existing_count)
         else:
             # Check for custom mailbox map (CSV-imported emails)
@@ -279,9 +282,9 @@ try {{
                     pw = entry.get("password", "").strip() or mailbox_password
                     mailbox_data.append({"email": email, "local_part": local_part, "display_name": dn, "password": pw})
                 if not mailbox_data:
-                    mailbox_data = generate_emails_for_domain(display_name=display_name, domain=domain, count=50)
+                    mailbox_data = generate_emails_for_domain(display_name=display_name, domain=domain, count=mailboxes_per_tenant)
             else:
-                mailbox_data = generate_emails_for_domain(display_name=display_name, domain=domain, count=50)
+                mailbox_data = generate_emails_for_domain(display_name=display_name, domain=domain, count=mailboxes_per_tenant)
 
             async with BackgroundSessionLocal() as gen_db:
                 for mb in mailbox_data:
@@ -631,6 +634,7 @@ async def run_step7_fast(batch_id: UUID, display_name: str) -> Dict[str, Any]:
             "persona_first_name": batch.persona_first_name,
             "persona_last_name": batch.persona_last_name,
             "custom_mailbox_map": batch.custom_mailbox_map,
+            "mailboxes_per_tenant": batch.mailboxes_per_tenant or 50,
         }
 
         result = await db.execute(
@@ -661,6 +665,7 @@ async def run_step7_fast(batch_id: UUID, display_name: str) -> Dict[str, Any]:
                 "admin_email": tenant.admin_email,
                 "admin_password": tenant.admin_password,
                 "domain_index": d.domain_index_in_tenant or 0,
+                "mailboxes_per_tenant": batch.mailboxes_per_tenant or 50,
             })
 
     total = len(domain_work_items)
@@ -698,6 +703,7 @@ async def run_step7_fast(batch_id: UUID, display_name: str) -> Dict[str, Any]:
                 batch_id=batch_id,
                 batch_data=batch_data,
                 domain_index=item["domain_index"],
+                mailboxes_per_tenant=item["mailboxes_per_tenant"],
             )
             if result.get("success"):
                 successful += 1

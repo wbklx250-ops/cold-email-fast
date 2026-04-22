@@ -104,8 +104,10 @@ class Step6Orchestrator:
             self.domain_id = tenant_data.get("domain_id")
         
         self.domain_index = domain_index
-        # Mailbox numbers for THIS domain: 1-50 for index 0, 51-100 for index 1, 101-150 for index 2
-        self.mailbox_start_index = domain_index * 50 + 1
+        # Mailbox count per domain (configurable, 25-100, defaults to 50 for backward compat)
+        self.mailboxes_per_tenant = tenant_data.get("mailboxes_per_tenant") or 50
+        # Mailbox numbers for THIS domain: e.g., count=50 → 1-50, 51-100, 101-150...
+        self.mailbox_start_index = domain_index * self.mailboxes_per_tenant + 1
         
         self.onmicrosoft_domain = tenant_data["onmicrosoft_domain"]
         self.admin_email = tenant_data["admin_email"]
@@ -337,9 +339,9 @@ class Step6Orchestrator:
                 self.tenant_id,
                 "generate_emails",
                 "in_progress",
-                "Generating 50 email addresses",
+                f"Generating {self.mailboxes_per_tenant} email addresses",
             )
-            mailbox_data = generate_emails_for_domain(self.display_name, self.domain, count=50)
+            mailbox_data = generate_emails_for_domain(self.display_name, self.domain, count=self.mailboxes_per_tenant)
 
             # Add index for numbered display names — offset by domain position within tenant
             # e.g., domain_index=0 → 1-50, domain_index=1 → 51-100, domain_index=2 → 101-150
@@ -359,7 +361,7 @@ class Step6Orchestrator:
                 self.tenant_id,
                 "create_mailboxes",
                 "in_progress",
-                "Creating shared mailboxes (0/50)",
+                f"Creating shared mailboxes (0/{self.mailboxes_per_tenant})",
             )
 
             ps_results = self._create_mailboxes_with_powershell(
@@ -387,7 +389,7 @@ class Step6Orchestrator:
                 self.tenant_id,
                 "fix_display_names",
                 "in_progress",
-                "Fixing display names (0/50)",
+                f"Fixing display names (0/{self.mailboxes_per_tenant})",
             )
             update_progress(
                 self.tenant_id,
@@ -401,7 +403,7 @@ class Step6Orchestrator:
                 self.tenant_id,
                 "fix_upns",
                 "in_progress",
-                "Fixing UPNs (0/50)",
+                f"Fixing UPNs (0/{self.mailboxes_per_tenant})",
             )
             upns_fixed = self._fix_upns(mailbox_data)
             self.results["upns_fixed"] = upns_fixed
@@ -417,7 +419,7 @@ class Step6Orchestrator:
                 self.tenant_id,
                 "enable_accounts",
                 "in_progress",
-                "Enabling accounts (0/50)",
+                f"Enabling accounts (0/{self.mailboxes_per_tenant})",
             )
             enabled = self._enable_accounts(mailbox_data)
             self.results["accounts_enabled"] = enabled
@@ -433,7 +435,7 @@ class Step6Orchestrator:
                 self.tenant_id,
                 "set_passwords",
                 "in_progress",
-                "Setting passwords (0/50)",
+                f"Setting passwords (0/{self.mailboxes_per_tenant})",
             )
             pwd_set = self._set_passwords(mailbox_data)
             self.results["passwords_set"] = pwd_set
@@ -449,7 +451,7 @@ class Step6Orchestrator:
                 self.tenant_id,
                 "delegation",
                 "in_progress",
-                "Adding delegation (0/50)",
+                f"Adding delegation (0/{self.mailboxes_per_tenant})",
             )
             update_progress(
                 self.tenant_id,
