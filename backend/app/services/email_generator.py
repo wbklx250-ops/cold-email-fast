@@ -71,6 +71,27 @@ def generate_email_variations(
             emails.add(f"{first[:i]}.{last[:j]}@{domain}")
             emails.add(f"{last[:j]}.{first[:i]}@{domain}")
 
+    # Pattern 10: letter-suffix fallback for high counts / short names (no digits introduced).
+    # Appends a-z to common base patterns until we have enough unique addresses.
+    if len(emails) < count:
+        import string
+        base_patterns = [
+            f"{first}.{last}",
+            f"{first}{last}",
+            f"{first[0]}{last}",
+            f"{last}.{first}",
+            f"{last}{first}",
+            f"{first}_{last}",
+            f"{first}-{last}",
+        ]
+        for suffix in string.ascii_lowercase:
+            if len(emails) >= count:
+                break
+            for base in base_patterns:
+                if len(emails) >= count:
+                    break
+                emails.add(f"{base}{suffix}@{domain}")
+
     email_list = sorted(list(emails))[:count]
     display_name = f"{first_name} {last_name}".strip()
     return [
