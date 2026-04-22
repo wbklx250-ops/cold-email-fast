@@ -53,6 +53,7 @@ export default function NewPipelinePage() {
   // Form state
   const [batchName, setBatchName] = useState("");
   const [domainsPerTenant, setDomainsPerTenant] = useState(1);
+  const [mailboxesPerTenant, setMailboxesPerTenant] = useState(50);
   const [domainsCsv, setDomainsCsv] = useState<File | null>(null);
   const [tenantsCsv, setTenantsCsv] = useState<File | null>(null);
   const [credentialsTxt, setCredentialsTxt] = useState<File | null>(null);
@@ -107,6 +108,7 @@ export default function NewPipelinePage() {
       formData.append("first_name", firstName);
       formData.append("last_name", lastName);
       formData.append("domains_per_tenant", domainsPerTenant.toString());
+      formData.append("mailboxes_per_tenant", mailboxesPerTenant.toString());
 
       const res = await fetch(`${API_BASE}/api/v1/pipeline/validate`, {
         method: "POST",
@@ -119,7 +121,7 @@ export default function NewPipelinePage() {
     } finally {
       setIsValidating(false);
     }
-  }, [domainsCsv, tenantsCsv, credentialsTxt, firstName, lastName, domainsPerTenant]);
+  }, [domainsCsv, tenantsCsv, credentialsTxt, firstName, lastName, domainsPerTenant, mailboxesPerTenant]);
 
   // Save new sequencer account via API, return account ID
   const saveSequencerAccount = async (): Promise<string> => {
@@ -178,6 +180,7 @@ export default function NewPipelinePage() {
       formData.append("first_name", firstName);
       formData.append("last_name", lastName);
       formData.append("domains_per_tenant", domainsPerTenant.toString());
+      formData.append("mailboxes_per_tenant", mailboxesPerTenant.toString());
       formData.append("sequencer_platform", sequencerPlatform);
       formData.append("sequencer_account_id", accountId);
       formData.append("sequencer_api_key", apiKey);
@@ -252,6 +255,28 @@ export default function NewPipelinePage() {
               </select>
               <p className="mt-1 text-xs text-gray-400">
                 How many custom domains to assign to each M365 tenant. Default is 1.
+              </p>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Mailboxes per Domain
+              </label>
+              <input
+                type="number"
+                min={25}
+                max={100}
+                step={1}
+                value={mailboxesPerTenant}
+                onChange={(e) => {
+                  const raw = Number(e.target.value);
+                  const clamped = Math.max(25, Math.min(100, isNaN(raw) ? 50 : raw));
+                  setMailboxesPerTenant(clamped);
+                  setValidation(null);
+                }}
+                className="w-full rounded-lg border border-gray-300 px-4 py-2.5 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+              />
+              <p className="mt-1 text-xs text-gray-400">
+                How many mailboxes to create per custom domain (25–100). Default is 50.
               </p>
             </div>
           </div>
@@ -459,7 +484,7 @@ export default function NewPipelinePage() {
                   {validation.summary.domains_count} domains ÷ {validation.summary.domains_per_tenant || domainsPerTenant} per tenant = {validation.summary.tenants_count} tenants ✓
                 </p>
                 <p className="text-sm text-gray-700 font-mono">
-                  Expected mailboxes: {validation.summary.tenants_count} tenants × {validation.summary.domains_per_tenant || domainsPerTenant} domains × 50 = {(validation.summary.expected_mailboxes ?? 0).toLocaleString()}
+                  Expected mailboxes: {validation.summary.tenants_count} tenants × {validation.summary.domains_per_tenant || domainsPerTenant} domains × {mailboxesPerTenant} = {(validation.summary.expected_mailboxes ?? 0).toLocaleString()}
                 </p>
               </div>
             )}
