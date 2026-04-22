@@ -1,76 +1,73 @@
-# =================================================================
-# Backend Dockerfile - Cold Email Platform
-# =================================================================
-#
-# Python 3.11 with PowerShell Core for Microsoft 365 integration
-#
-# Build:
-#   docker build -t cold-email-backend .
-#
-# Run:
-#   docker run -p 8000:8000 --env-file .env cold-email-backend
-#
-# =================================================================
+# Railway Deployment Dockerfile - Cold Email Infrastructure Platform
+# PINNED to Debian Bookworm for PowerShell compatibility
 
 FROM python:3.11-slim-bookworm
 
-# Set working directory
-WORKDIR /app
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
 
-# Set environment variables
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
-
-# Install system dependencies and PowerShell Core
+# Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    wget \
-    apt-transport-https \
-    software-properties-common \
-    gnupg \
+    # Chrome/Chromium for Selenium
     chromium \
     chromium-driver \
+    # General utilities
+    wget \
+    curl \
+    gnupg \
+    ca-certificates \
+    apt-transport-https \
+    software-properties-common \
+    # Build tools for Python packages
+    gcc \
+    libpq-dev \
+    # Chrome dependencies
+    fonts-liberation \
+    libasound2 \
+    libatk-bridge2.0-0 \
+    libdrm2 \
+    libgbm1 \
+    libgtk-3-0 \
+    libnspr4 \
+    libnss3 \
+    libxkbcommon0 \
+    libxshmfence1 \
+    xdg-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# Install PowerShell Core (for Microsoft 365 scripts)
-RUN wget -q https://packages.microsoft.com/config/debian/11/packages-microsoft-prod.deb \
-    && dpkg -i packages-microsoft-prod.deb \
-    && rm packages-microsoft-prod.deb \
+# Install PowerShell Core (Debian 12 Bookworm)
+RUN curl -sSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /usr/share/keyrings/microsoft.gpg \
+    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/debian/12/prod bookworm main" > /etc/apt/sources.list.d/microsoft.list \
     && apt-get update \
     && apt-get install -y --no-install-recommends powershell \
     && rm -rf /var/lib/apt/lists/*
 
-# Install ExchangeOnlineManagement module for PowerShell
-RUN pwsh -Command "Set-PSRepository PSGallery -InstallationPolicy Trusted" \
-    && pwsh -Command "Install-Module -Name ExchangeOnlineManagement -Scope AllUsers -Force"
+# Install PowerShell modules for Exchange Online (pinned for stability)
+RUN pwsh -Command "Set-PSRepository -Name PSGallery -InstallationPolicy Trusted" \
+    && pwsh -Command "Install-Module -Name ExchangeOnlineManagement -RequiredVersion 3.1.0 -Force -Scope AllUsers -AcceptLicense -AllowClobber"
 
-# Install Microsoft Graph Users module for PowerShell
-RUN pwsh -Command "Install-Module -Name Microsoft.Graph.Users -Scope AllUsers -Force"
+# Set environment paths
+ENV CHROME_PATH=/usr/bin/chromium
+ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver
+ENV PWSH_PATH=/usr/bin/pwsh
+ENV EXO_REQUIRED_VERSION=3.1.0
 
-# Copy requirements and install Python dependencies
+WORKDIR /app
+
+RUN mkdir -p /tmp/screenshots /app/logs
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
 COPY . .
 
-# Copy PowerShell scripts
-COPY scripts/ ./scripts/
+ENV SCREENSHOT_DIR=/tmp/screenshots
+ENV LOG_DIR=/app/logs
+ENV HEADLESS_MODE=true
 
-# Create non-root user for security
-RUN adduser --disabled-password --gecos '' appuser \
-    && chown -R appuser:appuser /app
-USER appuser
-
-# Expose port
 EXPOSE 8000
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:${PORT:-8000}/health || exit 1
+# start.sh is copied via `COPY . .` above (build context is backend/)
+RUN chmod +x start.sh
 
-# Run migrations then start the application
-# Migrations run first; if they fail the server starts anyway so you can debug
-CMD sh -c "echo '=== Running Alembic Migrations ===' && alembic upgrade head 2>&1 || echo '=== Migration failed (server starting anyway) ===' ; echo '=== Starting Uvicorn ===' && exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"
+CMD ["./start.sh"]

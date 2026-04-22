@@ -1,6 +1,9 @@
 [build]
 builder = "dockerfile"
-dockerfilePath = "Dockerfile"
+# Dockerfile now lives under backend/ so Railway can use either:
+#   - Root Directory = <empty> + dockerfilePath = "backend/Dockerfile"   (this file)
+#   - Root Directory = "backend" + dockerfilePath = "Dockerfile"         (backend/railway.toml if present)
+dockerfilePath = "backend/Dockerfile"
 
 [deploy]
 healthcheckPath = "/health"
