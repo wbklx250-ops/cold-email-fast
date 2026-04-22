@@ -75,6 +75,7 @@ async def validate_inputs(
     first_name: str = Form(...),
     last_name: str = Form(...),
     domains_per_tenant: int = Form(1),
+    mailboxes_per_tenant: int = Form(50),
 ):
     """
     Validate all input files without creating anything.
@@ -104,8 +105,8 @@ async def validate_inputs(
             }
         }
 
-    # Cross-validate (mailboxes_per_tenant always 50)
-    result = cross_validate(domains, tenants, credentials, first_name, last_name, 50, domains_per_tenant)
+    # Cross-validate with user-selected mailboxes_per_tenant (25-100, default 50)
+    result = cross_validate(domains, tenants, credentials, first_name, last_name, mailboxes_per_tenant, domains_per_tenant)
     return result
 
 
@@ -120,6 +121,7 @@ async def create_and_start(
     sequencer_platform: str = Form(""),
     sequencer_account_id: str = Form(""),
     domains_per_tenant: int = Form(1),
+    mailboxes_per_tenant: int = Form(50),
     sequencer_api_key: str = Form(""),
     profile_photo: UploadFile = File(None),
     background_tasks: BackgroundTasks = BackgroundTasks(),
@@ -152,7 +154,7 @@ async def create_and_start(
     if all_errors:
         raise HTTPException(400, detail={"errors": all_errors})
 
-    validation = cross_validate(domains, tenants, credentials, first_name, last_name, 50, domains_per_tenant)
+    validation = cross_validate(domains, tenants, credentials, first_name, last_name, mailboxes_per_tenant, domains_per_tenant)
     if not validation["valid"]:
         raise HTTPException(400, detail={"errors": validation["errors"]})
 
@@ -173,7 +175,7 @@ async def create_and_start(
         new_admin_password="#Sendemails1",  # Always hardcoded
         persona_first_name=first_name,
         persona_last_name=last_name,
-        mailboxes_per_tenant=50,  # Always 50
+        mailboxes_per_tenant=mailboxes_per_tenant,
         domains_per_tenant=domains_per_tenant,
         sequencer_platform=sequencer_platform or None,
         sequencer_login_email=None,  # No longer collected here
