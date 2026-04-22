@@ -67,7 +67,7 @@ ENV HEADLESS_MODE=true
 
 EXPOSE 8000
 
-COPY start.sh .
+# start.sh lives in backend/ and is copied via `COPY backend/ .` above
 RUN chmod +x start.sh
 
 CMD ["./start.sh"]
