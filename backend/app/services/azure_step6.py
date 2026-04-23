@@ -142,20 +142,12 @@ async def run_step6_for_batch(batch_id: UUID, display_name: str) -> Dict[str, An
             logger.error("Batch %s not found", batch_id)
             return {"success": False, "error": "Batch not found"}
 
-        first_name, last_name = (
-            display_name.strip().split(" ", 1)
-            if " " in display_name
-            else (display_name, "")
-        )
-        await db.execute(
-            update(SetupBatch)
-            .where(SetupBatch.id == batch_id)
-            .values(
-                persona_first_name=first_name,
-                persona_last_name=last_name,
-            )
-        )
-        await db.commit()
+        # NOTE: Previously this block overwrote SetupBatch.persona_first_name /
+        # persona_last_name from the `display_name` parameter on every run,
+        # which forced one persona per batch. Per-domain personas (stored on
+        # Domain.persona_first_name / persona_last_name) now take precedence
+        # and the batch-level fields are just the fallback default, set once
+        # at batch creation. Don't rewrite them here.
 
         # Get all DOMAINS needing mailbox creation for this batch
         # (domain-based iteration instead of tenant-based)
@@ -472,6 +464,8 @@ async def run_step6_for_tenant(tenant_id: UUID, domain_id: UUID = None, domain_i
                 "licensed_user_upn": domain_record.licensed_user_upn,
                 "licensed_user_password": domain_record.licensed_user_password,
                 "licensed_user_created": domain_record.licensed_user_created,
+                "persona_first_name": domain_record.persona_first_name,
+                "persona_last_name": domain_record.persona_last_name,
             }
             # Use domain-level licensed user info if available (overrides tenant-level)
             if domain_record.licensed_user_created and domain_record.licensed_user_upn:
@@ -658,11 +652,19 @@ async def run_step6_for_tenant(tenant_id: UUID, domain_id: UUID = None, domain_i
         # ================================================================
         update_progress(tid_str, "generate_emails", "in_progress", "Generating email variations")
 
-        persona_display_name = None
-        if batch_data:
-            persona_display_name = f"{batch_data['persona_first_name'] or ''} {batch_data['persona_last_name'] or ''}".strip()
+        # Prefer per-domain persona, fall back to batch-level persona
+        eff_first = ""
+        eff_last = ""
+        if domain_data:
+            eff_first = (domain_data.get("persona_first_name") or "").strip()
+            eff_last = (domain_data.get("persona_last_name") or "").strip()
+        if not eff_first and batch_data:
+            eff_first = (batch_data.get("persona_first_name") or "").strip()
+        if not eff_last and batch_data:
+            eff_last = (batch_data.get("persona_last_name") or "").strip()
+        persona_display_name = f"{eff_first} {eff_last}".strip()
         if not persona_display_name:
-            raise Exception("Missing persona display name for mailbox generation")
+            raise Exception(f"[{domain}] Missing persona display name (not on domain or batch)")
 
         if not mailbox_list:
             # Need to generate mailboxes

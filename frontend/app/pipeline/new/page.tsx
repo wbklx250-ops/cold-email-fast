@@ -95,7 +95,7 @@ export default function NewPipelinePage() {
 
   // Validate files
   const runValidation = useCallback(async () => {
-    if (!domainsCsv || !tenantsCsv || !firstName || !lastName) return;
+    if (!domainsCsv || !tenantsCsv) return;
 
     setIsValidating(true);
     setError(null);
@@ -154,7 +154,7 @@ export default function NewPipelinePage() {
   };
 
   const handleSubmit = async () => {
-    if (!batchName || !domainsCsv || !tenantsCsv || !firstName || !lastName) {
+    if (!batchName || !domainsCsv || !tenantsCsv) {
       setError("Please fill in all required fields");
       return;
     }
@@ -208,7 +208,7 @@ export default function NewPipelinePage() {
   };
 
   const allFilesUploaded = domainsCsv && tenantsCsv;
-  const canSubmit = batchName && allFilesUploaded && firstName && lastName && validation?.valid;
+  const canSubmit = batchName && allFilesUploaded && validation?.valid;
 
   return (
     <div className="max-w-3xl mx-auto py-8 px-4">
@@ -292,7 +292,7 @@ export default function NewPipelinePage() {
               required
               file={domainsCsv}
               onFile={(f) => { setDomainsCsv(f); setValidation(null); }}
-              hint="Columns: domain, redirect_url (optional)"
+              hint="Columns: domain, redirect_url, first_name, last_name — first_name/last_name optional per row; blank rows use the default below."
             />
             <FileUpload
               label="Tenants CSV"
@@ -325,7 +325,7 @@ export default function NewPipelinePage() {
           <div className="grid grid-cols-2 gap-4">
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">
-                First Name <span className="text-red-500">*</span>
+                Default First Name
               </label>
               <input
                 type="text"
@@ -337,7 +337,7 @@ export default function NewPipelinePage() {
             </div>
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">
-                Last Name <span className="text-red-500">*</span>
+                Default Last Name
               </label>
               <input
                 type="text"
@@ -348,6 +348,9 @@ export default function NewPipelinePage() {
               />
             </div>
           </div>
+          <p className="mt-2 text-xs text-gray-500">
+            Default persona for all domains. Override per-domain by adding <code className="font-mono">first_name</code> and <code className="font-mono">last_name</code> columns to your domains CSV.
+          </p>
         </div>
 
         {/* Section 4: Sequencer (Optional) */}
@@ -444,7 +447,7 @@ export default function NewPipelinePage() {
         </div>
 
         {/* Validate Button */}
-        {allFilesUploaded && firstName && lastName && !validation && (
+        {allFilesUploaded && !validation && (
           <button
             onClick={runValidation}
             disabled={isValidating}

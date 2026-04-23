@@ -82,6 +82,10 @@ class Domain(TimestampUUIDMixin, Base):
     redirect_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     redirect_configured: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
+    # Per-domain persona (overrides batch-level persona_first_name/last_name when set)
+    persona_first_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    persona_last_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+
     # Milestone timestamps
     ns_propagated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     m365_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

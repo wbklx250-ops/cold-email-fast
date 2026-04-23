@@ -72,8 +72,8 @@ async def validate_inputs(
     domains_csv: UploadFile = File(...),
     tenants_csv: UploadFile = File(...),
     credentials_txt: UploadFile = File(None),
-    first_name: str = Form(...),
-    last_name: str = Form(...),
+    first_name: str = Form(""),
+    last_name: str = Form(""),
     domains_per_tenant: int = Form(1),
     mailboxes_per_tenant: int = Form(50),
 ):
@@ -116,8 +116,8 @@ async def create_and_start(
     domains_csv: UploadFile = File(...),
     tenants_csv: UploadFile = File(...),
     credentials_txt: UploadFile = File(None),
-    first_name: str = Form(...),
-    last_name: str = Form(...),
+    first_name: str = Form(""),
+    last_name: str = Form(""),
     sequencer_platform: str = Form(""),
     sequencer_account_id: str = Form(""),
     domains_per_tenant: int = Form(1),
@@ -210,6 +210,10 @@ async def create_and_start(
             # CRITICAL: Clear old tenant linkage so import_tenants can assign new tenants
             existing.tenant_id = None
             existing.redirect_url = d.get("redirect_url", "") or existing.redirect_url
+            # Always overwrite per-domain persona from current CSV so re-uploads
+            # with updated persona take effect. None means "fall back to batch".
+            existing.persona_first_name = d.get("first_name") or None
+            existing.persona_last_name = d.get("last_name") or None
             existing.status = DomainStatus.PURCHASED
             existing.cloudflare_zone_status = existing.cloudflare_zone_status or "pending"
 
@@ -239,6 +243,8 @@ async def create_and_start(
                 name=d["name"],
                 tld=tld,
                 redirect_url=d.get("redirect_url", ""),
+                persona_first_name=d.get("first_name") or None,
+                persona_last_name=d.get("last_name") or None,
                 status=DomainStatus.PURCHASED,
                 cloudflare_zone_status="pending",
                 cloudflare_nameservers=[],

@@ -13,7 +13,15 @@ logger = logging.getLogger(__name__)
 
 def parse_domains_csv_content(content: str) -> Tuple[List[Dict], List[str]]:
     """
-    Parse domains CSV. Expected columns: domain (required), redirect_url (optional).
+    Parse domains CSV. Expected columns:
+      - domain (required)
+      - redirect_url (optional)
+      - first_name + last_name (optional per-domain persona, preferred form)
+      - firstname + lastname (same, alt spelling)
+      - display_name / displayname (split on LAST whitespace so last token wins:
+        "Mary Jane Smith" -> first="Mary Jane", last="Smith")
+
+    Per-row persona falls back to the batch-level first/last on empty.
     Returns (parsed_domains, errors).
     """
     errors = []
@@ -23,23 +31,23 @@ def parse_domains_csv_content(content: str) -> Tuple[List[Dict], List[str]]:
         reader = csv.DictReader(io.StringIO(content))
         columns = reader.fieldnames or []
 
-        # Check for domain column (flexible naming)
-        domain_col = None
-        for col in columns:
-            if col.strip().lower() in ("domain", "domain_name", "name"):
-                domain_col = col
-                break
+        # --- Column detection (case/whitespace-insensitive) ---
+        def _find(*candidates: str) -> Optional[str]:
+            wanted = {c.lower() for c in candidates}
+            for col in columns:
+                if col.strip().lower() in wanted:
+                    return col
+            return None
 
+        domain_col = _find("domain", "domain_name", "name")
         if not domain_col:
             errors.append(f"CSV must have a 'domain' column. Found: {', '.join(columns)}")
             return domains, errors
 
-        # Check for redirect column
-        redirect_col = None
-        for col in columns:
-            if col.strip().lower() in ("redirect_url", "redirect", "url"):
-                redirect_col = col
-                break
+        redirect_col = _find("redirect_url", "redirect", "url")
+        first_col = _find("first_name", "firstname")
+        last_col = _find("last_name", "lastname")
+        display_col = _find("display_name", "displayname")
 
         for i, row in enumerate(reader, start=2):
             domain_name = row.get(domain_col, "").strip().lower()
@@ -52,9 +60,35 @@ def parse_domains_csv_content(content: str) -> Tuple[List[Dict], List[str]]:
                 continue
 
             redirect_url = row.get(redirect_col, "").strip() if redirect_col else ""
+
+            # --- Per-row persona parsing ---
+            parsed_first = ""
+            parsed_last = ""
+            if first_col or last_col:
+                # Explicit first/last columns (preferred, unambiguous)
+                parsed_first = (row.get(first_col, "") if first_col else "").strip()
+                parsed_last = (row.get(last_col, "") if last_col else "").strip()
+            elif display_col:
+                raw_display = (row.get(display_col, "") or "").strip()
+                if raw_display:
+                    # Split on LAST whitespace so the last token becomes the surname:
+                    # "Mary Jane Smith" -> first="Mary Jane", last="Smith".
+                    # This matches the parse_display_name convention used by
+                    # email_generator.py (last = parts[-1]).
+                    parts = raw_display.rsplit(None, 1)
+                    if len(parts) == 2:
+                        parsed_first, parsed_last = parts[0].strip(), parts[1].strip()
+                    else:
+                        # Single token: put it all in first_name, leave last blank.
+                        # cross_validate will flag this row if no batch default exists.
+                        parsed_first = parts[0].strip()
+                        parsed_last = ""
+
             domains.append({
                 "name": domain_name,
                 "redirect_url": redirect_url,
+                "first_name": parsed_first or "",   # "" means "use batch-level fallback"
+                "last_name": parsed_last or "",
             })
 
     except Exception as e:
@@ -297,19 +331,46 @@ def cross_validate(
             f"Domain count ({len(domains)}) is not evenly divisible by domains_per_tenant ({domains_per_tenant})."
         )
 
-    # 3. Check name generates enough patterns
-    if len(first_name) < 2 or len(last_name) < 2:
-        errors.append("First and last name must each be at least 2 characters for email generation")
+    # 3. Per-domain effective-name check.
+    # The global first/last are no longer required; each domain row may supply
+    # its own. For each domain, compute the effective name (row value or
+    # batch-level fallback) and flag rows where first OR last is < 2 chars.
+    global_first = (first_name or "").strip()
+    global_last = (last_name or "").strip()
+    domains_with_custom_persona = 0
+    missing_name_domains = []
+    for d in domains:
+        row_first = (d.get("first_name") or "").strip()
+        row_last = (d.get("last_name") or "").strip()
+        if row_first and row_last:
+            domains_with_custom_persona += 1
+        eff_first = row_first or global_first
+        eff_last = row_last or global_last
+        if len(eff_first) < 2 or len(eff_last) < 2:
+            missing_name_domains.append(d.get("name", "?"))
+
+    for name in missing_name_domains:
+        errors.append(
+            f"Row for '{name}': missing first/last name "
+            f"(not in CSV and no batch default provided)"
+        )
 
     # 3b. Range guard for mailboxes_per_tenant (must be 25-100)
     if mailboxes_per_tenant < 25 or mailboxes_per_tenant > 100:
         errors.append(f"mailboxes_per_tenant must be between 25 and 100 (got {mailboxes_per_tenant})")
 
-    # 3c. Warn when a short persona name is combined with a high mailbox count —
-    # the pattern generator may not produce enough unique variations.
-    if mailboxes_per_tenant > 50 and (len(first_name) + len(last_name)) < 9:
+    # 3c. Warn when a short GLOBAL persona name is combined with a high mailbox
+    # count — the pattern generator may not produce enough unique variations.
+    # Only evaluated against the global default so a blank global + per-domain
+    # CSV doesn't trip this.
+    if (
+        mailboxes_per_tenant > 50
+        and global_first
+        and global_last
+        and (len(global_first) + len(global_last)) < 9
+    ):
         warnings.append(
-            f"Short name ({first_name} {last_name}) may not generate "
+            f"Short name ({global_first} {global_last}) may not generate "
             f"{mailboxes_per_tenant} unique patterns. "
             f"Consider a longer persona name or fewer mailboxes."
         )
@@ -328,5 +389,6 @@ def cross_validate(
             "credentials_matched": matched_count,
             "domains_linked": len(tenants) * domains_per_tenant,
             "expected_mailboxes": expected_mailboxes,
+            "domains_with_custom_persona": domains_with_custom_persona,
         }
     }

@@ -101,6 +101,8 @@ async def process_domain_fast(
     batch_data: Dict[str, Any] = None,
     domain_index: int = 0,
     mailboxes_per_tenant: int = 50,
+    persona_first_name: str = None,
+    persona_last_name: str = None,
 ) -> Dict[str, Any]:
     """
     Process a single domain: create licensed user, generate mailboxes, create in Exchange,
@@ -109,8 +111,31 @@ async def process_domain_fast(
     This is the fast replacement for run_step6_for_tenant in azure_step6.py.
     """
     domain = domain_name
+
+    # Resolve effective persona: domain-level overrides batch-level,
+    # which overrides the legacy display_name parameter.
+    eff_first = (persona_first_name or "").strip()
+    eff_last = (persona_last_name or "").strip()
+    if not eff_first and batch_data:
+        eff_first = (batch_data.get("persona_first_name") or "").strip()
+    if not eff_last and batch_data:
+        eff_last = (batch_data.get("persona_last_name") or "").strip()
+    effective_display_name = f"{eff_first} {eff_last}".strip()
+    if not effective_display_name:
+        # Fallback to legacy display_name parameter
+        effective_display_name = (display_name or "").strip()
+    if not effective_display_name:
+        logger.error("[%s] No persona name available (domain, batch, or legacy)", domain)
+        return {
+            "success": False,
+            "domain": domain_name,
+            "error": "No persona name available (not set on domain or batch)",
+            "elapsed_seconds": 0,
+        }
+
+    display_name = effective_display_name
     first_name, last_name = (
-        display_name.strip().split(" ", 1) if " " in display_name else (display_name, "")
+        display_name.rsplit(None, 1) if " " in display_name else (display_name, "")
     )
     escaped_email = _ps_escape(admin_email)
     escaped_password = _ps_escape(admin_password)
@@ -666,6 +691,8 @@ async def run_step7_fast(batch_id: UUID, display_name: str) -> Dict[str, Any]:
                 "admin_password": tenant.admin_password,
                 "domain_index": d.domain_index_in_tenant or 0,
                 "mailboxes_per_tenant": batch.mailboxes_per_tenant or 50,
+                "persona_first_name": d.persona_first_name,
+                "persona_last_name": d.persona_last_name,
             })
 
     total = len(domain_work_items)
@@ -704,6 +731,8 @@ async def run_step7_fast(batch_id: UUID, display_name: str) -> Dict[str, Any]:
                 batch_data=batch_data,
                 domain_index=item["domain_index"],
                 mailboxes_per_tenant=item["mailboxes_per_tenant"],
+                persona_first_name=item.get("persona_first_name"),
+                persona_last_name=item.get("persona_last_name"),
             )
             if result.get("success"):
                 successful += 1
