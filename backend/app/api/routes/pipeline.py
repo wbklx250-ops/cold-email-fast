@@ -234,6 +234,14 @@ async def create_and_start(
             existing.step6_mailboxes_created = 0
             existing.step6_skipped = False
             existing.error_message = None
+            # CRITICAL: Also reset CF verification state. Zone IDs stay (pre-flight
+            # in run_pipeline Step 1 validates them across all accounts), but the
+            # "I verified these records exist" flags must clear so Step 4 re-checks.
+            existing.phase1_cname_added = False
+            existing.phase1_dmarc_added = False
+            existing.dns_records_created = False
+            existing.redirect_configured = False
+            existing.cloudflare_zone_status = "pending"
             existing.domain_index_in_tenant = 0  # Will be re-assigned by auto_link_domains
 
             imported_domain_count += 1
@@ -1032,6 +1040,83 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
           try:
             await _update_pipeline(batch_id, 1, "running", "Creating Cloudflare zones...")
             await log_activity(batch_id, 1, STEP_NAMES[1], status="started", message="Starting zone creation")
+
+            # ============================================================
+            # PRE-FLIGHT: Validate/refresh cloudflare_zone_id across ALL CF accounts.
+            # Domains re-assigned from deleted batches carry stale zone_ids that may
+            # be in a different CF account or no longer exist. get_or_create_zone()
+            # searches all accounts and prefers active zones. If zone changes, clear
+            # downstream flags so DNS/redirect/phase1 loops re-verify.
+            # ============================================================
+            async with SessionLocal() as db:
+                all_batch_domains = (await db.execute(
+                    select(Domain).where(Domain.batch_id == batch_id)
+                )).scalars().all()
+
+                logger.info(
+                    f"Step 1 pre-flight: validating CF state for {len(all_batch_domains)} "
+                    f"domains across all accounts"
+                )
+
+                preflight_refreshed = 0
+                preflight_unchanged = 0
+                preflight_errors = 0
+
+                for domain in all_batch_domains:
+                    if await _check_paused_or_stopped(batch_id):
+                        await _update_pipeline(batch_id, 1, "paused", "Paused by user")
+                        return
+
+                    try:
+                        zone_data = await cloudflare_service.get_or_create_zone(domain.name)
+                        new_zone_id = zone_data.get("zone_id")
+                        new_ns = zone_data.get("nameservers") or []
+                        new_status = zone_data.get("status", "pending")
+                        account_label = zone_data.get("account_label", "?")
+                        already_existed = zone_data.get("already_existed", False)
+
+                        zone_changed = domain.cloudflare_zone_id != new_zone_id
+                        ns_changed = (domain.cloudflare_nameservers or []) != new_ns
+
+                        if zone_changed or ns_changed or not domain.cloudflare_zone_id:
+                            logger.info(
+                                f"[{domain.name}] CF pre-flight refresh: "
+                                f"zone_id {domain.cloudflare_zone_id} -> {new_zone_id} "
+                                f"(account={account_label}, status={new_status}, "
+                                f"already_existed={already_existed})"
+                            )
+                            domain.cloudflare_zone_id = new_zone_id
+                            domain.cloudflare_nameservers = new_ns
+                            domain.cloudflare_zone_status = new_status
+                            if zone_changed:
+                                domain.phase1_cname_added = False
+                                domain.phase1_dmarc_added = False
+                                domain.dns_records_created = False
+                                domain.redirect_configured = False
+                            preflight_refreshed += 1
+                        else:
+                            preflight_unchanged += 1
+
+                    except Exception as e:
+                        preflight_errors += 1
+                        logger.warning(f"[{domain.name}] CF pre-flight failed: {e}")
+                        # Don't fail the pipeline — existing Step 1 loop will catch any
+                        # domains that still have a null zone_id after this.
+
+                    await db.commit()
+
+                logger.info(
+                    f"Step 1 pre-flight complete: refreshed={preflight_refreshed}, "
+                    f"unchanged={preflight_unchanged}, errors={preflight_errors}"
+                )
+                await log_activity(
+                    batch_id, 1, STEP_NAMES[1],
+                    status="info",
+                    message=(
+                        f"Pre-flight: {preflight_refreshed} refreshed, "
+                        f"{preflight_unchanged} unchanged, {preflight_errors} errors"
+                    ),
+                )
 
             async with SessionLocal() as db:
                 domains = (await db.execute(
