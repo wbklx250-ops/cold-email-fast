@@ -12,6 +12,7 @@ interface ValidationResult {
   summary: {
     domains_count: number;
     tenants_count: number;
+    tenants_used?: number;
     domains_per_tenant: number;
     credentials_matched: number;
     credentials_unmatched: number;
@@ -484,10 +485,10 @@ export default function NewPipelinePage() {
             {validation.valid && (
               <div className="mb-3 space-y-1">
                 <p className="text-sm text-gray-700 font-mono">
-                  {validation.summary.domains_count} domains ÷ {validation.summary.domains_per_tenant || domainsPerTenant} per tenant = {validation.summary.tenants_count} tenants ✓
+                  {validation.summary.domains_count} domains ÷ {validation.summary.domains_per_tenant || domainsPerTenant} per tenant = {validation.summary.tenants_used ?? validation.summary.tenants_count} tenant(s) used ✓
                 </p>
                 <p className="text-sm text-gray-700 font-mono">
-                  Expected mailboxes: {validation.summary.tenants_count} tenants × {validation.summary.domains_per_tenant || domainsPerTenant} domains × {mailboxesPerTenant} = {(validation.summary.expected_mailboxes ?? 0).toLocaleString()}
+                  Expected mailboxes: {validation.summary.domains_count} domains × {mailboxesPerTenant} = {(validation.summary.expected_mailboxes ?? 0).toLocaleString()}
                 </p>
               </div>
             )}

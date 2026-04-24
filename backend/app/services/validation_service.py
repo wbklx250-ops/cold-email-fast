@@ -318,17 +318,21 @@ def cross_validate(
     if unmatched_tenants and tenants_with_embedded_creds == 0:
         warnings.append(f"{len(unmatched_tenants)} tenant(s) have no matching credentials")
 
-    # 2. Check domain-tenant count alignment (N:1 check)
-    expected_domain_count = len(tenants) * domains_per_tenant
-    if len(domains) != expected_domain_count:
+    # 2. Check domain-tenant capacity (allow partial fills, error only on overflow)
+    max_domain_capacity = len(tenants) * domains_per_tenant
+    if len(domains) > max_domain_capacity:
         errors.append(
-            f"With {domains_per_tenant} domain(s) per tenant and {len(tenants)} tenants, "
-            f"expected {expected_domain_count} domains but got {len(domains)}. "
-            f"Domain count must be exactly tenants × {domains_per_tenant}."
+            f"Too many domains: {len(domains)} domains exceed capacity of "
+            f"{len(tenants)} tenants × {domains_per_tenant} = {max_domain_capacity}. "
+            f"Reduce domain count or add more tenants."
         )
-    elif len(domains) % domains_per_tenant != 0:
-        errors.append(
-            f"Domain count ({len(domains)}) is not evenly divisible by domains_per_tenant ({domains_per_tenant})."
+    elif len(domains) < max_domain_capacity:
+        # Partial fill — ceiling division to get tenants actually used
+        tenants_used = -(-len(domains) // domains_per_tenant)
+        tenants_unused = len(tenants) - tenants_used
+        warnings.append(
+            f"{len(domains)} domains will fill {tenants_used} tenant(s); "
+            f"{tenants_unused} tenant(s) will remain unused."
         )
 
     # 3. Per-domain effective-name check.
@@ -375,8 +379,8 @@ def cross_validate(
             f"Consider a longer persona name or fewer mailboxes."
         )
 
-    # 4. Calculate expected mailboxes
-    expected_mailboxes = len(tenants) * domains_per_tenant * mailboxes_per_tenant
+    # 4. Calculate expected mailboxes (based on actual domains, not tenant capacity)
+    expected_mailboxes = len(domains) * mailboxes_per_tenant
 
     return {
         "valid": len(errors) == 0,
@@ -387,7 +391,8 @@ def cross_validate(
             "tenants_count": len(tenants),
             "domains_per_tenant": domains_per_tenant,
             "credentials_matched": matched_count,
-            "domains_linked": len(tenants) * domains_per_tenant,
+            "domains_linked": min(len(domains), len(tenants) * domains_per_tenant),
+            "tenants_used": -(-len(domains) // domains_per_tenant) if domains_per_tenant else 0,
             "expected_mailboxes": expected_mailboxes,
             "domains_with_custom_persona": domains_with_custom_persona,
         }
