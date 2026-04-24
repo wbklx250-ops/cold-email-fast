@@ -1692,7 +1692,11 @@ class MultiCloudflareService:
         return await svc.ensure_verification_txt(zone_id, domain, txt_value)
 
     async def create_zone(self, domain_name: str) -> dict:
-        return await self.primary.create_zone(domain_name)
+        """
+        Search ALL Cloudflare accounts for an existing zone first, create in primary only if not found.
+        Returns the same shape as CloudflareService.create_zone() plus extra keys that callers ignore.
+        """
+        return await self.get_or_create_zone(domain_name)
 
     async def create_phase1_dns(self, zone_id: str, domain: str) -> dict:
         svc = await self._find_service_for_zone(zone_id)
