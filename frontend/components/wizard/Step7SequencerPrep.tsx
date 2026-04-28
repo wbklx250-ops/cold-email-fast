@@ -13,6 +13,10 @@ interface TenantStep7Status {
   security_defaults_disabled: boolean;
   security_defaults_error: string | null;
   security_defaults_disabled_at: string | null;
+  conditional_access_disabled?: boolean;
+  conditional_access_error?: string | null;
+  conditional_access_disabled_at?: string | null;
+  conditional_access_policies_disabled_count?: number;
   error: string | null;
   completed_at: string | null;
 }
@@ -575,7 +579,17 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
                   </td>
                   <td className="px-4 py-3 text-center">
                     {t.security_defaults_disabled ? (
-                      <span className="text-green-500 text-lg">&#10003;</span>
+                      <span className="inline-flex items-center gap-1">
+                        <span className="text-green-500 text-lg">&#10003;</span>
+                        {t.conditional_access_disabled && (
+                          <span
+                            title={`Disabled ${t.conditional_access_policies_disabled_count ?? 0} Microsoft-managed Conditional Access MFA policy(ies)`}
+                            className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-purple-100 text-purple-800"
+                          >
+                            via CA
+                          </span>
+                        )}
+                      </span>
                     ) : (
                       <span className="text-gray-300">&mdash;</span>
                     )}
@@ -591,7 +605,7 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
                     })()}
                   </td>
                   <td className="px-4 py-3 text-sm text-red-500 max-w-xs truncate">
-                    {t.error || t.security_defaults_error || t.app_consent_error || "\u2014"}
+                    {t.error || t.security_defaults_error || t.conditional_access_error || t.app_consent_error || "\u2014"}
                   </td>
                   <td className="px-4 py-3 text-right">
                     {!t.step7_complete && (

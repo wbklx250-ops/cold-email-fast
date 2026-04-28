@@ -80,6 +80,15 @@ class Tenant(TimestampUUIDMixin, Base):
     security_defaults_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     security_defaults_disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # === CONDITIONAL ACCESS TRACKING ===
+    # Some tenants ship with Microsoft-managed CA policies that block our automation
+    # by enforcing MFA. When detected, step8 disables the targeted MFA policies via
+    # Graph PATCH and records the outcome here.
+    conditional_access_disabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    conditional_access_disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    conditional_access_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    conditional_access_policies_disabled_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
     # === OAUTH TOKENS ===
     access_token: Mapped[str | None] = mapped_column(Text, nullable=True)  # ENCRYPT IN PROD!
     refresh_token: Mapped[str | None] = mapped_column(Text, nullable=True)  # ENCRYPT IN PROD!

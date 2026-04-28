@@ -5349,6 +5349,17 @@ async def get_step7_status(
                 "security_defaults_disabled_at": t.security_defaults_disabled_at.isoformat()
                 if getattr(t, "security_defaults_disabled_at", None)
                 else None,
+                # === CONDITIONAL ACCESS PATH ===
+                # Set when SD is hidden by Microsoft-managed CA policies and we
+                # disabled those policies via Graph instead of toggling SD.
+                "conditional_access_disabled": getattr(t, "conditional_access_disabled", False) or False,
+                "conditional_access_error": getattr(t, "conditional_access_error", None),
+                "conditional_access_disabled_at": t.conditional_access_disabled_at.isoformat()
+                if getattr(t, "conditional_access_disabled_at", None)
+                else None,
+                "conditional_access_policies_disabled_count": getattr(
+                    t, "conditional_access_policies_disabled_count", 0
+                ) or 0,
                 "error": getattr(t, "step7_error", None),
                 "completed_at": t.step7_completed_at.isoformat()
                 if getattr(t, "step7_completed_at", None)

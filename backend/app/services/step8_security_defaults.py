@@ -64,6 +64,11 @@ class SecurityDefaultsDisabler:
         self.headless = headless
         self.worker_id = worker_id
         self.driver: Optional[webdriver.Chrome] = None
+        # Set to True by _click_manage_security_defaults when it detects the
+        # "Conditional Access has replaced Security Defaults" UI variant.
+        # Inspected by disable_for_tenant() to dispatch to the CA-disable path.
+        self._ca_replaces_sd_detected: bool = False
+
     
     def _log(self, message: str, level: str = "info"):
         """Log with worker ID prefix."""
@@ -488,12 +493,93 @@ class SecurityDefaultsDisabler:
         self._screenshot("nav_error_properties")
         return False
     
+    def _detect_ca_replaces_sd(self) -> bool:
+        """
+        Detect the "Conditional Access has replaced Security Defaults" UI variant.
+
+        On tenants that have Microsoft-managed CA policies (most newer ones),
+        Microsoft hides the "Manage security defaults" link entirely and shows:
+          - A blue info banner mentioning "Conditional Access policies which
+            prevents you from enabling security defaults"
+          - A "Manage Conditional Access" link in place of "Manage security defaults"
+
+        Returns True if this state is detected in the main document or any iframe.
+        """
+        try:
+            # Check main document
+            self.driver.switch_to.default_content()
+            if self._page_has_ca_replacement_text():
+                return True
+
+            # Check iframes (Properties content typically lives in one)
+            iframes = self.driver.find_elements(By.TAG_NAME, "iframe")
+            for iframe in iframes:
+                try:
+                    self.driver.switch_to.frame(iframe)
+                    if self._page_has_ca_replacement_text():
+                        self.driver.switch_to.default_content()
+                        return True
+                    self.driver.switch_to.default_content()
+                except Exception:
+                    self.driver.switch_to.default_content()
+            return False
+        except Exception as e:
+            self._log(f"_detect_ca_replaces_sd error (treating as False): {e}")
+            try:
+                self.driver.switch_to.default_content()
+            except Exception:
+                pass
+            return False
+
+    def _page_has_ca_replacement_text(self) -> bool:
+        """JS check: does the current document contain the CA-replaces-SD signals?"""
+        try:
+            return bool(self.driver.execute_script("""
+                var bodyText = (document.body && document.body.innerText) || '';
+                var bodyHtml = (document.body && document.body.innerHTML) || '';
+
+                // Strong signal #1: the banner text
+                if (bodyText.indexOf('Conditional Access policies which prevents you from enabling security defaults') !== -1) {
+                    return true;
+                }
+                // Slight phrasing variants
+                if (/Conditional Access[^.]{0,80}prevents[^.]{0,80}security defaults/i.test(bodyText)) {
+                    return true;
+                }
+
+                // Strong signal #2: a visible "Manage Conditional Access" link/button
+                var clickables = document.querySelectorAll('a, [role="link"], [role="button"], span, button');
+                for (var i = 0; i < clickables.length; i++) {
+                    var el = clickables[i];
+                    var t = (el.textContent || '').trim();
+                    if (t === 'Manage Conditional Access' && el.offsetParent !== null) {
+                        return true;
+                    }
+                }
+
+                return false;
+            """))
+        except Exception:
+            return False
+
     def _click_manage_security_defaults(self) -> bool:
         """Click 'Manage security defaults' link to open the panel."""
         self._log("Step 3: Clicking 'Manage security defaults'...")
-        
+
         for attempt in range(5):
             self._log(f"Manage security defaults click attempt {attempt + 1}...")
+
+            # Before each retry, check if this tenant has CA in place of SD.
+            # If so, short-circuit out — caller will route to the CA-disable path.
+            if attempt >= 1 and self._detect_ca_replaces_sd():
+                self._log(
+                    "Detected 'Conditional Access has replaced Security Defaults' UI variant — "
+                    "short-circuiting SD click loop"
+                )
+                self._ca_replaces_sd_detected = True
+                self._screenshot("nav_03_ca_replaces_sd_detected")
+                return False
+
             
             # First try in iframes (where Properties content usually is)
             self.driver.switch_to.default_content()
@@ -1259,6 +1345,138 @@ class SecurityDefaultsDisabler:
             self._log(f"pre-check exception (non-fatal): {e}")
             return None
 
+    def _disable_ca_policies_for_tenant(self, creds: TenantCredentials) -> Dict:
+        """
+        CA-disable path: mint a Graph token (ROPC → device-code fallback) and
+        call ca_policies.disable_targeted_mfa_policies to PATCH every
+        Microsoft-managed MFA Conditional Access policy to state="disabled".
+
+        This runs when _detect_ca_replaces_sd flagged that Microsoft has hidden
+        the "Manage security defaults" UI on this tenant (because CA enforces MFA).
+
+        Returns a dict suitable for merging into disable_for_tenant's result:
+            {
+              "success": bool,
+              "error": str|None,
+              "ca_policies_disabled": int,
+              "ca_policies_already_disabled": int,
+              "ca_policies_disabled_names": [str, ...],
+              "ca_policies_left_enabled": [{id, displayName, templateId}, ...],
+              "ca_policies_failed": [{id, displayName, error}, ...],
+              "ca_total_policies": int,
+              "ca_targeted_count": int,
+              "token_method": str|None,    # "ropc" or "device_code"
+            }
+        """
+        import asyncio as _asyncio
+        from app.services import ca_policies as _ca  # type: ignore
+
+        out: Dict = {
+            "success": False,
+            "error": None,
+            "ca_policies_disabled": 0,
+            "ca_policies_already_disabled": 0,
+            "ca_policies_disabled_names": [],
+            "ca_policies_left_enabled": [],
+            "ca_policies_failed": [],
+            "ca_total_policies": 0,
+            "ca_targeted_count": 0,
+            "token_method": None,
+        }
+
+        # Resolve the onmicrosoft tenant domain for ROPC URL.
+        tenant_domain = creds.domain or ""
+        if "." not in tenant_domain:
+            tenant_domain = f"{tenant_domain}.onmicrosoft.com"
+        elif not tenant_domain.endswith(".onmicrosoft.com"):
+            if "@" in (creds.admin_email or ""):
+                td = creds.admin_email.split("@", 1)[1]
+                if td.endswith(".onmicrosoft.com"):
+                    tenant_domain = td
+
+        async def _mint_token() -> Optional[str]:
+            # Try ROPC first using the well-known Azure PowerShell client.
+            # This client has Policy.ReadWrite.ConditionalAccess pre-consented.
+            try:
+                from app.services.sd_graph import get_ropc_graph_token  # type: ignore
+                tok = await get_ropc_graph_token(
+                    tenant_domain=tenant_domain,
+                    admin_email=creds.admin_email,
+                    admin_password=creds.admin_password,
+                )
+                if tok and tok.get("access_token"):
+                    out["token_method"] = "ropc"
+                    return tok["access_token"]
+            except Exception as e:
+                self._log(f"[{creds.domain}] CA path: ROPC token error: {e}", "warning")
+
+            # Fall back to device-code (Selenium-assisted). Reuses the existing
+            # DeviceCodeAuth helper. Requires totp_secret which we have.
+            try:
+                from app.services.microsoft.auth import DeviceCodeAuth  # type: ignore
+                self._log(f"[{creds.domain}] CA path: ROPC failed, trying device-code...")
+                dc = DeviceCodeAuth()
+                token_resp = await dc.get_tokens(
+                    tenant_id=tenant_domain,
+                    admin_email=creds.admin_email,
+                    admin_password=creds.admin_password,
+                    totp_secret=creds.totp_secret,
+                    headless=self.headless,
+                )
+                if token_resp and getattr(token_resp, "access_token", None):
+                    out["token_method"] = "device_code"
+                    return token_resp.access_token
+            except Exception as e:
+                self._log(f"[{creds.domain}] CA path: device-code token error: {e}", "warning")
+
+            return None
+
+        async def _run() -> Dict:
+            access_token = await _mint_token()
+            if not access_token:
+                return {"_error": "Could not mint Graph token (ROPC and device-code both failed)"}
+            return await _ca.disable_targeted_mfa_policies(access_token)
+
+        try:
+            try:
+                loop = _asyncio.get_event_loop()
+                if loop.is_running():
+                    out["error"] = "CA path cannot run inside an active event loop"
+                    return out
+            except RuntimeError:
+                pass
+
+            res = _asyncio.run(_run())
+            if "_error" in res:
+                out["error"] = res["_error"]
+                return out
+
+            out["success"] = bool(res.get("success"))
+            out["ca_policies_disabled"] = int(res.get("disabled_now", 0))
+            out["ca_policies_already_disabled"] = int(res.get("already_disabled", 0))
+            out["ca_policies_disabled_names"] = list(res.get("disabled_names", []))
+            out["ca_policies_left_enabled"] = list(res.get("left_enabled_non_targeted", []))
+            out["ca_policies_failed"] = list(res.get("failed", []))
+            out["ca_total_policies"] = int(res.get("total_policies", 0))
+            out["ca_targeted_count"] = int(res.get("targeted_count", 0))
+
+            if not out["success"]:
+                if out["ca_policies_failed"]:
+                    first = out["ca_policies_failed"][0]
+                    out["error"] = (
+                        f"PATCH failed for '{first.get('displayName')}': "
+                        f"{first.get('error')}"
+                    )
+                elif res.get("errors"):
+                    out["error"] = "; ".join(res.get("errors") or [])
+                else:
+                    out["error"] = "CA disable verification failed"
+            return out
+        except Exception as e:
+            self._log(f"[{creds.domain}] CA path exception: {e}", "error")
+            out["error"] = str(e)
+            return out
+
     def verify_sd_disabled(self, creds: TenantCredentials) -> Dict:
         """
         Read-only Selenium fallback: open the Security Defaults panel and
@@ -1343,6 +1561,54 @@ class SecurityDefaultsDisabler:
             
             # Navigate to Security Defaults panel
             if not self._navigate_to_security_defaults():
+                # Dispatch: if navigation failed *because* this tenant has
+                # the "CA replaces SD" UI variant, route to the CA-disable path
+                # via Graph instead of returning a generic navigation failure.
+                if self._ca_replaces_sd_detected:
+                    self._log(
+                        f"[{creds.domain}] CA-replaces-SD detected — "
+                        f"dispatching to Conditional Access disable path"
+                    )
+                    # We close the Selenium browser before the CA path runs
+                    # so its (potential) device-code Selenium flow has a clean slate.
+                    if self.driver:
+                        try:
+                            self.driver.quit()
+                        except Exception:
+                            pass
+                        self.driver = None
+
+                    ca_res = self._disable_ca_policies_for_tenant(creds)
+                    # Merge CA fields into the result envelope
+                    result.update({
+                        "ca_policies_disabled": ca_res.get("ca_policies_disabled", 0),
+                        "ca_policies_already_disabled": ca_res.get("ca_policies_already_disabled", 0),
+                        "ca_policies_disabled_names": ca_res.get("ca_policies_disabled_names", []),
+                        "ca_policies_left_enabled": ca_res.get("ca_policies_left_enabled", []),
+                        "ca_policies_failed": ca_res.get("ca_policies_failed", []),
+                        "ca_total_policies": ca_res.get("ca_total_policies", 0),
+                        "ca_targeted_count": ca_res.get("ca_targeted_count", 0),
+                        "ca_token_method": ca_res.get("token_method"),
+                    })
+                    if ca_res.get("success"):
+                        result["success"] = True
+                        result["reason"] = "conditional_access_disabled"
+                        # SD cannot be set on a CA-managed tenant — treat as
+                        # equivalent for downstream "no MFA" gating purposes.
+                        result["already_disabled"] = True
+                        self._log(
+                            f"[{creds.domain}] CA path SUCCESS — "
+                            f"disabled {ca_res.get('ca_policies_disabled', 0)} "
+                            f"(already-disabled: {ca_res.get('ca_policies_already_disabled', 0)})"
+                        )
+                    else:
+                        result["error"] = ca_res.get("error") or "CA disable failed"
+                        self._log(
+                            f"[{creds.domain}] CA path FAILED: {result['error']}",
+                            "error",
+                        )
+                    return result
+
                 result["error"] = "Navigation failed"
                 return result
 
@@ -1361,6 +1627,7 @@ class SecurityDefaultsDisabler:
                 return result
             
             result["success"] = True
+            result["reason"] = "security_defaults_disabled"
             self._log(f"[{creds.domain}] COMPLETE!")
             
         except Exception as e:

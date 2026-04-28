@@ -159,13 +159,41 @@ async def _reconcile_sd_for_tenant(
                 )
                 if fix_result.get("success"):
                     summary["sd_drift_fixed"] += 1
-                    t_result["sd"]["action"] = "selenium_repaired"
+                    # If the dispatcher took the CA path, surface that distinctly
+                    # in the per-tenant result and persist the CA-tracking columns.
+                    took_ca_path = (
+                        fix_result.get("reason") == "conditional_access_disabled"
+                    )
+                    t_result["sd"]["action"] = (
+                        "ca_policies_disabled" if took_ca_path else "selenium_repaired"
+                    )
                     t_result["sd"]["sd_disabled"] = True
+                    if took_ca_path:
+                        t_result["sd"]["ca_path_taken"] = True
+                        t_result["sd"]["ca_policies_disabled"] = (
+                            fix_result.get("ca_policies_disabled", 0)
+                        )
+                        t_result["sd"]["ca_policies_disabled_names"] = (
+                            fix_result.get("ca_policies_disabled_names", [])
+                        )
+                        t_result["sd"]["ca_policies_left_enabled"] = (
+                            fix_result.get("ca_policies_left_enabled", [])
+                        )
                     async with async_session_factory() as db:
                         t = await db.get(Tenant, tenant.id)
                         if t:
                             t.security_defaults_disabled = True
-                            t.security_defaults_disabled_at = datetime.utcnow()
+                            if not t.security_defaults_disabled_at:
+                                t.security_defaults_disabled_at = datetime.utcnow()
+                            t.security_defaults_error = None
+                            if took_ca_path:
+                                t.conditional_access_disabled = True
+                                t.conditional_access_disabled_at = datetime.utcnow()
+                                t.conditional_access_error = None
+                                t.conditional_access_policies_disabled_count = int(
+                                    (fix_result.get("ca_policies_disabled") or 0)
+                                    + (fix_result.get("ca_policies_already_disabled") or 0)
+                                )
                             await db.commit()
                 else:
                     summary["sd_drift_unfixable"] += 1
