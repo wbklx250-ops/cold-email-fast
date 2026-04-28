@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { NameserverGroup } from "@/lib/api";
 
 interface NameserverGroupsDisplayProps {
@@ -14,56 +14,74 @@ interface NameserverGroupCardProps {
 }
 
 const NameserverGroupCard = ({ group }: NameserverGroupCardProps) => {
-  const [showAll, setShowAll] = useState(false);
-  const [copied, setCopied] = useState(false);
-  
-  const MAX_VISIBLE_DOMAINS = 5;
-  const visibleDomains = showAll 
-    ? group.domains 
-    : group.domains.slice(0, MAX_VISIBLE_DOMAINS);
-  const hiddenCount = group.domains.length - MAX_VISIBLE_DOMAINS;
+  const [filter, setFilter] = useState("");
+  const [copied, setCopied] = useState<string | null>(null);
 
-  const copyNameservers = async () => {
-    const nsText = group.nameservers.join("\n");
+  const filtered = useMemo(() => {
+    const q = filter.trim().toLowerCase();
+    if (!q) return group.domains;
+    return group.domains.filter((d) => d.toLowerCase().includes(q));
+  }, [filter, group.domains]);
+
+  const copy = async (text: string, label: string) => {
     try {
-      await navigator.clipboard.writeText(nsText);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
+      await navigator.clipboard.writeText(text);
+      setCopied(label);
+      setTimeout(() => setCopied(null), 2000);
     } catch (err) {
       console.error("Failed to copy:", err);
     }
   };
 
+  const nsText = group.nameservers.join("\n");
+  const domainsText = group.domains.join("\n");
+  const tableText = group.domains
+    .map((d) => [d, ...group.nameservers].join("\t"))
+    .join("\n");
+
   return (
     <div className="bg-white border border-gray-200 rounded-lg overflow-hidden">
       {/* Header */}
-      <div className="px-4 py-3 bg-gray-50 border-b border-gray-200 flex items-center justify-between">
+      <div className="px-4 py-3 bg-gray-50 border-b border-gray-200 flex items-center justify-between flex-wrap gap-2">
         <div className="flex items-center gap-2">
           <span className="text-lg">📋</span>
           <span className="font-medium text-gray-900">
             Nameservers ({group.domain_count} domain{group.domain_count !== 1 ? "s" : ""})
           </span>
         </div>
-        <button
-          onClick={copyNameservers}
-          className={`px-3 py-1 text-xs font-medium rounded transition-colors flex items-center gap-1 ${
-            copied 
-              ? "bg-green-100 text-green-700 border border-green-300" 
-              : "bg-blue-100 text-blue-700 hover:bg-blue-200 border border-blue-300"
-          }`}
-        >
-          {copied ? (
-            <>
-              <span>✓</span>
-              Copied!
-            </>
-          ) : (
-            <>
-              <span>📋</span>
-              Copy NS
-            </>
-          )}
-        </button>
+        <div className="flex flex-wrap gap-2">
+          <button
+            onClick={() => copy(nsText, "ns")}
+            className={`px-3 py-1 text-xs font-medium rounded border transition-colors ${
+              copied === "ns"
+                ? "bg-green-100 text-green-700 border-green-300"
+                : "bg-blue-100 text-blue-700 hover:bg-blue-200 border-blue-300"
+            }`}
+          >
+            {copied === "ns" ? "✓ Copied!" : "📋 Copy NS"}
+          </button>
+          <button
+            onClick={() => copy(domainsText, "domains")}
+            className={`px-3 py-1 text-xs font-medium rounded border transition-colors ${
+              copied === "domains"
+                ? "bg-green-100 text-green-700 border-green-300"
+                : "bg-indigo-100 text-indigo-700 hover:bg-indigo-200 border-indigo-300"
+            }`}
+          >
+            {copied === "domains" ? "✓ Copied!" : `📋 Copy Domains (${group.domains.length})`}
+          </button>
+          <button
+            onClick={() => copy(tableText, "table")}
+            title="Tab-separated: domain TAB ns1 TAB ns2 — paste into Excel/Sheets"
+            className={`px-3 py-1 text-xs font-medium rounded border transition-colors ${
+              copied === "table"
+                ? "bg-green-100 text-green-700 border-green-300"
+                : "bg-emerald-100 text-emerald-700 hover:bg-emerald-200 border-emerald-300"
+            }`}
+          >
+            {copied === "table" ? "✓ Copied!" : "📋 Copy Table (TSV)"}
+          </button>
+        </div>
       </div>
 
       {/* Nameservers */}
@@ -73,35 +91,50 @@ const NameserverGroupCard = ({ group }: NameserverGroupCardProps) => {
             <span className="text-xs font-medium text-gray-500 w-8">
               NS{index + 1}:
             </span>
-            <code className="text-sm text-blue-700 font-mono">{ns}</code>
+            <code
+              className="text-sm text-blue-700 font-mono cursor-pointer hover:bg-blue-100 px-2 py-0.5 rounded"
+              onClick={() => copy(ns, "ns")}
+              title="Click to copy"
+            >
+              {ns}
+            </code>
           </div>
         ))}
       </div>
 
-      {/* Domains */}
+      {/* Domains — full scrollable list, no truncation */}
       <div className="px-4 py-3">
-        <div className="text-sm text-gray-600">
-          {visibleDomains.map((domain, index) => (
-            <span key={domain}>
-              <span className="font-mono text-gray-800">{domain}</span>
-              {index < visibleDomains.length - 1 && (
-                <span className="text-gray-400">, </span>
-              )}
-            </span>
+        <div className="flex items-center justify-between mb-2">
+          <span className="text-xs font-semibold text-gray-700">
+            Domains ({filtered.length}
+            {filtered.length !== group.domains.length ? ` of ${group.domains.length}` : ""})
+          </span>
+          <input
+            type="text"
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+            placeholder="Filter domains…"
+            className="px-2 py-1 text-xs border border-gray-300 rounded w-48 focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+          />
+        </div>
+        <div className="max-h-72 overflow-y-auto border border-gray-200 rounded bg-gray-50 divide-y divide-gray-100">
+          {filtered.map((d) => (
+            <div
+              key={d}
+              onClick={() => copy(d, "domains")}
+              className="px-3 py-1.5 text-sm font-mono text-gray-800 hover:bg-yellow-50 cursor-pointer flex items-center justify-between group"
+              title="Click to copy this domain"
+            >
+              <span>{d}</span>
+              <span className="text-[10px] text-gray-400 opacity-0 group-hover:opacity-100">
+                click to copy
+              </span>
+            </div>
           ))}
-          {!showAll && hiddenCount > 0 && (
-            <span className="text-gray-400">...</span>
+          {filtered.length === 0 && (
+            <div className="px-3 py-3 text-sm text-gray-400 text-center">No domains match filter</div>
           )}
         </div>
-        
-        {hiddenCount > 0 && (
-          <button
-            onClick={() => setShowAll(!showAll)}
-            className="mt-2 text-sm text-blue-600 hover:text-blue-800 font-medium"
-          >
-            {showAll ? "Show less" : `Show all ${group.domain_count}`}
-          </button>
-        )}
       </div>
     </div>
   );
@@ -112,6 +145,30 @@ export const NameserverGroupsDisplay = ({
   totalDomains,
   onClose,
 }: NameserverGroupsDisplayProps) => {
+  const [allCopied, setAllCopied] = useState<string | null>(null);
+
+  const allDomainsText = useMemo(
+    () => groups.flatMap((g) => g.domains).join("\n"),
+    [groups]
+  );
+  const allTableText = useMemo(
+    () =>
+      groups
+        .flatMap((g) => g.domains.map((d) => [d, ...g.nameservers].join("\t")))
+        .join("\n"),
+    [groups]
+  );
+
+  const copyAll = async (text: string, key: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setAllCopied(key);
+      setTimeout(() => setAllCopied(null), 2000);
+    } catch (err) {
+      console.error("Failed to copy:", err);
+    }
+  };
+
   if (groups.length === 0) {
     return (
       <div className="bg-gray-50 border border-gray-200 rounded-lg p-6 text-center">
@@ -124,7 +181,7 @@ export const NameserverGroupsDisplay = ({
   return (
     <div className="space-y-4">
       {/* Summary Header */}
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between flex-wrap gap-2">
         <div>
           <h3 className="text-lg font-semibold text-gray-900">
             Nameserver Groups
@@ -133,14 +190,37 @@ export const NameserverGroupsDisplay = ({
             {totalDomains} domain{totalDomains !== 1 ? "s" : ""} across {groups.length} nameserver group{groups.length !== 1 ? "s" : ""}
           </p>
         </div>
-        {onClose && (
+        <div className="flex flex-wrap gap-2">
           <button
-            onClick={onClose}
-            className="text-gray-400 hover:text-gray-600 transition-colors"
+            onClick={() => copyAll(allDomainsText, "all-domains")}
+            className={`px-3 py-1 text-xs font-medium rounded border transition-colors ${
+              allCopied === "all-domains"
+                ? "bg-green-100 text-green-700 border-green-300"
+                : "bg-indigo-100 text-indigo-700 hover:bg-indigo-200 border-indigo-300"
+            }`}
           >
-            <span className="text-xl">×</span>
+            {allCopied === "all-domains" ? "✓ Copied!" : `📋 Copy ALL Domains (${totalDomains})`}
           </button>
-        )}
+          <button
+            onClick={() => copyAll(allTableText, "all-table")}
+            title="domain TAB ns1 TAB ns2 — one row per domain, all groups"
+            className={`px-3 py-1 text-xs font-medium rounded border transition-colors ${
+              allCopied === "all-table"
+                ? "bg-green-100 text-green-700 border-green-300"
+                : "bg-emerald-100 text-emerald-700 hover:bg-emerald-200 border-emerald-300"
+            }`}
+          >
+            {allCopied === "all-table" ? "✓ Copied!" : "📋 Copy ALL as Table (TSV)"}
+          </button>
+          {onClose && (
+            <button
+              onClick={onClose}
+              className="text-gray-400 hover:text-gray-600 transition-colors"
+            >
+              <span className="text-xl">×</span>
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Info Box */}

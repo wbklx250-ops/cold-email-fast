@@ -815,6 +815,237 @@ async def resume_pipeline(
     }
 
 
+class RestartFromStepRequest(BaseModel):
+    step: int
+    force: bool = True
+
+
+@router.post("/{batch_id}/restart-from-step")
+async def restart_from_step(
+    batch_id: UUID,
+    request: RestartFromStepRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Restart the pipeline from any step (1..11), resetting all progress for that step
+    and every step after it. Steps before the chosen step keep their progress.
+
+    Behavior per step (cascading: choosing step N also resets N+1..11 flags):
+      - 1: clear CF zone state (zone_id, nameservers, phase1 DNS flags)
+      - 2/3: clear ns_confirmed_at, ns_propagated_at, nameservers_updated
+      - 4: clear dns_records_created, redirect_configured
+      - 5: clear tenant first_login_completed, step4_retry_count, setup_error
+      - 6: clear domain m365/dkim flags + tenant step5_complete
+      - 7: clear domain step6_* + tenant step6_* (this is what mailbox creation needs)
+      - 8: clear tenant step7_smtp_auth_enabled / step7_retry_count / step7_error
+      - 9-11: just rerun (no resets, idempotent)
+
+    Sets pipeline_step=N, pipeline_status='running', clears pipeline_paused_at,
+    then schedules run_pipeline(batch_id, start_from_step=N) in the background.
+    """
+    from sqlalchemy import update as sql_update
+
+    step = request.step
+    if step < 1 or step > 11:
+        raise HTTPException(400, "step must be between 1 and 11")
+
+    batch = await db.get(SetupBatch, batch_id)
+    if not batch:
+        raise HTTPException(404, "Batch not found")
+
+    # Refuse if pipeline is actively running (must Pause first)
+    job_id = str(batch_id)
+    if batch.pipeline_status == "running":
+        if job_id in pipeline_jobs and pipeline_jobs[job_id].get("status") == "running":
+            raise HTTPException(
+                409,
+                "Pipeline is currently running. Pause it first, then restart from a step.",
+            )
+
+    reset_counts = {"domains": 0, "tenants": 0, "mailboxes": 0}
+
+    # ---- STEP 1: Cloudflare zone creation ----
+    if step <= 1:
+        res = await db.execute(
+            sql_update(Domain)
+            .where(Domain.batch_id == batch_id)
+            .values(
+                cloudflare_zone_id=None,
+                cloudflare_nameservers=[],
+                cloudflare_zone_status="pending",
+                phase1_cname_added=False,
+                phase1_dmarc_added=False,
+            )
+        )
+        reset_counts["domains"] = max(reset_counts["domains"], res.rowcount or 0)
+
+    # ---- STEP 2-3: Nameserver update + propagation ----
+    if step <= 3:
+        await db.execute(
+            sql_update(Domain)
+            .where(Domain.batch_id == batch_id)
+            .values(
+                ns_propagated_at=None,
+                nameservers_updated=False,
+            )
+        )
+        batch.ns_confirmed_at = None
+        batch.ns_propagated_count = 0
+
+    # ---- STEP 4: DNS records + redirects ----
+    if step <= 4:
+        await db.execute(
+            sql_update(Domain)
+            .where(Domain.batch_id == batch_id)
+            .values(
+                dns_records_created=False,
+                redirect_configured=False,
+            )
+        )
+        batch.dns_completed = 0
+
+    # ---- STEP 5: First login automation ----
+    if step <= 5:
+        res = await db.execute(
+            sql_update(Tenant)
+            .where(Tenant.batch_id == batch_id)
+            .values(
+                first_login_completed=False,
+                first_login_at=None,
+                password_changed=False,
+                step4_retry_count=0,
+                setup_error=None,
+            )
+        )
+        reset_counts["tenants"] = max(reset_counts["tenants"], res.rowcount or 0)
+        batch.first_login_completed_count = 0
+
+    # ---- STEP 6: M365 domain setup + DKIM ----
+    if step <= 6:
+        res = await db.execute(
+            sql_update(Domain)
+            .where(Domain.batch_id == batch_id)
+            .values(
+                domain_added_to_m365=False,
+                domain_verified_in_m365=False,
+                domain_verified_at=None,
+                step5_complete=False,
+                step5_retry_count=0,
+                step5_skipped=False,
+                dkim_enabled=False,
+                dkim_cnames_added=False,
+                dkim_enabled_at=None,
+                mx_record_added=False,
+                spf_record_added=False,
+                autodiscover_added=False,
+                error_message=None,
+            )
+        )
+        reset_counts["domains"] = max(reset_counts["domains"], res.rowcount or 0)
+        await db.execute(
+            sql_update(Tenant)
+            .where(Tenant.batch_id == batch_id)
+            .values(
+                step5_complete=False,
+                step5_retry_count=0,
+                domain_verified_in_m365=False,
+                dkim_enabled=False,
+                dkim_cnames_added=False,
+            )
+        )
+        batch.m365_completed = 0
+
+    # ---- STEP 7: Mailbox creation & delegation ----
+    if step <= 7:
+        res = await db.execute(
+            sql_update(Domain)
+            .where(Domain.batch_id == batch_id)
+            .values(
+                step6_complete=False,
+                step6_skipped=False,
+                step6_mailboxes_created=0,
+                licensed_user_created=False,
+                error_message=None,
+            )
+        )
+        reset_counts["domains"] = max(reset_counts["domains"], res.rowcount or 0)
+        res2 = await db.execute(
+            sql_update(Tenant)
+            .where(Tenant.batch_id == batch_id)
+            .values(
+                step6_started=False,
+                step6_started_at=None,
+                step6_complete=False,
+                step6_completed_at=None,
+                step6_mailboxes_created=0,
+                step6_display_names_fixed=0,
+                step6_accounts_enabled=0,
+                step6_passwords_set=0,
+                step6_upns_fixed=0,
+                step6_delegations_done=0,
+                step6_retry_count=0,
+                step6_error=None,
+                mailboxes_created=False,
+                mailboxes_configured=0,
+                delegation_completed=False,
+            )
+        )
+        reset_counts["tenants"] = max(reset_counts["tenants"], res2.rowcount or 0)
+        batch.mailboxes_completed_count = 0
+
+    # ---- STEP 8: SMTP Auth ----
+    if step <= 8:
+        await db.execute(
+            sql_update(Tenant)
+            .where(Tenant.batch_id == batch_id)
+            .values(
+                step7_complete=False,
+                step7_completed_at=None,
+                step7_smtp_auth_enabled=False,
+                step7_retry_count=0,
+                step7_error=None,
+            )
+        )
+        batch.smtp_completed = 0
+
+    # ---- STEP 9: Export Credentials (no reset needed, idempotent) ----
+    # ---- STEP 10: Upload to Sequencer ----
+    if step <= 10:
+        batch.uploaded_to_sequencer = False
+        batch.uploaded_at = None
+        batch.sequencer_uploaded_count = 0
+
+    # ---- STEP 11: Reconciliation (idempotent, no reset needed) ----
+
+    # Update batch state and schedule run_pipeline
+    batch.pipeline_step = step
+    batch.pipeline_step_name = STEP_NAMES.get(step, f"Step {step}")
+    batch.pipeline_status = "running"
+    batch.pipeline_paused_at = None
+    if step >= 11:
+        batch.pipeline_completed_at = None
+    await db.commit()
+
+    # Clear stale in-memory job state so run_pipeline initializes fresh
+    pipeline_jobs.pop(job_id, None)
+
+    logger.info(
+        f"Restart-from-step: batch {batch_id} -> step {step} "
+        f"(reset domains={reset_counts['domains']}, tenants={reset_counts['tenants']})"
+    )
+
+    background_tasks.add_task(run_pipeline, batch_id, step)
+
+    return {
+        "success": True,
+        "restarted_from_step": step,
+        "step_name": STEP_NAMES.get(step, f"Step {step}"),
+        "reset_counts": reset_counts,
+        "message": f"Pipeline restarting from Step {step}: {STEP_NAMES.get(step, 'Unknown')}",
+    }
+
+
 @router.post("/{batch_id}/reset-progress")
 async def reset_batch_progress(batch_id: UUID, db: AsyncSession = Depends(get_db)):
     """Reset all step progress for tenants in a batch so the pipeline re-processes them."""

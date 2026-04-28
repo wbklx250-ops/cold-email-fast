@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { useParams } from "next/navigation";
 import BatchDetail from "@/components/batches/BatchDetail";
+import NameserverGroupBanner from "@/components/domains/NameserverGroupBanner";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -98,6 +99,11 @@ export default function PipelineDashboard() {
   const [skipResult, setSkipResult] = useState<SkipResult | null>(null);
   const [showDomainPanel, setShowDomainPanel] = useState(false);
 
+  // Restart-from-step modal state
+  const [restartStep, setRestartStep] = useState<number | null>(null);
+  const [isRestarting, setIsRestarting] = useState(false);
+  const [restartError, setRestartError] = useState<string | null>(null);
+
   const fetchStatus = useCallback(async () => {
     try {
       const res = await fetch(`${API_BASE}/api/v1/pipeline/${batchId}/status`);
@@ -181,6 +187,33 @@ export default function PipelineDashboard() {
 
   const downloadCredentials = () => {
     window.open(`${API_BASE}/api/v1/pipeline/${batchId}/credentials-export`, "_blank");
+  };
+
+  const restartFromStep = async (step: number) => {
+    setIsRestarting(true);
+    setRestartError(null);
+    try {
+      const res = await fetch(
+        `${API_BASE}/api/v1/pipeline/${batchId}/restart-from-step`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ step, force: true }),
+        }
+      );
+      const data = await res.json();
+      if (!res.ok || data.success === false) {
+        setRestartError(data.detail || data.message || "Failed to restart");
+        return;
+      }
+      setRestartStep(null);
+      await fetchStatus();
+      await fetchActivityLog();
+    } catch (e) {
+      setRestartError("Network error: " + String(e));
+    } finally {
+      setIsRestarting(false);
+    }
   };
 
   const skipDomains = async (domainNames?: string[], skipAll?: boolean) => {
@@ -328,29 +361,11 @@ export default function PipelineDashboard() {
           <h2 className="text-lg font-bold text-yellow-900 mb-3">⏸ Update Nameservers at Porkbun</h2>
           <p className="text-sm text-yellow-800 mb-4">
             Update the nameservers for all domains below, then click confirm.
+            Use the copy buttons to grab the full domain list, the nameservers,
+            or a tab-separated table you can paste straight into Excel/Sheets.
           </p>
 
-          {pipelineStatus.nameserver_groups.map((group, i) => (
-            <div key={i} className="bg-white rounded-lg p-4 mb-3 border border-yellow-200">
-              <p className="text-xs text-gray-500 mb-1">{group.count} domain(s):</p>
-              <div className="flex gap-2 mb-2">
-                {group.nameservers.map((ns) => (
-                  <code
-                    key={ns}
-                    className="bg-gray-100 px-3 py-1 rounded text-sm font-mono cursor-pointer hover:bg-gray-200"
-                    onClick={() => navigator.clipboard.writeText(ns)}
-                    title="Click to copy"
-                  >
-                    {ns}
-                  </code>
-                ))}
-              </div>
-              <p className="text-xs text-gray-400">
-                {group.domains.slice(0, 5).join(", ")}
-                {group.domains.length > 5 && ` + ${group.domains.length - 5} more`}
-              </p>
-            </div>
-          ))}
+          <NameserverGroupBanner groups={pipelineStatus.nameserver_groups} />
 
           <button
             onClick={confirmNameservers}
@@ -411,11 +426,79 @@ export default function PipelineDashboard() {
                     View Domains
                   </button>
                 )}
+                {/* Restart-from-here button — visible when pipeline is not actively running */}
+                {!isRunning && (
+                  <button
+                    onClick={() => setRestartStep(step)}
+                    className="text-xs text-orange-600 hover:text-orange-800 underline"
+                    title={`Reset and re-run pipeline starting from Step ${step}`}
+                  >
+                    ↻ Restart from here
+                  </button>
+                )}
               </div>
             </div>
           );
         })}
       </div>
+
+      {/* Restart-from-step Confirmation Modal */}
+      {restartStep !== null && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+          <div className="bg-white rounded-lg shadow-xl max-w-lg w-full p-6">
+            <h3 className="text-lg font-bold text-gray-900 mb-3">
+              Restart pipeline from Step {restartStep}?
+            </h3>
+            <p className="text-sm text-gray-600 mb-3">
+              This will reset Step <span className="font-semibold">{restartStep}: {STEP_NAMES[restartStep]}</span>
+              {restartStep < 11 && (
+                <> and all subsequent steps ({restartStep + 1}–11)</>
+              )}, then re-run the pipeline starting from Step {restartStep}.
+            </p>
+            <div className="bg-orange-50 border border-orange-200 rounded p-3 text-xs text-orange-800 mb-4">
+              <p className="font-semibold mb-1">⚠ What this resets:</p>
+              <ul className="list-disc ml-4 space-y-0.5">
+                {restartStep <= 6 && <li>Per-domain Step 6 (M365 domain add / DKIM) flags</li>}
+                {restartStep <= 7 && <li>Per-tenant + per-domain Step 7 (mailboxes / delegation) flags</li>}
+                {restartStep <= 8 && <li>SMTP-auth flags</li>}
+                {restartStep <= 9 && <li>Credential-export status</li>}
+                {restartStep <= 10 && <li>Sequencer-upload status</li>}
+                <li>Step status entries for {restartStep}–11 in pipeline state</li>
+              </ul>
+              <p className="mt-2">
+                Cloudflare zones, DNS records, nameserver updates, and first-login work
+                completed in earlier steps are <span className="font-semibold">not</span> rolled back.
+              </p>
+            </div>
+
+            {restartError && (
+              <div className="mb-3 p-2 rounded bg-red-50 border border-red-200 text-sm text-red-800">
+                {restartError}
+              </div>
+            )}
+
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => {
+                  setRestartStep(null);
+                  setRestartError(null);
+                }}
+                disabled={isRestarting}
+                className="px-4 py-2 text-sm rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => restartFromStep(restartStep)}
+                disabled={isRestarting}
+                className="px-4 py-2 text-sm rounded-lg bg-orange-600 text-white font-semibold hover:bg-orange-700 disabled:opacity-50"
+              >
+                {isRestarting ? "Restarting…" : `↻ Restart from Step ${restartStep}`}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Verify & Repair — Graph + PowerShell reconciliation (Step 11) */}
       <BatchDetail batchId={batchId} />
