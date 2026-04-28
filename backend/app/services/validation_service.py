@@ -8,7 +8,17 @@ import re
 import logging
 from typing import Dict, List, Any, Optional, Tuple
 
+# Reuse the explicit-domain header detection helpers from the import service
+# so both the validation pre-flight and the actual import recognise the
+# "Domain N to link tenant" columns identically.
+from app.services.tenant_import import (
+    _is_explicit_domain_column,
+    _extract_column_index,
+    _normalize_domain_name,
+)
+
 logger = logging.getLogger(__name__)
+
 
 
 def parse_domains_csv_content(content: str) -> Tuple[List[Dict], List[str]]:
@@ -101,6 +111,12 @@ def parse_tenants_csv_content(content: str) -> Tuple[List[Dict], List[str]]:
     """
     Parse tenant CSV from reseller.
     Flexible column detection — handles various reseller formats.
+
+    Also recognises optional "Domain N to link tenant" columns and attaches
+    them to each parsed tenant as `explicit_domains: List[str]` (normalized,
+    in slot order). Empty / absent columns yield an empty list, which means
+    "fall back to legacy auto-link".
+
     Returns (parsed_tenants, errors).
     """
     errors = []
@@ -111,9 +127,21 @@ def parse_tenants_csv_content(content: str) -> Tuple[List[Dict], List[str]]:
         columns = [c.strip() for c in (reader.fieldnames or [])]
         columns_lower = [c.lower() for c in columns]
 
+        # Detect explicit "Domain N to link tenant" columns FIRST so we
+        # don't misidentify them as the onmicrosoft column. They're sorted
+        # by the embedded digit so slot order matches user intent.
+        explicit_domain_cols = [c for c in columns if _is_explicit_domain_column(c)]
+        explicit_domain_cols.sort(key=lambda c: (_extract_column_index(c), c.lower()))
+
+        # Set of lowercase explicit-column names so the generic matchers below
+        # can skip them.
+        explicit_set_lower = {c.lower() for c in explicit_domain_cols}
+
         # Find the onmicrosoft domain column - check names first
         onmicrosoft_col = None
         for i, col in enumerate(columns_lower):
+            if col in explicit_set_lower:
+                continue
             if "onmicrosoft" in col or "domain" in col or "username" in col or "email" in col or "pattern" in col:
                 onmicrosoft_col = columns[i]
                 break
@@ -132,6 +160,8 @@ def parse_tenants_csv_content(content: str) -> Tuple[List[Dict], List[str]]:
         # Find tenant name column
         name_col = None
         for i, col in enumerate(columns_lower):
+            if col in explicit_set_lower:
+                continue
             if "company" in col or "name" in col or "tenant" in col:
                 name_col = columns[i]
                 break
@@ -139,6 +169,8 @@ def parse_tenants_csv_content(content: str) -> Tuple[List[Dict], List[str]]:
         # Find tenant ID column
         id_col = None
         for i, col in enumerate(columns_lower):
+            if col in explicit_set_lower:
+                continue
             if "uuid" in col or "tenant_id" in col or "id" in col:
                 id_col = columns[i]
                 break
@@ -146,6 +178,8 @@ def parse_tenants_csv_content(content: str) -> Tuple[List[Dict], List[str]]:
         # Find password column
         password_col = None
         for i, col in enumerate(columns_lower):
+            if col in explicit_set_lower:
+                continue
             if "password" in col:
                 password_col = columns[i]
                 break
@@ -168,17 +202,28 @@ def parse_tenants_csv_content(content: str) -> Tuple[List[Dict], List[str]]:
             if not onmicrosoft.endswith(".onmicrosoft.com"):
                 onmicrosoft = f"{onmicrosoft}.onmicrosoft.com"
 
+            # Extract explicit domain assignments (normalized) in slot order
+            explicit_domains: List[str] = []
+            for col in explicit_domain_cols:
+                raw_val = row.get(col, "") or ""
+                normalized = _normalize_domain_name(raw_val)
+                if normalized:
+                    explicit_domains.append(normalized)
+
             tenants.append({
                 "name": row.get(name_col, "").strip() if name_col else onmicrosoft.split(".")[0],
                 "onmicrosoft_domain": onmicrosoft,
                 "microsoft_tenant_id": row.get(id_col, "").strip() if id_col else "",
                 "password": row.get(password_col, "").strip() if password_col else "",
+                "explicit_domains": explicit_domains,
+                "_row_number": i,
             })
 
     except Exception as e:
         errors.append(f"Failed to parse tenant CSV: {str(e)}")
 
     return tenants, errors
+
 
 
 def parse_credentials_txt_content(content: str) -> Tuple[Dict[str, Dict], List[str]]:
@@ -382,6 +427,71 @@ def cross_validate(
     # 4. Calculate expected mailboxes (based on actual domains, not tenant capacity)
     expected_mailboxes = len(domains) * mailboxes_per_tenant
 
+    # 5. Explicit "Domain N to link tenant" cross-validation
+    # ------------------------------------------------------------------
+    # The tenant CSV may explicitly list which custom domains belong to
+    # each tenant. We must verify:
+    #   (a) every explicit domain exists in the domains CSV (HARD ERROR)
+    #   (b) no domain is listed on more than one tenant row (WARNING — first wins)
+    #   (c) no tenant exceeds the per-tenant cap (WARNING — overflow ignored)
+    domain_names_set = {(d.get("name") or "").lower() for d in domains}
+    seen_explicit: Dict[str, str] = {}  # domain_name_lower -> first tenant onmicrosoft
+    duplicates_reported: set = set()
+    tenants_with_explicit_domains = 0
+    domains_explicitly_linked = 0
+    overflow_total = 0
+
+    for tenant in tenants:
+        ed = tenant.get("explicit_domains") or []
+        if not ed:
+            continue
+        tenants_with_explicit_domains += 1
+        tenant_om = tenant.get("onmicrosoft_domain", "?")
+
+        # Cap warning
+        if len(ed) > max(0, domains_per_tenant):
+            overflow_count = len(ed) - max(0, domains_per_tenant)
+            overflow_total += overflow_count
+            warnings.append(
+                f"Tenant '{tenant_om}' lists {len(ed)} explicit domains but "
+                f"domains_per_tenant cap is {domains_per_tenant}; "
+                f"the last {overflow_count} will be ignored."
+            )
+            effective_ed = ed[:max(0, domains_per_tenant)]
+        else:
+            effective_ed = ed
+
+        for d_name in effective_ed:
+            key = (d_name or "").lower()
+            if not key:
+                continue
+
+            # (a) Hard error: explicit domain not in domains CSV
+            if key not in domain_names_set:
+                errors.append(
+                    f"Tenant '{tenant_om}' references domain '{d_name}' "
+                    f"that is not present in the domains CSV."
+                )
+                continue
+
+            # (b) Warning: same domain on multiple tenants — first wins
+            if key in seen_explicit and key not in duplicates_reported:
+                warnings.append(
+                    f"Domain '{d_name}' is assigned to multiple tenants "
+                    f"('{seen_explicit[key]}' and '{tenant_om}'); "
+                    f"the first occurrence wins, the rest are ignored."
+                )
+                duplicates_reported.add(key)
+            elif key not in seen_explicit:
+                seen_explicit[key] = tenant_om
+                domains_explicitly_linked += 1
+
+    # Summary stats
+    domains_auto_linked = max(
+        0,
+        min(len(domains), len(tenants) * domains_per_tenant) - domains_explicitly_linked,
+    )
+
     return {
         "valid": len(errors) == 0,
         "errors": errors,
@@ -395,5 +505,10 @@ def cross_validate(
             "tenants_used": -(-len(domains) // domains_per_tenant) if domains_per_tenant else 0,
             "expected_mailboxes": expected_mailboxes,
             "domains_with_custom_persona": domains_with_custom_persona,
+            "tenants_with_explicit_domains": tenants_with_explicit_domains,
+            "domains_explicitly_linked": domains_explicitly_linked,
+            "domains_auto_linked": domains_auto_linked,
+            "explicit_overflow_count": overflow_total,
         }
     }
+

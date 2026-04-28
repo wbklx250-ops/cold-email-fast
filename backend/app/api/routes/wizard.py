@@ -2523,22 +2523,59 @@ async def import_tenants(
     provider: Optional[str] = Form(None),
     db: AsyncSession = Depends(get_db)
 ):
-    """Import tenants from reseller files. Credentials TXT is optional."""
+    """
+    Import tenants from reseller files. Credentials TXT is optional.
+
+    Also stashes the optional `explicit_domain_map` (parsed from
+    "Domain N to link tenant" columns) onto SetupBatch.auto_run_state so
+    the subsequent /step4/link-domains call can honor it.
+    """
     csv_content = (await tenant_csv.read()).decode('utf-8-sig')
     txt_content = (await credentials_txt.read()).decode('utf-8-sig') if credentials_txt else ""
-    
+
     result = await tenant_import_service.import_tenants(
         db, batch_id, csv_content, txt_content, provider
     )
-    
+
+    # Persist explicit domain assignments for the link step (which has no CSV access).
+    explicit_map = result.get("explicit_domain_map") or {}
+    if explicit_map:
+        batch = await db.get(SetupBatch, batch_id)
+        if batch:
+            current_state = dict(batch.auto_run_state or {})
+            current_state["explicit_domain_map"] = explicit_map
+            batch.auto_run_state = current_state
+            await db.commit()
+            logger.info(
+                f"Stashed {len(explicit_map)} explicit domain assignments on "
+                f"SetupBatch.auto_run_state for batch {batch_id}"
+            )
+
     return {"success": True, "details": result}
 
 
 @router.post("/batches/{batch_id}/step4/link-domains")
 async def link_domains(batch_id: UUID, db: AsyncSession = Depends(get_db)):
-    """Auto-link tenants to domains."""
-    result = await tenant_import_service.auto_link_domains(db, batch_id)
+    """
+    Auto-link tenants to domains.
+
+    Honors any explicit "Domain N to link tenant" assignments that were
+    stashed on SetupBatch.auto_run_state during the preceding
+    /step4/import-tenants call. Empty / missing -> legacy auto-fill only.
+    """
+    batch = await db.get(SetupBatch, batch_id)
+    domains_per_tenant = (batch.domains_per_tenant if batch else 1) or 1
+    state = (batch.auto_run_state or {}) if batch else {}
+    explicit_map = state.get("explicit_domain_map") or {}
+
+    result = await tenant_import_service.auto_link_domains(
+        db,
+        batch_id,
+        domains_per_tenant,
+        explicit_map=explicit_map,
+    )
     return {"success": True, "details": result}
+
 
 
 @router.post("/batches/{batch_id}/step4/start-automation")

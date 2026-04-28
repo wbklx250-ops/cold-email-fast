@@ -301,7 +301,7 @@ export default function NewPipelinePage() {
               required
               file={tenantsCsv}
               onFile={(f) => { setTenantsCsv(f); setValidation(null); }}
-              hint="From reseller — company name, onmicrosoft domain, etc."
+              hint="From reseller — company name, onmicrosoft domain, etc. Optional: 'Domain 1 to link tenant', 'Domain 2 to link tenant', ... columns to explicitly assign domains to tenants (blank = auto-link)."
             />
             <FileUpload
               label="Credentials TXT"

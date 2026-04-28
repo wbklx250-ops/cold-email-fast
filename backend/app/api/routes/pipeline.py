@@ -273,15 +273,51 @@ async def create_and_start(
         logger.error(f"import_tenants FAILED: {e}", exc_info=True)
         raise
 
-    # Auto-link domains to tenants (N:1 in order)
+    # Pull explicit "Domain N to link tenant" assignments collected during import.
+    # Empty dict -> Phase 1 is a no-op and the linker behaves exactly like before.
+    explicit_map = result.get("explicit_domain_map", {}) or {}
+
+    # Auto-link domains to tenants. Phase 1 honors the explicit map; Phase 2
+    # legacy-fills any remaining tenants/domains.
     try:
-        link_result = await tenant_import_service.auto_link_domains(db, batch_id, domains_per_tenant)
+        link_result = await tenant_import_service.auto_link_domains(
+            db,
+            batch_id,
+            domains_per_tenant,
+            explicit_map=explicit_map,
+        )
         logger.info(f"auto_link_domains result: {link_result}")
     except Exception as e:
         logger.error(f"auto_link_domains FAILED: {e}", exc_info=True)
         raise
 
     await db.commit()
+
+    # Surface explicit-link issues as warnings (validation already enforced
+    # the hard constraints, but late race conditions / DB state can still
+    # produce unmatched / conflicting / overflow entries here).
+    extra_warnings: List[str] = []
+    if link_result.get("unmatched_domains"):
+        extra_warnings.append(
+            f"Explicit assignment: {len(link_result['unmatched_domains'])} "
+            f"domain name(s) not found in batch and skipped: "
+            f"{', '.join(link_result['unmatched_domains'][:5])}"
+            + ("…" if len(link_result["unmatched_domains"]) > 5 else "")
+        )
+    if link_result.get("conflicting_domains"):
+        extra_warnings.append(
+            f"Explicit assignment: {len(link_result['conflicting_domains'])} "
+            f"domain(s) were already linked to a different tenant and skipped: "
+            f"{', '.join(link_result['conflicting_domains'][:5])}"
+            + ("…" if len(link_result["conflicting_domains"]) > 5 else "")
+        )
+    if link_result.get("overflow_domains"):
+        extra_warnings.append(
+            f"Explicit assignment: {len(link_result['overflow_domains'])} "
+            f"domain(s) exceeded the per-tenant cap of {domains_per_tenant} "
+            f"and were ignored."
+        )
+
 
     # Initialize pipeline job tracking
     job_id = str(batch_id)
@@ -310,9 +346,18 @@ async def create_and_start(
         "domains_imported": imported_domain_count,
         "tenants_imported": result.get("imported", 0),
         "tenants_linked": link_result.get("linked", 0),
+        "tenants_linked_explicit": link_result.get("linked_explicit", 0),
+        "tenants_linked_auto": link_result.get("linked_auto", 0),
         "pipeline_started": True,
-        "warnings": validation.get("warnings", []),
+        "warnings": list(validation.get("warnings", [])) + extra_warnings,
+        "explicit_link_summary": {
+            "tenants_with_explicit": link_result.get("tenants_with_explicit", 0),
+            "unmatched_domains": link_result.get("unmatched_domains", []),
+            "conflicting_domains": link_result.get("conflicting_domains", []),
+            "overflow_domains": link_result.get("overflow_domains", []),
+        },
     }
+
 
 
 @router.get("/{batch_id}/status")
