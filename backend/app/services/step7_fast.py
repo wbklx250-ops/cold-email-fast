@@ -8,9 +8,11 @@ allowing 25+ parallel workers on 8GB RAM.
 """
 
 import asyncio
+import hashlib
 import logging
 import json
 import os
+import re
 import time
 from typing import Dict, Any, List
 from uuid import UUID
@@ -49,7 +51,7 @@ async def _run_powershell(script: str, timeout: int = 300) -> Dict[str, Any]:
     env["EXO_DISABLE_WAM"] = "true"
 
     import tempfile as _tf
-    with _tf.NamedTemporaryFile(mode="w", suffix=".ps1", delete=False, dir="/tmp") as _f:
+    with _tf.NamedTemporaryFile(mode="w", suffix=".ps1", delete=False, dir=_tf.gettempdir()) as _f:
         _f.write(script)
         _script_path = _f.name
     try:
@@ -90,6 +92,188 @@ async def _run_powershell(script: str, timeout: int = 300) -> Dict[str, Any]:
             pass
 
 
+def _mail_nickname_for_domain(domain: str) -> str:
+    """
+    Generate a tenant-unique mailNickname for the per-domain licensed user.
+
+    `mailNickname`/alias has to be unique across the tenant, so every domain
+    cannot safely use plain "me1" even though the UPN is me1@{domain}.
+    """
+    clean = re.sub(r"[^a-z0-9-]+", "-", (domain or "").lower()).strip("-")
+    if not clean:
+        clean = "domain"
+    nickname = f"me1-{clean}"
+    if len(nickname) <= 64:
+        return nickname
+    digest = hashlib.sha1(clean.encode("utf-8")).hexdigest()[:10]
+    return f"{nickname[:53].rstrip('-')}-{digest}"
+
+
+def _as_list(value: Any) -> List[str]:
+    """Normalize PowerShell JSON scalar/list output into a Python string list."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value if item]
+    if isinstance(value, str) and value:
+        return [value]
+    return []
+
+
+def _build_licensed_user_script(
+    escaped_email: str,
+    escaped_password: str,
+    domain: str,
+    mailbox_password: str,
+) -> str:
+    """Build idempotent Graph script that ensures me1@domain exists and is licensed."""
+    target_upn = f"me1@{domain}"
+    escaped_target_upn = _ps_escape(target_upn)
+    escaped_mail_nickname = _ps_escape(_mail_nickname_for_domain(domain))
+    escaped_mailbox_password = _ps_escape(mailbox_password)
+
+    return f'''
+$ErrorActionPreference = "Stop"
+try {{
+    Import-Module Microsoft.Graph.Users -ErrorAction Stop
+    Import-Module Microsoft.Graph.Users.Actions -ErrorAction SilentlyContinue
+    Import-Module Microsoft.Graph.Identity.DirectoryManagement -ErrorAction SilentlyContinue
+
+    $body2 = @{{
+        grant_type = "password"
+        client_id = "1950a258-227b-4e31-a9cf-717495945fc2"
+        scope = "https://graph.microsoft.com/.default"
+        username = "{escaped_email}"
+        password = "{escaped_password}"
+    }}
+    $td = "{escaped_email}".Split("@")[1]
+    $tok2 = Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$td/oauth2/v2.0/token" -Body $body2 -ErrorAction Stop
+    $sec2 = ConvertTo-SecureString $tok2.access_token -AsPlainText -Force
+    Connect-MgGraph -AccessToken $sec2 -NoWelcome -ErrorAction Stop
+
+    $targetUpn = "{escaped_target_upn}"
+    $userId = $null
+    $wasCreated = $false
+
+    try {{
+        $existing = Get-MgUser -UserId $targetUpn -ErrorAction Stop
+        $userId = $existing.Id
+    }} catch {{
+        $passwordProfile = @{{
+            Password = "{escaped_mailbox_password}"
+            ForceChangePasswordNextSignIn = $false
+        }}
+
+        try {{
+            $newUser = New-MgUser `
+                -DisplayName "me1" `
+                -MailNickname "{escaped_mail_nickname}" `
+                -UserPrincipalName $targetUpn `
+                -PasswordProfile $passwordProfile `
+                -AccountEnabled:$true `
+                -ErrorAction Stop
+            $userId = $newUser.Id
+            $wasCreated = $true
+        }} catch {{
+            if ($_.Exception.Message -like "*already exists*") {{
+                $fallback = Get-MgUser -UserId $targetUpn -ErrorAction Stop
+                $userId = $fallback.Id
+            }} else {{
+                throw
+            }}
+        }}
+    }}
+
+    $allowedSkuPartNumbers = @("O365_BUSINESS_ESSENTIALS", "EXCHANGESTANDARD")
+    $allSkus = Get-MgSubscribedSku -ErrorAction Stop
+    $allowedSkus = @($allSkus | Where-Object {{
+        ($allowedSkuPartNumbers -contains $_.SkuPartNumber) -and
+        ($_.SkuPartNumber -notlike "*TRIAL*") -and
+        ($_.AppliesTo -eq "User")
+    }})
+
+    $userWithLic = Get-MgUser -UserId $userId -Property "AssignedLicenses" -ErrorAction Stop
+    $assignedSkuIds = @($userWithLic.AssignedLicenses | ForEach-Object {{ [string]$_.SkuId }})
+    $existingAllowedSku = $allowedSkus | Where-Object {{ $assignedSkuIds -contains ([string]$_.SkuId) }} | Select-Object -First 1
+    $hasAllowedLicense = $null -ne $existingAllowedSku
+    $licenseAction = "already_licensed"
+    $licenseSku = if ($existingAllowedSku) {{ $existingAllowedSku.SkuPartNumber }} else {{ $null }}
+
+    if (-not $hasAllowedLicense) {{
+        $sku = $allowedSkus | Where-Object {{
+            ($_.PrepaidUnits.Enabled -gt 0) -and
+            ($_.ConsumedUnits -lt $_.PrepaidUnits.Enabled)
+        }} | Sort-Object @{{ Expression = {{ if ($_.SkuPartNumber -eq "O365_BUSINESS_ESSENTIALS") {{ 0 }} else {{ 1 }} }} }} | Select-Object -First 1
+
+        if ($sku) {{
+            Set-MgUserLicense -UserId $userId -AddLicenses @(@{{SkuId=$sku.SkuId}}) -RemoveLicenses @() -ErrorAction Stop
+            $hasAllowedLicense = $true
+            $licenseAction = "assigned"
+            $licenseSku = $sku.SkuPartNumber
+        }} else {{
+            throw "No available 'Microsoft 365 Business Basic' (O365_BUSINESS_ESSENTIALS) or 'Exchange Online Plan 1' (EXCHANGESTANDARD) license with a free seat in this tenant"
+        }}
+    }}
+
+    @{{ success=$true; email=$targetUpn; user_id=$userId; was_created=$wasCreated; has_license=$hasAllowedLicense; license_action=$licenseAction; license_sku=$licenseSku }} | ConvertTo-Json -Compress
+    Disconnect-MgGraph -ErrorAction SilentlyContinue
+}} catch {{
+    @{{ success=$false; error=$_.Exception.Message }} | ConvertTo-Json -Compress
+    Disconnect-MgGraph -ErrorAction SilentlyContinue
+}}
+'''
+
+
+async def ensure_licensed_user_for_domain(
+    domain_name: str,
+    domain_id: UUID,
+    admin_email: str,
+    admin_password: str,
+    mailbox_password: str = MAILBOX_PASSWORD,
+    save_to_domain: bool = True,
+) -> Dict[str, Any]:
+    """
+    Ensure the per-domain licensed user exists in Microsoft 365 and has one of
+    the allowed paid SKUs. This intentionally verifies Graph every time instead
+    of trusting cached DB flags.
+    """
+    domain = (domain_name or "").strip().lower()
+    if not domain or domain.endswith(".onmicrosoft.com"):
+        return {"success": False, "domain": domain_name, "error": "onmicrosoft domains are not eligible"}
+
+    script = _build_licensed_user_script(
+        escaped_email=_ps_escape(admin_email),
+        escaped_password=_ps_escape(admin_password),
+        domain=domain,
+        mailbox_password=mailbox_password,
+    )
+    result = await _run_powershell(script, timeout=120)
+
+    if not result.get("success"):
+        return {
+            "success": False,
+            "domain": domain,
+            "email": f"me1@{domain}",
+            "error": result.get("error") or result.get("stderr") or "Unknown licensed user error",
+        }
+
+    result["domain"] = domain
+    result["email"] = result.get("email") or f"me1@{domain}"
+
+    if save_to_domain and domain_id:
+        async def _save_licensed_user(db):
+            d = await db.get(Domain, domain_id)
+            if d:
+                d.licensed_user_created = True
+                d.licensed_user_upn = result["email"]
+                d.licensed_user_password = mailbox_password
+                d.licensed_user_id = result.get("user_id")
+
+        await save_to_db_with_retry(_save_licensed_user, description=f"{domain} licensed user save")
+
+    return result
+
+
 async def process_domain_fast(
     domain_name: str,
     domain_id: UUID,
@@ -110,7 +294,7 @@ async def process_domain_fast(
 
     This is the fast replacement for run_step6_for_tenant in azure_step6.py.
     """
-    domain = domain_name
+    domain = (domain_name or "").strip().lower()
 
     # Resolve effective persona: domain-level overrides batch-level,
     # which overrides the legacy display_name parameter.
@@ -153,145 +337,29 @@ async def process_domain_fast(
         # ================================================================
         logger.info("[%s] Phase 1: Connect + Licensed User via Graph API", domain)
 
-        licensed_user_upn = None
-        async with BackgroundSessionLocal() as db:
-            # Check DOMAIN-level only. Each domain gets its own licensed user
-            # (me1@{domain}) because UPN is tied to the domain name. The tenant-level
-            # fallback was legacy from the 1-domain-per-tenant era and broke
-            # multi-domain: Domain1 would mark the tenant as "has licensed user",
-            # causing Domain2/Domain3 to skip creation and reuse Domain1's user.
-            d = await db.get(Domain, domain_id)
-            if d and d.licensed_user_created and d.licensed_user_upn:
-                licensed_user_upn = d.licensed_user_upn
-                logger.info("[%s] Licensed user already exists (domain): %s", domain, licensed_user_upn)
-
-        if not licensed_user_upn:
-            create_user_script = f'''
-$ErrorActionPreference = "Stop"
-try {{
-    Import-Module Microsoft.Graph.Users -ErrorAction Stop
-    Import-Module Microsoft.Graph.Users.Actions -ErrorAction SilentlyContinue
-    Import-Module Microsoft.Graph.Identity.DirectoryManagement -ErrorAction SilentlyContinue
-
-    $sp = ConvertTo-SecureString "{escaped_password}" -AsPlainText -Force
-    $cred = New-Object System.Management.Automation.PSCredential("{escaped_email}", $sp)
-    $body2 = @{{
-        grant_type = "password"
-        client_id = "1950a258-227b-4e31-a9cf-717495945fc2"
-        scope = "https://graph.microsoft.com/.default"
-        username = "{escaped_email}"
-        password = "{escaped_password}"
-    }}
-    $td = "{escaped_email}".Split("@")[1]
-    $tok2 = Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$td/oauth2/v2.0/token" -Body $body2 -ErrorAction Stop
-    $sec2 = ConvertTo-SecureString $tok2.access_token -AsPlainText -Force
-    Connect-MgGraph -AccessToken $sec2 -NoWelcome -ErrorAction Stop
-
-    # Step 1: Get-or-create user — idempotent. Handles the case where a prior
-    # attempt created the user in M365 but the Python side failed to save it to
-    # the DB (e.g. license assignment threw afterward). Uses Get-MgUser -UserId
-    # (direct UPN lookup), NOT -Filter. The -Filter form can silently return
-    # nothing due to Graph replication lag / missing ConsistencyLevel headers,
-    # which is what caused New-MgUser to throw "Another object with the same
-    # value for property userPrincipalName already exists" on 109 sibling
-    # domains and fail out after 4 retries.
-    $userId = $null
-    $wasCreated = $false
-
-    try {{
-        $existing = Get-MgUser -UserId "me1@{domain}" -ErrorAction Stop
-        $userId = $existing.Id
-    }} catch {{
-        $passwordProfile = @{{
-            Password = "{_ps_escape(mailbox_password)}"
-            ForceChangePasswordNextSignIn = $false
-        }}
-
-        try {{
-            $newUser = New-MgUser -DisplayName "me1" -MailNickname "me1" -UserPrincipalName "me1@{domain}" -PasswordProfile $passwordProfile -AccountEnabled -ErrorAction Stop
-            $userId = $newUser.Id
-            $wasCreated = $true
-        }} catch {{
-            # Race condition fallback: Get-MgUser missed (replication lag) but
-            # New-MgUser sees the conflict. Fetch the now-visible user.
-            if ($_.Exception.Message -like "*already exists*") {{
-                $fallback = Get-MgUser -UserId "me1@{domain}" -ErrorAction Stop
-                $userId = $fallback.Id
-            }} else {{
-                throw
-            }}
-        }}
-    }}
-
-    # Step 2: Assign license only if the user doesn't already have one.
-    # Previous attempts may have created the user but failed at license
-    # assignment, leaving the user unlicensed; we must be able to fix that
-    # on retry without trying to recreate the user.
-    $userWithLic = Get-MgUser -UserId $userId -Property "AssignedLicenses" -ErrorAction Stop
-    $hasLicense = $userWithLic.AssignedLicenses -and $userWithLic.AssignedLicenses.Count -gt 0
-
-    if (-not $hasLicense) {{
-        # IMPORTANT: Tenants from our provider may include trial licenses and
-        # other paid subscriptions we do not want to consume. We must ONLY
-        # assign one of these two SKUs (whichever has a free seat available):
-        #   - O365_BUSINESS_ESSENTIALS  (Microsoft 365 Business Basic)
-        #   - EXCHANGESTANDARD          (Exchange Online Plan 1)
-        # Anything else (trials of other plans, E3/E5, Business Standard,
-        # Defender, Teams Essentials, etc.) must be skipped.
-        $allowedSkus = @("O365_BUSINESS_ESSENTIALS", "EXCHANGESTANDARD")
-        $skus = Get-MgSubscribedSku -ErrorAction Stop
-
-        # Only paid (non-trial), still has a free seat, and matches one of the
-        # allowed SkuPartNumbers. Trial subscriptions are filtered out by
-        # ignoring SKUs whose part number contains "TRIAL".
-        # Order the result so Business Basic is preferred over Exchange Online
-        # Plan 1 when both are available (Business Basic is the richer SKU).
-        $sku = $skus | Where-Object {{
-            ($allowedSkus -contains $_.SkuPartNumber) -and
-            ($_.SkuPartNumber -notlike "*TRIAL*") -and
-            ($_.AppliesTo -eq "User") -and
-            ($_.PrepaidUnits.Enabled -gt 0) -and
-            ($_.ConsumedUnits -lt $_.PrepaidUnits.Enabled)
-        }} | Sort-Object @{{ Expression = {{ if ($_.SkuPartNumber -eq "O365_BUSINESS_ESSENTIALS") {{ 0 }} else {{ 1 }} }} }} | Select-Object -First 1
-
-        if ($sku) {{
-            Set-MgUserLicense -UserId $userId -AddLicenses @(@{{SkuId=$sku.SkuId}}) -RemoveLicenses @() -ErrorAction Stop
-            $hasLicense = $true
-        }} else {{
-            throw "No available 'Microsoft 365 Business Basic' (O365_BUSINESS_ESSENTIALS) or 'Exchange Online Plan 1' (EXCHANGESTANDARD) license with a free seat in this tenant"
-        }}
-    }}
-
-    @{{ success=$true; email="me1@{domain}"; user_id=$userId; was_created=$wasCreated; has_license=$hasLicense }} | ConvertTo-Json -Compress
-    Disconnect-MgGraph -ErrorAction SilentlyContinue
-}} catch {{
-    @{{ success=$false; error=$_.Exception.Message }} | ConvertTo-Json -Compress
-    Disconnect-MgGraph -ErrorAction SilentlyContinue
-}}
-'''
-            result = await _run_powershell(create_user_script, timeout=120)
-
-            if not result.get("success"):
-                raise Exception(
-                    f"Licensed user creation failed: {result.get('error', result.get('stderr', 'Unknown'))}"
-                )
-
-            licensed_user_upn = f"me1@{domain}"
-
-            # Save to DOMAIN record only. Licensed user is per-domain in the
-            # multi-domain architecture — writing to the Tenant record causes
-            # sibling domains to skip their own licensed user creation.
-            async def _save_licensed_user(db):
-                d = await db.get(Domain, domain_id)
-                if d:
-                    d.licensed_user_created = True
-                    d.licensed_user_upn = licensed_user_upn
-                    d.licensed_user_password = mailbox_password
-
-            await save_to_db_with_retry(_save_licensed_user, description=f"{domain} licensed user save")
-            logger.info(
-                "[%s] Licensed user created: %s (%.1fs)", domain, licensed_user_upn, time.time() - start_time
+        license_result = await ensure_licensed_user_for_domain(
+            domain_name=domain,
+            domain_id=domain_id,
+            admin_email=admin_email,
+            admin_password=admin_password,
+            mailbox_password=mailbox_password,
+            save_to_domain=True,
+        )
+        if not license_result.get("success"):
+            raise Exception(
+                f"Licensed user creation/licensing failed: {license_result.get('error', 'Unknown')}"
             )
+
+        licensed_user_upn = license_result.get("email") or f"me1@{domain}"
+        logger.info(
+            "[%s] Licensed user ready: %s action=%s sku=%s created=%s (%.1fs)",
+            domain,
+            licensed_user_upn,
+            license_result.get("license_action"),
+            license_result.get("license_sku"),
+            license_result.get("was_created"),
+            time.time() - start_time,
+        )
 
         # ================================================================
         # PHASE 2: Generate emails + save to DB (~1 sec)
@@ -299,15 +367,14 @@ try {{
         logger.info("[%s] Phase 2: Generate emails", domain)
 
         async with BackgroundSessionLocal() as db:
-            existing_count = (
-                await db.scalar(
-                    select(func.count(Mailbox.id)).where(
-                        Mailbox.tenant_id == tenant_id,
-                        Mailbox.email.like(f"%@{domain}"),
-                    )
+            existing_rows = await db.execute(
+                select(Mailbox.email).where(
+                    Mailbox.tenant_id == tenant_id,
+                    Mailbox.email.like(f"%@{domain}"),
                 )
-                or 0
             )
+            existing_emails = {email.lower() for email in existing_rows.scalars().all()}
+            existing_count = len(existing_emails)
 
         if existing_count >= mailboxes_per_tenant:
             logger.info("[%s] Mailboxes already generated (%s exist)", domain, existing_count)
@@ -333,22 +400,30 @@ try {{
             else:
                 mailbox_data = generate_emails_for_domain(display_name=display_name, domain=domain, count=mailboxes_per_tenant)
 
-            async with BackgroundSessionLocal() as gen_db:
-                for mb in mailbox_data:
-                    mailbox = Mailbox(
-                        email=mb["email"],
-                        local_part=mb["local_part"],
-                        display_name=mb["display_name"],
-                        password=mb["password"],
-                        tenant_id=tenant_id,
-                        batch_id=batch_id,
-                        status=MailboxStatus.PENDING,
-                        warmup_stage="none",
-                    )
-                    gen_db.add(mailbox)
-                await gen_db.commit()
+            mailbox_data = [
+                mb for mb in mailbox_data
+                if (mb.get("email") or "").strip().lower() not in existing_emails
+            ]
 
-            logger.info("[%s] Generated %s mailboxes (%.1fs)", domain, len(mailbox_data), time.time() - start_time)
+            if not mailbox_data:
+                logger.info("[%s] No missing mailbox DB records to generate", domain)
+            else:
+                async with BackgroundSessionLocal() as gen_db:
+                    for mb in mailbox_data:
+                        mailbox = Mailbox(
+                            email=mb["email"],
+                            local_part=mb["local_part"],
+                            display_name=mb["display_name"],
+                            password=mb["password"],
+                            tenant_id=tenant_id,
+                            batch_id=batch_id,
+                            status=MailboxStatus.PENDING,
+                            warmup_stage="none",
+                        )
+                        gen_db.add(mailbox)
+                    await gen_db.commit()
+
+            logger.info("[%s] Generated %s missing mailboxes (%.1fs)", domain, len(mailbox_data), time.time() - start_time)
 
         # Reload mailboxes from DB
         async with BackgroundSessionLocal() as db:
@@ -394,11 +469,20 @@ try {{
 
         ps_result = await _run_powershell(master_script, timeout=900)  # 15 min timeout
 
+        if ps_result.get("success") is False and "created" not in ps_result:
+            raise Exception(
+                f"Mailbox PowerShell failed: {ps_result.get('error') or ps_result.get('stderr') or 'Unknown error'}"
+            )
+
         created = ps_result.get("created", 0)
         delegated = ps_result.get("delegated", 0)
         passwords_set = ps_result.get("passwords_set", 0)
         upns_fixed = ps_result.get("upns_fixed", 0)
         ps_errors = ps_result.get("errors", [])
+        created_emails = _as_list(ps_result.get("created_emails"))
+        delegated_emails = _as_list(ps_result.get("delegated_emails"))
+        password_emails = _as_list(ps_result.get("password_emails"))
+        upn_emails = _as_list(ps_result.get("upn_emails"))
 
         if ps_errors:
             logger.warning("[%s] PowerShell errors: %s", domain, "; ".join(str(e) for e in ps_errors[:5]))
@@ -418,28 +502,28 @@ try {{
             nonlocal step6_complete
 
             # Update mailbox records
-            if created > 0:
+            if created_emails:
                 await db.execute(
                     update(Mailbox)
-                    .where(Mailbox.tenant_id == tenant_id, Mailbox.email.like(f"%@{domain}"))
+                    .where(Mailbox.tenant_id == tenant_id, Mailbox.email.in_(created_emails))
                     .values(created_in_exchange=True, display_name_fixed=True)
                 )
-            if delegated > 0:
+            if delegated_emails:
                 await db.execute(
                     update(Mailbox)
-                    .where(Mailbox.tenant_id == tenant_id, Mailbox.email.like(f"%@{domain}"))
+                    .where(Mailbox.tenant_id == tenant_id, Mailbox.email.in_(delegated_emails))
                     .values(delegated=True)
                 )
-            if passwords_set > 0:
+            if password_emails:
                 await db.execute(
                     update(Mailbox)
-                    .where(Mailbox.tenant_id == tenant_id, Mailbox.email.like(f"%@{domain}"))
+                    .where(Mailbox.tenant_id == tenant_id, Mailbox.email.in_(password_emails))
                     .values(password_set=True, account_enabled=True, password=mailbox_password)
                 )
-            if upns_fixed > 0:
+            if upn_emails:
                 await db.execute(
                     update(Mailbox)
-                    .where(Mailbox.tenant_id == tenant_id, Mailbox.email.like(f"%@{domain}"))
+                    .where(Mailbox.tenant_id == tenant_id, Mailbox.email.in_(upn_emails))
                     .values(upn_fixed=True)
                 )
 
@@ -529,7 +613,17 @@ def _build_master_script(
 
     return f'''
 $ErrorActionPreference = "Continue"
-$results = @{{ created=0; delegated=0; passwords_set=0; upns_fixed=0; errors=@() }}
+$results = @{{
+    created=0
+    delegated=0
+    passwords_set=0
+    upns_fixed=0
+    created_emails=@()
+    delegated_emails=@()
+    password_emails=@()
+    upn_emails=@()
+    errors=@()
+}}
 
 # === CONNECT TO EXCHANGE ONLINE (ROPC — no browser) ===
 try {{
@@ -558,15 +652,18 @@ foreach ($mb in $mailboxes) {{
         $existing = Get-Mailbox -Identity $mb.Email -ErrorAction SilentlyContinue
         if ($existing) {{
             $results.created++
+            $results.created_emails += $mb.Email
         }} else {{
             $tempName = "$("{escaped_display}") $($mb.Index)"
             New-Mailbox -Shared -Name $tempName -DisplayName $tempName -PrimarySmtpAddress $mb.Email -ErrorAction Stop | Out-Null
             $results.created++
+            $results.created_emails += $mb.Email
         }}
     }} catch {{
         $errMsg = $_.Exception.Message
         if ($errMsg -like "*already being used*" -or $errMsg -like "*already exists*") {{
             $results.created++
+            $results.created_emails += $mb.Email
         }} else {{
             $results.errors += "Create failed: $($mb.Email): $errMsg"
         }}
@@ -589,12 +686,27 @@ foreach ($mb in $mailboxes) {{
 # === STEP 3: DELEGATE ===
 Write-Host "STEP3_DELEGATE"
 foreach ($mb in $mailboxes) {{
+    $delegateErrors = @()
     try {{
-        Add-MailboxPermission -Identity $mb.Email -User $licensedUser -AccessRights FullAccess -AutoMapping $true -ErrorAction SilentlyContinue | Out-Null
-        Add-RecipientPermission -Identity $mb.Email -Trustee $licensedUser -AccessRights SendAs -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
-        $results.delegated++
+        Add-MailboxPermission -Identity $mb.Email -User $licensedUser -AccessRights FullAccess -AutoMapping $true -ErrorAction Stop | Out-Null
     }} catch {{
-        $results.errors += "Delegate failed: $($mb.Email): $($_.Exception.Message)"
+        if ($_.Exception.Message -notlike "*already*") {{
+            $delegateErrors += "FullAccess: $($_.Exception.Message)"
+        }}
+    }}
+    try {{
+        Add-RecipientPermission -Identity $mb.Email -Trustee $licensedUser -AccessRights SendAs -Confirm:$false -ErrorAction Stop | Out-Null
+    }} catch {{
+        if ($_.Exception.Message -notlike "*already*") {{
+            $delegateErrors += "SendAs: $($_.Exception.Message)"
+        }}
+    }}
+
+    if ($delegateErrors.Count -eq 0) {{
+        $results.delegated++
+        $results.delegated_emails += $mb.Email
+    }} else {{
+        $results.errors += "Delegate failed: $($mb.Email): $($delegateErrors -join '; ')"
     }}
     Start-Sleep -Milliseconds 100
 }}
@@ -605,6 +717,7 @@ foreach ($mb in $mailboxes) {{
     try {{
         Set-Mailbox -Identity $mb.Email -MicrosoftOnlineServicesID $mb.Email -ErrorAction SilentlyContinue
         $results.upns_fixed++
+        $results.upn_emails += $mb.Email
     }} catch {{}}
     Start-Sleep -Milliseconds 100
 }}
@@ -629,7 +742,12 @@ try {{
 
     foreach ($mb in $mailboxes) {{
         try {{
-            $user = Get-MgUser -Filter "mail eq '$($mb.Email)'" -ErrorAction SilentlyContinue
+            $user = $null
+            try {{
+                $user = Get-MgUser -UserId $mb.Email -ErrorAction Stop
+            }} catch {{
+                $user = Get-MgUser -Filter "mail eq '$($mb.Email)'" -ErrorAction SilentlyContinue
+            }}
             if (-not $user) {{
                 $user = Get-MgUser -Filter "userPrincipalName eq '$($mb.Email)'" -ErrorAction SilentlyContinue
             }}
@@ -643,6 +761,9 @@ try {{
                 }}
                 Update-MgUser -UserId $user.Id -BodyParameter $params -ErrorAction Stop
                 $results.passwords_set++
+                $results.password_emails += $mb.Email
+            }} else {{
+                $results.errors += "Graph user not found: $($mb.Email)"
             }}
         }} catch {{
             $results.errors += "Graph failed: $($mb.Email): $($_.Exception.Message)"
