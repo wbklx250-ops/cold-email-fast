@@ -199,17 +199,101 @@ class UserOpsSelenium:
             time.sleep(3)
             self._screenshot("license_page")
             
-            # Assign license page - select a license
+            # Assign license page - select ONLY a Microsoft 365 Business Basic
+            # or Exchange Online Plan 1 license. Tenants from our provider may
+            # contain trial SKUs and other paid subs (E3/E5, Business Standard,
+            # Defender, Teams Essentials, etc.) — we MUST NOT consume those.
+            #
+            # The M365 admin UI shows license display names rather than SKU
+            # part numbers. Match the visible label so we pick the right row.
+            # Preference order: Business Basic first, Exchange Online Plan 1
+            # second. We also explicitly avoid any row containing "Trial".
             try:
-                # Click first available license checkbox
-                license_checkbox = WebDriverWait(self.driver, 10).until(
-                    EC.element_to_be_clickable((By.CSS_SELECTOR, "input[type='checkbox'][aria-label*='license'], .ms-Checkbox"))
+                preferred_labels = [
+                    "Microsoft 365 Business Basic",
+                    "Exchange Online (Plan 1)",
+                    "Exchange Online Plan 1",
+                ]
+
+                # Wait for the license list to render at all.
+                WebDriverWait(self.driver, 15).until(
+                    EC.presence_of_element_located(
+                        (By.CSS_SELECTOR, "input[type='checkbox'], [role='checkbox']")
+                    )
                 )
-                license_checkbox.click()
-                logger.info("Selected license checkbox")
-                time.sleep(1)
-            except:
-                logger.warning("Could not select license automatically")
+
+                selected_label = None
+                for label in preferred_labels:
+                    try:
+                        # Find the row whose visible text matches our preferred
+                        # license name AND does not include the word "Trial".
+                        # The license name is typically rendered next to (or
+                        # above) the checkbox in the same row container.
+                        xpath = (
+                            "//*[("
+                            "self::div or self::span or self::label or self::li"
+                            ") and contains(normalize-space(.), '" + label + "') "
+                            "and not(contains(translate(., 'TRIAL', 'trial'), 'trial'))]"
+                        )
+                        candidates = self.driver.find_elements(By.XPATH, xpath)
+                        if not candidates:
+                            continue
+                        # Find a clickable checkbox inside (or near) the matched row.
+                        target_cb = None
+                        for row in candidates:
+                            try:
+                                target_cb = row.find_element(
+                                    By.XPATH,
+                                    ".//input[@type='checkbox'] | .//*[@role='checkbox']",
+                                )
+                                if target_cb:
+                                    break
+                            except Exception:
+                                continue
+                            # Walk up to find a checkbox sibling
+                            try:
+                                target_cb = row.find_element(
+                                    By.XPATH,
+                                    "ancestor::*[.//input[@type='checkbox'] or .//*[@role='checkbox']][1]"
+                                    "//input[@type='checkbox'] | "
+                                    "ancestor::*[.//input[@type='checkbox'] or .//*[@role='checkbox']][1]"
+                                    "//*[@role='checkbox']",
+                                )
+                                if target_cb:
+                                    break
+                            except Exception:
+                                continue
+
+                        if target_cb is not None:
+                            try:
+                                target_cb.click()
+                            except Exception:
+                                self.driver.execute_script("arguments[0].click();", target_cb)
+                            selected_label = label
+                            logger.info(
+                                f"[{self.domain}] Selected allowed license: {label}"
+                            )
+                            time.sleep(1)
+                            break
+                    except Exception as e:
+                        logger.debug(f"License match attempt failed for '{label}': {e}")
+                        continue
+
+                if not selected_label:
+                    # No allowed license found on this page — fail loudly so
+                    # the tenant gets flagged instead of silently consuming a
+                    # premium/trial SKU.
+                    self._screenshot("license_no_allowed_sku")
+                    raise Exception(
+                        "No 'Microsoft 365 Business Basic' or 'Exchange Online "
+                        "Plan 1' license available in this tenant — refusing "
+                        "to assign any other SKU"
+                    )
+            except Exception as exc:
+                logger.error(
+                    f"[{self.domain}] License selection failed: {exc}"
+                )
+                raise
             
             self._screenshot("license_selected")
             

@@ -175,12 +175,24 @@ try {{
 
     $newUser = New-MgUser -DisplayName "me1" -MailNickname "me1" -UserPrincipalName "me1@{domain}" -PasswordProfile $passwordProfile -AccountEnabled -ErrorAction Stop
 
-    # Get available license SKU
+    # Get available license SKU — ONLY allow Microsoft 365 Business Basic
+    # (O365_BUSINESS_ESSENTIALS) or Exchange Online Plan 1 (EXCHANGESTANDARD).
+    # Skip trial SKUs and any other paid sub the provider may have attached
+    # to the tenant. Prefer Business Basic over Exchange Online Plan 1.
+    $allowedSkus = @("O365_BUSINESS_ESSENTIALS", "EXCHANGESTANDARD")
     $skus = Get-MgSubscribedSku -ErrorAction Stop
-    $sku = $skus | Where-Object {{ $_.SkuPartNumber -like "*EXCHANGE*" -or $_.SkuPartNumber -like "*BUSINESS*" -or $_.SkuPartNumber -like "*ENTERPRISE*" }} | Select-Object -First 1
+    $sku = $skus | Where-Object {{
+        ($allowedSkus -contains $_.SkuPartNumber) -and
+        ($_.SkuPartNumber -notlike "*TRIAL*") -and
+        ($_.AppliesTo -eq "User") -and
+        ($_.PrepaidUnits.Enabled -gt 0) -and
+        ($_.ConsumedUnits -lt $_.PrepaidUnits.Enabled)
+    }} | Sort-Object @{{ Expression = {{ if ($_.SkuPartNumber -eq "O365_BUSINESS_ESSENTIALS") {{ 0 }} else {{ 1 }} }} }} | Select-Object -First 1
 
     if ($sku) {{
         Set-MgUserLicense -UserId $newUser.Id -AddLicenses @(@{{SkuId=$sku.SkuId}}) -RemoveLicenses @() -ErrorAction Stop
+    }} else {{
+        throw "No available 'Microsoft 365 Business Basic' (O365_BUSINESS_ESSENTIALS) or 'Exchange Online Plan 1' (EXCHANGESTANDARD) license with a free seat in this tenant"
     }}
 
     @{{ success=$true; email="me1@{domain}"; user_id=$newUser.Id; action="created" }} | ConvertTo-Json -Compress

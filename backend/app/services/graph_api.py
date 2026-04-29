@@ -161,25 +161,48 @@ class GraphAPIService:
         if not user_id:
             return {"success": False, "error": "No user ID returned"}
 
-        # Step 2: Get available license
-        licenses = await self.get_available_licenses()
-        available_license = None
+        # Step 2: Get available license — ONLY use Microsoft 365 Business Basic
+        # (O365_BUSINESS_ESSENTIALS) or Exchange Online Plan 1 (EXCHANGESTANDARD).
+        # Tenants from our provider may include trial SKUs and unrelated paid
+        # subs (E3/E5, Defender, Teams Essentials, etc.) — we must skip those.
+        # Prefer Business Basic over Exchange Online Plan 1 when both have a
+        # free seat available.
+        ALLOWED_SKUS = ("O365_BUSINESS_ESSENTIALS", "EXCHANGESTANDARD")
+        SKU_PREFERENCE = {"O365_BUSINESS_ESSENTIALS": 0, "EXCHANGESTANDARD": 1}
 
+        licenses = await self.get_available_licenses()
+        candidates = []
         for lic in licenses:
+            sku_part = (lic.get("skuPartNumber") or "").upper()
+            if sku_part not in ALLOWED_SKUS:
+                continue
+            # Hard-skip any trial SKU even if the part number happened to match.
+            if "TRIAL" in sku_part:
+                continue
+            # Must apply to users (not e.g. service-plan-only) and have a seat.
+            if lic.get("appliesTo") and lic.get("appliesTo") != "User":
+                continue
             consumed = lic.get("consumedUnits", 0)
             enabled = lic.get("prepaidUnits", {}).get("enabled", 0)
-            if enabled > consumed:
-                available_license = lic.get("skuId")
-                break
+            if enabled <= 0 or enabled <= consumed:
+                continue
+            candidates.append((SKU_PREFERENCE.get(sku_part, 99), lic))
+
+        candidates.sort(key=lambda x: x[0])
+        available_license = candidates[0][1].get("skuId") if candidates else None
 
         if not available_license:
             return {
-                "success": True,
+                "success": False,
                 "email": upn,
                 "password": password,
                 "user_id": user_id,
                 "license_assigned": False,
-                "warning": "No available licenses",
+                "error": (
+                    "No available 'Microsoft 365 Business Basic' "
+                    "(O365_BUSINESS_ESSENTIALS) or 'Exchange Online Plan 1' "
+                    "(EXCHANGESTANDARD) license with a free seat in this tenant"
+                ),
             }
 
         # Step 3: Assign license

@@ -231,12 +231,34 @@ try {{
     $hasLicense = $userWithLic.AssignedLicenses -and $userWithLic.AssignedLicenses.Count -gt 0
 
     if (-not $hasLicense) {{
+        # IMPORTANT: Tenants from our provider may include trial licenses and
+        # other paid subscriptions we do not want to consume. We must ONLY
+        # assign one of these two SKUs (whichever has a free seat available):
+        #   - O365_BUSINESS_ESSENTIALS  (Microsoft 365 Business Basic)
+        #   - EXCHANGESTANDARD          (Exchange Online Plan 1)
+        # Anything else (trials of other plans, E3/E5, Business Standard,
+        # Defender, Teams Essentials, etc.) must be skipped.
+        $allowedSkus = @("O365_BUSINESS_ESSENTIALS", "EXCHANGESTANDARD")
         $skus = Get-MgSubscribedSku -ErrorAction Stop
-        $sku = $skus | Where-Object {{ ($_.SkuPartNumber -like "*EXCHANGE*" -or $_.SkuPartNumber -like "*BUSINESS*" -or $_.SkuPartNumber -like "*ENTERPRISE*" -or $_.SkuPartNumber -like "*STANDARDPACK*") -and ($_.ConsumedUnits -lt $_.PrepaidUnits.Enabled) }} | Select-Object -First 1
+
+        # Only paid (non-trial), still has a free seat, and matches one of the
+        # allowed SkuPartNumbers. Trial subscriptions are filtered out by
+        # ignoring SKUs whose part number contains "TRIAL".
+        # Order the result so Business Basic is preferred over Exchange Online
+        # Plan 1 when both are available (Business Basic is the richer SKU).
+        $sku = $skus | Where-Object {{
+            ($allowedSkus -contains $_.SkuPartNumber) -and
+            ($_.SkuPartNumber -notlike "*TRIAL*") -and
+            ($_.AppliesTo -eq "User") -and
+            ($_.PrepaidUnits.Enabled -gt 0) -and
+            ($_.ConsumedUnits -lt $_.PrepaidUnits.Enabled)
+        }} | Sort-Object @{{ Expression = {{ if ($_.SkuPartNumber -eq "O365_BUSINESS_ESSENTIALS") {{ 0 }} else {{ 1 }} }} }} | Select-Object -First 1
 
         if ($sku) {{
             Set-MgUserLicense -UserId $userId -AddLicenses @(@{{SkuId=$sku.SkuId}}) -RemoveLicenses @() -ErrorAction Stop
             $hasLicense = $true
+        }} else {{
+            throw "No available 'Microsoft 365 Business Basic' (O365_BUSINESS_ESSENTIALS) or 'Exchange Online Plan 1' (EXCHANGESTANDARD) license with a free seat in this tenant"
         }}
     }}
 
