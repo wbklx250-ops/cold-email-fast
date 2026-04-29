@@ -18,6 +18,7 @@ REQUIRED_MODULES = [
     "ExchangeOnlineManagement",
     "Microsoft.Graph.Authentication",
     "Microsoft.Graph.Users",
+    "Microsoft.Graph.Users.Actions",
     "Microsoft.Graph.Identity.DirectoryManagement",
 ]
 

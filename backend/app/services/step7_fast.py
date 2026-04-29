@@ -136,7 +136,7 @@ def _build_licensed_user_script(
 $ErrorActionPreference = "Stop"
 try {{
     Import-Module Microsoft.Graph.Users -ErrorAction Stop
-    Import-Module Microsoft.Graph.Users.Actions -ErrorAction SilentlyContinue
+    Import-Module Microsoft.Graph.Users.Actions -ErrorAction Stop
     Import-Module Microsoft.Graph.Identity.DirectoryManagement -ErrorAction SilentlyContinue
 
     $body2 = @{{
