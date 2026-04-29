@@ -27,7 +27,7 @@ class LicensedUserRepairRequest(BaseModel):
     tenant_ids: Optional[List[UUID]] = None
     all_tenants: bool = False
     dry_run: bool = True
-    include_unverified: bool = False
+    include_unverified: bool = True
     reset_delegation_flags: bool = True
     max_parallel: int = Field(default=2, ge=1, le=10)
     limit: Optional[int] = Field(default=None, ge=1)
@@ -51,6 +51,27 @@ async def start_licensed_user_repair(
         )
 
     job_id = f"licensed_user_repair_{uuid4().hex[:12]}"
+
+    if request.dry_run:
+        logger.info(
+            "Running licensed-user repair dry run %s batch_id=%s all_tenants=%s",
+            job_id,
+            request.batch_id,
+            request.all_tenants,
+        )
+        summary = await run_licensed_user_repair(
+            batch_id=request.batch_id,
+            tenant_ids=request.tenant_ids,
+            all_tenants=request.all_tenants,
+            dry_run=True,
+            include_unverified=request.include_unverified,
+            reset_delegation_flags=request.reset_delegation_flags,
+            max_parallel=request.max_parallel,
+            limit=request.limit,
+            job_id=job_id,
+        )
+        return {"success": True, **summary}
+
     licensed_user_repair_jobs[job_id] = {
         "job_id": job_id,
         "status": "scheduled",

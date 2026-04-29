@@ -165,6 +165,30 @@ def _public_item(item: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _tenant_summary(work_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    tenants: Dict[str, Dict[str, Any]] = {}
+    for item in work_items:
+        tenant_id = str(item["tenant_id"])
+        tenant = tenants.setdefault(
+            tenant_id,
+            {
+                "tenant_id": tenant_id,
+                "tenant_name": item["tenant_name"],
+                "tenant_onmicrosoft_domain": item["tenant_onmicrosoft_domain"],
+                "batch_id": str(item["batch_id"]) if item.get("batch_id") else None,
+                "batch_name": item["batch_name"],
+                "domain_count": 0,
+                "mailbox_count": 0,
+                "domains": [],
+            },
+        )
+        tenant["domain_count"] += 1
+        tenant["mailbox_count"] += item["mailbox_count"]
+        tenant["domains"].append(item["domain_name"])
+
+    return list(tenants.values())
+
+
 async def _reset_delegation_flags(item: Dict[str, Any]) -> None:
     async with BackgroundSessionLocal() as db:
         await db.execute(
@@ -184,7 +208,7 @@ async def run_licensed_user_repair(
     tenant_ids: Optional[List[UUID]] = None,
     all_tenants: bool = False,
     dry_run: bool = True,
-    include_unverified: bool = False,
+    include_unverified: bool = True,
     reset_delegation_flags: bool = True,
     max_parallel: int = 2,
     limit: Optional[int] = None,
@@ -208,6 +232,8 @@ async def run_licensed_user_repair(
         "batch_id": str(batch_id) if batch_id else None,
         "all_tenants": all_tenants,
         "tenant_ids": [str(tid) for tid in tenant_ids] if tenant_ids else [],
+        "total_tenants": 0,
+        "tenants": [],
         "total_domains": 0,
         "processed": 0,
         "successful": 0,
@@ -227,6 +253,8 @@ async def run_licensed_user_repair(
             limit=limit,
         )
         summary["total_domains"] = len(work_items)
+        summary["tenants"] = _tenant_summary(work_items)
+        summary["total_tenants"] = len(summary["tenants"])
 
         if dry_run:
             summary["status"] = "completed"
