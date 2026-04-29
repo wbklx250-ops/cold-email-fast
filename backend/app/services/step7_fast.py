@@ -471,7 +471,10 @@ async def process_domain_fast(
         # PHASE 3: Create mailboxes + delegate + set passwords
         #          ALL in one PowerShell session (~12-15 min)
         # ================================================================
-        logger.info("[%s] Phase 3: PowerShell mailbox creation (ROPC auth, no browser)", domain)
+        logger.info(
+            "[%s] Phase 3: PowerShell mailbox creation (ROPC auth, no browser; can be silent up to 15 min)",
+            domain,
+        )
 
         base_display_name = display_name
 
@@ -873,14 +876,17 @@ async def run_step7_fast(batch_id: UUID, display_name: str) -> Dict[str, Any]:
     if total == 0:
         return {"success": True, "message": "No eligible domains", "total": 0, "successful": 0, "failed": 0}
 
-    # Process with semaphore — can go MUCH higher without Chrome
+    # Process with semaphore. Fast mode avoids Chrome, but Phase 3 opens
+    # Exchange Online PowerShell sessions, so keep concurrency conservative.
     settings = get_settings()
-    max_parallel = int(settings.max_parallel_browsers) if hasattr(settings, "max_parallel_browsers") else 20
-    max_parallel = max(1, min(max_parallel, 30))  # Allow up to 30 parallel
+    max_parallel = int(getattr(settings, "step7_fast_parallel", 2) or 2)
+    max_parallel = max(1, min(max_parallel, 5))
     semaphore = asyncio.Semaphore(max_parallel)
 
     logger.info(
-        "Processing %s domains with max_parallel=%s (FAST MODE — no Chrome)", total, max_parallel
+        "Processing %s domains with max_parallel=%s (FAST MODE — no Chrome; Exchange sessions capped)",
+        total,
+        max_parallel,
     )
 
     successful = 0

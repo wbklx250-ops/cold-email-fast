@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     # 6 workers × ~300MB per Chrome = ~1.8GB RAM needed
     # Railway has upgraded memory to support this
     max_parallel_browsers: int = 20
+
+    # Step 7 fast mode uses Exchange Online PowerShell sessions, not browsers.
+    # Keep this low to avoid EXO throttling/hanging many concurrent mailbox jobs.
+    step7_fast_parallel: int = 2
     
     # Step 5 Browser Display Mode
     # False = visible browsers (useful for debugging/testing)
