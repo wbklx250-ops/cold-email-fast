@@ -208,6 +208,23 @@ try {{
     $licenseSku = if ($existingAllowedSku) {{ $existingAllowedSku.SkuPartNumber }} else {{ $null }}
 
     if (-not $hasAllowedLicense) {{
+        $usageLocation = $env:M365_USAGE_LOCATION
+        if ([string]::IsNullOrWhiteSpace($usageLocation)) {{
+            try {{
+                $org = Get-MgOrganization -Property "CountryLetterCode" -ErrorAction SilentlyContinue | Select-Object -First 1
+                $usageLocation = $org.CountryLetterCode
+            }} catch {{}}
+        }}
+        if ([string]::IsNullOrWhiteSpace($usageLocation)) {{
+            $usageLocation = "US"
+        }}
+        $usageLocation = $usageLocation.Trim().ToUpperInvariant()
+
+        $userForLicense = Get-MgUser -UserId $userId -Property "UsageLocation" -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($userForLicense.UsageLocation) -or $userForLicense.UsageLocation.Length -ne 2) {{
+            Update-MgUser -UserId $userId -UsageLocation $usageLocation -ErrorAction Stop
+        }}
+
         $sku = $allowedSkus | Where-Object {{
             ($_.PrepaidUnits.Enabled -gt 0) -and
             ($_.ConsumedUnits -lt $_.PrepaidUnits.Enabled)
