@@ -13,13 +13,19 @@ import sys
 
 logger = logging.getLogger(__name__)
 
-# Required PowerShell modules for M365 operations
+# Required PowerShell modules for current M365 operations
 REQUIRED_MODULES = [
-    "MSOnline",
     "ExchangeOnlineManagement",
     "Microsoft.Graph.Authentication",
     "Microsoft.Graph.Users",
     "Microsoft.Graph.Identity.DirectoryManagement",
+]
+
+# Legacy/fallback code paths still reference MSOnline, but PSGallery may no
+# longer provide it in newer Linux containers. Do not fail startup if it is
+# unavailable; those specific legacy paths will report their own error if used.
+OPTIONAL_MODULES = [
+    "MSOnline",
 ]
 
 # Auto-detect PowerShell path based on OS
@@ -62,6 +68,20 @@ def ensure_powershell_modules() -> bool:
                 logger.info(f"Successfully installed: {module}")
         else:
             logger.info(f"Module already installed: {module}")
+
+    for module in OPTIONAL_MODULES:
+        if not _is_module_installed(module):
+            logger.info(f"Installing optional legacy PowerShell module: {module}")
+            if not _install_module(module):
+                logger.warning(
+                    "Optional legacy PowerShell module unavailable: %s. "
+                    "Current Graph/Exchange automation can continue.",
+                    module,
+                )
+            else:
+                logger.info(f"Successfully installed optional module: {module}")
+        else:
+            logger.info(f"Optional module already installed: {module}")
     
     if all_success:
         _modules_verified = True

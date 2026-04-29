@@ -162,18 +162,32 @@ class GraphAPIService:
             return {"success": False, "error": "No user ID returned"}
 
         # Step 2: Get available license — ONLY use Microsoft 365 Business Basic
-        # (O365_BUSINESS_ESSENTIALS) or Exchange Online Plan 1 (EXCHANGESTANDARD).
+        # variants or Exchange Online Plan 1 (EXCHANGESTANDARD).
         # Tenants from our provider may include trial SKUs and unrelated paid
         # subs (E3/E5, Defender, Teams Essentials, etc.) — we must skip those.
         # Prefer Business Basic over Exchange Online Plan 1 when both have a
         # free seat available.
-        ALLOWED_SKUS = ("O365_BUSINESS_ESSENTIALS", "EXCHANGESTANDARD")
-        SKU_PREFERENCE = {"O365_BUSINESS_ESSENTIALS": 0, "EXCHANGESTANDARD": 1}
+        BUSINESS_BASIC_SKUS = (
+            "O365_BUSINESS_ESSENTIALS",
+            "SMB_BUSINESS_ESSENTIALS",
+            "MICROSOFT_365_BUSINESS_BASIC_(NO TEAMS)",
+            "MICROSOFT_365_BUSINESS_BASIC_(NO_TEAMS)",
+            "MICROSOFT_365_BUSINESS_BASIC_EEA_(NO_TEAMS)",
+            "MICROSOFT_365_BUSINESS_BASIC_EEA_(NO TEAMS)",
+        )
+        ALLOWED_SKUS = (*BUSINESS_BASIC_SKUS, "EXCHANGESTANDARD")
+        SKU_PREFERENCE = {sku: 0 for sku in BUSINESS_BASIC_SKUS}
+        SKU_PREFERENCE["EXCHANGESTANDARD"] = 1
 
         licenses = await self.get_available_licenses()
         candidates = []
+        seen_skus = []
         for lic in licenses:
             sku_part = (lic.get("skuPartNumber") or "").upper()
+            consumed = lic.get("consumedUnits", 0)
+            enabled = lic.get("prepaidUnits", {}).get("enabled", 0)
+            if sku_part:
+                seen_skus.append(f"{sku_part}:{consumed}/{enabled}")
             if sku_part not in ALLOWED_SKUS:
                 continue
             # Hard-skip any trial SKU even if the part number happened to match.
@@ -182,8 +196,6 @@ class GraphAPIService:
             # Must apply to users (not e.g. service-plan-only) and have a seat.
             if lic.get("appliesTo") and lic.get("appliesTo") != "User":
                 continue
-            consumed = lic.get("consumedUnits", 0)
-            enabled = lic.get("prepaidUnits", {}).get("enabled", 0)
             if enabled <= 0 or enabled <= consumed:
                 continue
             candidates.append((SKU_PREFERENCE.get(sku_part, 99), lic))
@@ -200,8 +212,10 @@ class GraphAPIService:
                 "license_assigned": False,
                 "error": (
                     "No available 'Microsoft 365 Business Basic' "
-                    "(O365_BUSINESS_ESSENTIALS) or 'Exchange Online Plan 1' "
-                    "(EXCHANGESTANDARD) license with a free seat in this tenant"
+                    f"(accepted SKUs: {', '.join(BUSINESS_BASIC_SKUS)}) or "
+                    "'Exchange Online Plan 1' (EXCHANGESTANDARD) license with "
+                    "a free seat in this tenant. Seen SKUs consumed/enabled: "
+                    f"{', '.join(seen_skus) or 'none'}"
                 ),
             }
 

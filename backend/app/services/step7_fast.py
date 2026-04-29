@@ -184,7 +184,15 @@ try {{
         }}
     }}
 
-    $allowedSkuPartNumbers = @("O365_BUSINESS_ESSENTIALS", "EXCHANGESTANDARD")
+    $businessBasicSkuPartNumbers = @(
+        "O365_BUSINESS_ESSENTIALS",
+        "SMB_BUSINESS_ESSENTIALS",
+        "Microsoft_365_Business_Basic_(no Teams)",
+        "Microsoft_365_Business_Basic_(no_Teams)",
+        "Microsoft_365_Business_Basic_EEA_(no_Teams)",
+        "Microsoft_365_Business_Basic_EEA_(no Teams)"
+    )
+    $allowedSkuPartNumbers = @($businessBasicSkuPartNumbers + @("EXCHANGESTANDARD"))
     $allSkus = Get-MgSubscribedSku -ErrorAction Stop
     $allowedSkus = @($allSkus | Where-Object {{
         ($allowedSkuPartNumbers -contains $_.SkuPartNumber) -and
@@ -203,7 +211,7 @@ try {{
         $sku = $allowedSkus | Where-Object {{
             ($_.PrepaidUnits.Enabled -gt 0) -and
             ($_.ConsumedUnits -lt $_.PrepaidUnits.Enabled)
-        }} | Sort-Object @{{ Expression = {{ if ($_.SkuPartNumber -eq "O365_BUSINESS_ESSENTIALS") {{ 0 }} else {{ 1 }} }} }} | Select-Object -First 1
+        }} | Sort-Object @{{ Expression = {{ if ($businessBasicSkuPartNumbers -contains $_.SkuPartNumber) {{ 0 }} else {{ 1 }} }} }} | Select-Object -First 1
 
         if ($sku) {{
             Set-MgUserLicense -UserId $userId -AddLicenses @(@{{SkuId=$sku.SkuId}}) -RemoveLicenses @() -ErrorAction Stop
@@ -211,7 +219,10 @@ try {{
             $licenseAction = "assigned"
             $licenseSku = $sku.SkuPartNumber
         }} else {{
-            throw "No available 'Microsoft 365 Business Basic' (O365_BUSINESS_ESSENTIALS) or 'Exchange Online Plan 1' (EXCHANGESTANDARD) license with a free seat in this tenant"
+            $seenSkus = @($allSkus | ForEach-Object {{
+                "$($_.SkuPartNumber):$($_.ConsumedUnits)/$($_.PrepaidUnits.Enabled)"
+            }}) -join ", "
+            throw "No available 'Microsoft 365 Business Basic' (accepted SKUs: $($businessBasicSkuPartNumbers -join ', ')) or 'Exchange Online Plan 1' (EXCHANGESTANDARD) license with a free seat in this tenant. Seen SKUs consumed/enabled: $seenSkus"
         }}
     }}
 
@@ -809,6 +820,7 @@ async def run_step7_fast(batch_id: UUID, display_name: str) -> Dict[str, Any]:
             select(Domain)
             .join(Tenant, Domain.tenant_id == Tenant.id)
             .where(
+                Domain.batch_id == batch_id,
                 Tenant.batch_id == batch_id,
                 Domain.domain_verified_in_m365 == True,
                 Domain.dkim_enabled == True,

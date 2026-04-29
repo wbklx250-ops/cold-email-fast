@@ -155,10 +155,12 @@ async def run_step6_for_batch(batch_id: UUID, display_name: str) -> Dict[str, An
             select(Domain)
             .join(Tenant, Domain.tenant_id == Tenant.id)
             .where(
+                Domain.batch_id == batch_id,
                 Tenant.batch_id == batch_id,
                 Domain.domain_verified_in_m365 == True,
                 Domain.dkim_enabled == True,
                 Domain.step6_complete.is_not(True),
+                Domain.step6_skipped.is_not(True),
             )
             .order_by(Tenant.created_at, Domain.domain_index_in_tenant)
         )
