@@ -317,8 +317,8 @@ export default function CsvSequencerUpload() {
           <div className="rounded-lg border bg-white p-4 space-y-3">
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-2">Parallel Workers: {numWorkers}</label>
-              <input type="range" min="1" max="3" value={numWorkers} onChange={(e) => setNumWorkers(parseInt(e.target.value))} disabled={isRunning} className="w-full" />
-              <p className="text-xs text-gray-500 mt-1">Each worker uses ~200MB RAM. 2 recommended.</p>
+              <input type="range" min="1" max="5" value={numWorkers} onChange={(e) => setNumWorkers(parseInt(e.target.value))} disabled={isRunning} className="w-full" />
+              <p className="text-xs text-gray-500 mt-1">Each worker runs one browser session. 3 is conservative; 5 is the Railway max for large uploads.</p>
             </div>
             <label className="flex items-center">
               <input type="checkbox" checked={skipExisting} onChange={(e) => setSkipExisting(e.target.checked)} disabled={isRunning} className="mr-2" />

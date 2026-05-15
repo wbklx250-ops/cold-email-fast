@@ -41,7 +41,8 @@ from app.services.cloudflare import cloudflare_service, CloudflareError
 # Load settings from .env
 _settings = get_settings()
 MAX_PARALLEL_BROWSERS = _settings.max_parallel_browsers
-STEP5_HEADLESS = _settings.step5_headless
+STEP6_HEADLESS = _settings.step6_headless
+STEP6_DOMAIN_TIMEOUT_SECONDS = _settings.step6_domain_timeout_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +101,7 @@ def _sync_setup_domain(tenant_data: dict) -> dict:
             - zone_id: Cloudflare zone ID
             - admin_email: M365 admin email
             - admin_password: M365 admin password
-            - totp_secret: TOTP secret for MFA
+            - totp_secret: Optional TOTP secret for MFA
             - tenant_id: Tenant UUID (for logging only)
     
     Returns:
@@ -121,7 +122,7 @@ def _sync_setup_domain(tenant_data: dict) -> dict:
             admin_email=tenant_data["admin_email"],
             admin_password=tenant_data["admin_password"],
             totp_secret=tenant_data["totp_secret"],
-            headless=STEP5_HEADLESS,
+            headless=STEP6_HEADLESS,
         )
         
         logger.info(f"[{domain}] Selenium automation completed: success={result.get('success')}")
@@ -344,15 +345,17 @@ async def run_step5_for_batch(
             summary["failed"] += 1
             continue
         
-        # Validate credentials (from tenant)
-        if not tenant.admin_email or not tenant.admin_password or not tenant.totp_secret:
+        # Validate credentials (from tenant). TOTP is optional here: some
+        # tenants have security defaults disabled or otherwise do not prompt
+        # for MFA, so Step 6 can still complete with email/password only.
+        if not tenant.admin_email or not tenant.admin_password:
             logger.warning(f"[{domain_name}] Missing tenant credentials, skipping")
             summary["results"].append({
                 "domain_id": str(domain.id),
                 "tenant_id": str(tenant.id),
                 "domain_name": domain_name,
                 "success": False,
-                "error": "Missing credentials (admin_email, admin_password, or totp_secret)"
+                "error": "Missing credentials (admin_email or admin_password)"
             })
             summary["failed"] += 1
             continue
@@ -405,11 +408,35 @@ async def run_step5_for_batch(
             
             try:
                 # Run Selenium in thread pool (synchronous)
-                selenium_result = await asyncio.get_event_loop().run_in_executor(
+                selenium_future = asyncio.get_event_loop().run_in_executor(
                     None,
                     _sync_setup_domain,
                     domain_data
                 )
+                try:
+                    selenium_result = await asyncio.wait_for(
+                        selenium_future,
+                        timeout=STEP6_DOMAIN_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    error_msg = (
+                        f"Selenium automation timed out after "
+                        f"{STEP6_DOMAIN_TIMEOUT_SECONDS}s; ChromeDriver likely stopped responding"
+                    )
+                    logger.error(f"[{domain_name}] {error_msg}")
+                    selenium_future.cancel()
+                    try:
+                        from app.services.selenium.browser import kill_all_browsers
+                        logger.info(f"[{domain_name}] Cleaning up browsers after Step 6 timeout")
+                        kill_all_browsers()
+                    except Exception as cleanup_error:
+                        logger.warning(f"[{domain_name}] Browser cleanup after timeout failed: {cleanup_error}")
+                    selenium_result = {
+                        "success": False,
+                        "verified": False,
+                        "dns_configured": False,
+                        "error": error_msg,
+                    }
                 
                 # Save to DB with FRESH session immediately
                 await _save_step6_result(domain_data, selenium_result)
@@ -561,8 +588,9 @@ async def run_step5_for_tenant(db: AsyncSession, tenant_id: UUID, on_progress=No
             logger.error(f"[{result.domain_name}] Domain {tenant.domain_id} not found")
             return result
         
-        # Validate credentials
-        if not tenant.admin_email or not tenant.admin_password or not tenant.totp_secret:
+        # Validate credentials. TOTP is optional unless Microsoft prompts for
+        # MFA during the browser login.
+        if not tenant.admin_email or not tenant.admin_password:
             result.error = "Missing credentials"
             result.error_step = "credential_check"
             tenant.setup_error = result.error
@@ -583,7 +611,31 @@ async def run_step5_for_tenant(db: AsyncSession, tenant_id: UUID, on_progress=No
         # PHASE 2: Run Selenium in thread
         logger.info(f"[{result.domain_name}] Starting Selenium automation...")
         loop = asyncio.get_event_loop()
-        selenium_result = await loop.run_in_executor(None, _sync_setup_domain, tenant_data)
+        selenium_future = loop.run_in_executor(None, _sync_setup_domain, tenant_data)
+        try:
+            selenium_result = await asyncio.wait_for(
+                selenium_future,
+                timeout=STEP6_DOMAIN_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            error_msg = (
+                f"Selenium automation timed out after "
+                f"{STEP6_DOMAIN_TIMEOUT_SECONDS}s; ChromeDriver likely stopped responding"
+            )
+            logger.error(f"[{result.domain_name}] {error_msg}")
+            selenium_future.cancel()
+            try:
+                from app.services.selenium.browser import kill_all_browsers
+                logger.info(f"[{result.domain_name}] Cleaning up browsers after Step 6 timeout")
+                kill_all_browsers()
+            except Exception as cleanup_error:
+                logger.warning(f"[{result.domain_name}] Browser cleanup after timeout failed: {cleanup_error}")
+            selenium_result = {
+                "success": False,
+                "verified": False,
+                "dns_configured": False,
+                "error": error_msg,
+            }
         logger.info(f"[{result.domain_name}] Selenium result: {selenium_result}")
         
         # PHASE 3: Save to DB using fresh session
@@ -635,8 +687,6 @@ class M365SetupService:
             return "No admin_email"
         if not tenant.admin_password:
             return "No admin_password"
-        if not tenant.totp_secret:
-            return "No totp_secret"
         return None
     
     async def setup_tenant_domain(self, tenant: Tenant, domain: Domain, on_progress=None) -> Step5Result:

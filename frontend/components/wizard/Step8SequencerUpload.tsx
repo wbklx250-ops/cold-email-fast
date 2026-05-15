@@ -90,7 +90,7 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
         const data = await res.json();
         // Convert backend format to Step8Status format
         const convertedStatus: Step8Status = {
-          batch_complete: false,
+          batch_complete: (data.summary?.total || 0) > 0 && (data.summary?.uploaded || 0) === (data.summary?.total || 0),
           total: data.summary?.total || 0,
           uploaded: data.summary?.uploaded || 0,
           failed: data.summary?.failed || 0,
@@ -100,8 +100,10 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
         };
         setStatus(convertedStatus);
 
-        // Auto-stop polling when all done
-        if (convertedStatus.total > 0 && convertedStatus.uploaded === convertedStatus.total) {
+        const jobStatus = data.job?.status;
+        if (jobStatus === "running") {
+          setIsRunning(true);
+        } else if (jobStatus === "completed" || jobStatus === "failed" || convertedStatus.batch_complete) {
           setIsRunning(false);
         }
 
@@ -835,14 +837,14 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
           <input
             type="range"
             min="1"
-            max="3"
+            max="5"
             value={numWorkers}
             onChange={(e) => setNumWorkers(parseInt(e.target.value))}
             disabled={isRunning}
             className="w-full"
           />
           <p className="text-xs text-gray-500 mt-1">
-            Each worker uses ~200MB RAM. 2 recommended for Railway, 3 max.
+            Each worker runs one browser session. 3 is conservative; 5 is the Railway max for large uploads.
           </p>
         </div>
 

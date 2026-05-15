@@ -11,7 +11,11 @@ import logging
 import time
 import random
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import shutil
+import signal
+import subprocess
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import List, Dict, Optional, Any
 
@@ -24,7 +28,7 @@ from selenium.webdriver.chrome.options import Options
 from selenium.common.exceptions import (
     TimeoutException, WebDriverException, NoSuchElementException,
     NoSuchWindowException, InvalidSessionIdException,
-    ElementClickInterceptedException
+    ElementClickInterceptedException, StaleElementReferenceException
 )
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -35,6 +39,12 @@ from app.models.batch import SetupBatch
 from app.db.session import async_session_factory
 
 logger = logging.getLogger(__name__)
+
+
+MAILBOX_HARD_TIMEOUT_SECONDS = int(os.getenv("INSTANTLY_MAILBOX_TIMEOUT_SECONDS", "420"))
+INSTANTLY_USE_OAUTH_API = os.getenv("INSTANTLY_USE_OAUTH_API", "true").lower() not in {
+    "0", "false", "no"
+}
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +155,90 @@ class InstantlyAPI:
 
         return False
 
+    def init_microsoft_oauth(self, email: str) -> Dict[str, Any]:
+        """Create an Instantly Microsoft OAuth session and return its auth URL."""
+        try:
+            r = self.session.post(
+                f"{self.BASE}/oauth/microsoft/init",
+                json={"email": email},
+                timeout=15,
+            )
+            if r.status_code >= 400:
+                return {
+                    "success": False,
+                    "error": f"init status {r.status_code}: {r.text[:300]}",
+                }
+            data = r.json()
+            auth_url = data.get("auth_url") or data.get("authUrl") or data.get("url")
+            session_id = (
+                data.get("session_id")
+                or data.get("sessionId")
+                or data.get("id")
+                or data.get("state")
+            )
+            if not auth_url:
+                return {
+                    "success": False,
+                    "error": f"init response missing auth_url: {data}",
+                }
+            return {
+                "success": True,
+                "auth_url": auth_url,
+                "session_id": session_id,
+                "raw": data,
+            }
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    def oauth_status(self, session_id: Optional[str], email: str) -> Dict[str, Any]:
+        """Check Instantly OAuth session status, falling back to account lookup."""
+        if session_id:
+            for path in (
+                f"{self.BASE}/oauth/status/{session_id}",
+                f"{self.BASE}/oauth/{session_id}/status",
+            ):
+                try:
+                    r = self.session.get(path, timeout=10)
+                    if r.status_code == 200:
+                        data = r.json()
+                        status = str(data.get("status") or "").lower()
+                        if status in {"success", "completed", "connected", "done"}:
+                            self._known_emails.add(email.strip().lower())
+                            return {"success": True, "status": status, "raw": data}
+                        if status in {"failed", "error", "expired", "cancelled", "canceled"}:
+                            return {
+                                "success": False,
+                                "done": True,
+                                "status": status,
+                                "error": data.get("error") or data.get("message") or str(data),
+                            }
+                        return {"success": False, "done": False, "status": status, "raw": data}
+                except Exception:
+                    pass
+
+        if self.account_exists(email):
+            return {"success": True, "status": "account_exists"}
+
+        return {"success": False, "done": False, "status": "pending"}
+
+    def wait_for_oauth_success(
+        self,
+        session_id: Optional[str],
+        email: str,
+        max_wait: int = 45,
+        poll_interval: int = 3,
+    ) -> bool:
+        elapsed = 0
+        while elapsed < max_wait:
+            status = self.oauth_status(session_id, email)
+            if status.get("success"):
+                return True
+            if status.get("done"):
+                return False
+            time.sleep(poll_interval)
+            elapsed += poll_interval
+        return False
+
 
 # ---------------------------------------------------------------------------
 # Core Uploader — ported from working standalone script
@@ -173,6 +267,9 @@ class InstantlyUploader:
         self.worker_id = worker_id
         self.driver: Optional[webdriver.Chrome] = None
         self._accounts_since_restart = 0
+        self.retired = False
+        self._profile_dir: Optional[str] = None
+        self._driver_pid: Optional[int] = None
 
     # ---- Browser Setup ----
 
@@ -180,6 +277,10 @@ class InstantlyUploader:
         """Initialize Chrome WebDriver — matches working standalone script."""
         try:
             opts = Options()
+            if self._profile_dir:
+                shutil.rmtree(self._profile_dir, ignore_errors=True)
+            self._profile_dir = tempfile.mkdtemp(prefix=f"instantly-w{self.worker_id}-")
+
             # Use Railway chromium path if set, otherwise system default
             chrome_path = os.getenv("CHROME_PATH")
             if chrome_path:
@@ -193,9 +294,22 @@ class InstantlyUploader:
             opts.add_argument("--no-sandbox")
             opts.add_argument("--disable-dev-shm-usage")
             opts.add_argument("--disable-gpu")
+            opts.add_argument("--disable-software-rasterizer")
             opts.add_argument("--disable-background-timer-throttling")
             opts.add_argument("--disable-backgrounding-occluded-windows")
             opts.add_argument("--disable-renderer-backgrounding")
+            opts.add_argument("--disable-background-networking")
+            opts.add_argument("--disable-sync")
+            opts.add_argument("--disable-default-apps")
+            opts.add_argument("--no-first-run")
+            opts.add_argument("--no-default-browser-check")
+            opts.add_argument("--disable-crash-reporter")
+            opts.add_argument("--disk-cache-size=1")
+            opts.add_argument("--media-cache-size=1")
+            opts.add_argument("--remote-debugging-port=0")
+            opts.add_argument("--disable-site-isolation-trials")
+            opts.add_argument("--renderer-process-limit=2")
+            opts.add_argument(f"--user-data-dir={self._profile_dir}")
             opts.add_argument("--window-size=1920,1080")
             opts.add_argument("--disable-features=ThirdPartyCookieBlocking")
 
@@ -214,6 +328,8 @@ class InstantlyUploader:
                 opts.add_argument(f"--window-position={offset},{offset}")
 
             self.driver = webdriver.Chrome(options=opts)
+            service_process = getattr(getattr(self.driver, "service", None), "process", None)
+            self._driver_pid = getattr(service_process, "pid", None)
             self.driver.execute_script(
                 "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
             )
@@ -236,12 +352,25 @@ class InstantlyUploader:
 
     def restart_browser(self) -> bool:
         """Restart browser and re-login to Instantly."""
+        if self.retired:
+            logger.warning(f"[Worker {self.worker_id}] Restart skipped because worker is retired")
+            return False
+
         logger.info(f"[Worker {self.worker_id}] Restarting browser...")
+        driver = self.driver
+        driver_pid = self._driver_pid
+        profile_dir = self._profile_dir
+        self.driver = None
+        self._driver_pid = None
+        self._profile_dir = None
         try:
-            self.driver.quit()
+            if driver:
+                driver.quit()
         except Exception:
             pass
-        self.driver = None
+        self._kill_driver_process_tree(driver_pid)
+        if profile_dir:
+            shutil.rmtree(profile_dir, ignore_errors=True)
 
         if not self.setup_driver():
             return False
@@ -253,12 +382,46 @@ class InstantlyUploader:
 
     def cleanup(self):
         """Clean up WebDriver resources."""
-        if self.driver:
+        self.retired = True
+        driver = self.driver
+        driver_pid = self._driver_pid
+        profile_dir = self._profile_dir
+        self.driver = None
+        self._driver_pid = None
+        self._profile_dir = None
+
+        if driver:
             try:
-                self.driver.quit()
+                driver.quit()
                 logger.info(f"[Worker {self.worker_id}] Chrome driver closed")
             except Exception as e:
                 logger.error(f"[Worker {self.worker_id}] Error closing driver: {e}")
+        self._kill_driver_process_tree(driver_pid)
+        if profile_dir:
+            shutil.rmtree(profile_dir, ignore_errors=True)
+
+    def _kill_driver_process_tree(self, pid: Optional[int]) -> None:
+        """Best-effort cleanup for orphaned ChromeDriver/Chrome children on Railway."""
+        if not pid or os.name != "posix":
+            return
+        for pkill_arg, sig in (("-TERM", signal.SIGTERM), ("-KILL", signal.SIGKILL)):
+            try:
+                subprocess.run(
+                    ["pkill", pkill_arg, "-P", str(pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=3,
+                    check=False,
+                )
+            except Exception:
+                pass
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                return
+            except Exception:
+                pass
+            time.sleep(0.2)
 
     # ---- Helpers (from working script) ----
 
@@ -270,6 +433,7 @@ class InstantlyUploader:
         """Try multiple selectors, scrollIntoView, then native click.
         This is the proven click pattern from the working standalone script."""
         for sel_type, sel in selectors:
+            el = None
             try:
                 el = WebDriverWait(self.driver, timeout).until(
                     EC.element_to_be_clickable((sel_type, sel))
@@ -283,11 +447,15 @@ class InstantlyUploader:
                 self._dismiss_overlays()
                 time.sleep(0.5)
                 try:
-                    self.driver.execute_script("arguments[0].click()", el)
-                    return True
+                    if el is not None:
+                        self.driver.execute_script("arguments[0].click()", el)
+                        return True
                 except Exception:
                     continue
-            except (TimeoutException, NoSuchElementException):
+            except (TimeoutException, NoSuchElementException, StaleElementReferenceException, AttributeError):
+                continue
+            except WebDriverException as e:
+                logger.debug(f"[Worker {self.worker_id}] Click helper skipped selector {sel}: {e}")
                 continue
         return False
 
@@ -660,10 +828,28 @@ class InstantlyUploader:
 # Synchronous mailbox processor (runs in ThreadPoolExecutor)
 # ---------------------------------------------------------------------------
 
+def _is_browser_infra_error(error: Any) -> bool:
+    """Return true for Chrome/Selenium transport failures that should not fail a mailbox."""
+    text = str(error or "").lower()
+    markers = [
+        "timed out receiving message from renderer",
+        "httpconnectionpool(host='localhost'",
+        "read timed out",
+        "invalid session id",
+        "chrome not reachable",
+        "session deleted because of page crash",
+        "disconnected",
+        "target window already closed",
+        "browser restart failed",
+        "browser crashed",
+    ]
+    return any(marker in text for marker in markers)
+
+
 def process_mailbox_sync(
     uploader: InstantlyUploader,
     mailbox_data: Dict[str, Any],
-    max_retries: int = 2
+    max_retries: int = 1
 ) -> Dict[str, Any]:
     """
     Synchronous function to process a single mailbox upload.
@@ -694,7 +880,15 @@ def process_mailbox_sync(
             f"{uploader._accounts_since_restart} accounts"
         )
         if not uploader.restart_browser():
-            logger.error(f"[Worker {uploader.worker_id}] Preventive restart failed — continuing")
+            logger.error(f"[Worker {uploader.worker_id}] Preventive restart failed — retiring worker")
+            return {
+                "mailbox_id": mailbox_id,
+                "success": False,
+                "error": "Browser restart failed",
+                "retries": 0,
+                "verified": False,
+                "worker_dead": True,
+            }
 
     # Check driver health
     if not uploader.is_driver_alive():
@@ -706,6 +900,7 @@ def process_mailbox_sync(
                 "error": "Browser crashed and restart failed",
                 "retries": 0,
                 "verified": False,
+                "worker_dead": True,
             }
 
     # Try OAuth upload with retries
@@ -718,21 +913,56 @@ def process_mailbox_sync(
                 logger.info(f"[Worker {uploader.worker_id}] Retry {attempt} for {email}")
                 if not uploader.is_driver_alive():
                     if not uploader.restart_browser():
-                        last_error = "Browser restart failed"
-                        break
+                        return {
+                            "mailbox_id": mailbox_id,
+                            "success": False,
+                            "error": "Browser restart failed",
+                            "retries": attempt,
+                            "verified": False,
+                            "worker_dead": True,
+                        }
                 try:
                     uploader.driver.get("https://app.instantly.ai/app/accounts")
                     uploader.delay(2, 3)
                 except Exception:
                     if not uploader.restart_browser():
-                        last_error = "Browser restart failed"
-                        break
+                        return {
+                            "mailbox_id": mailbox_id,
+                            "success": False,
+                            "error": "Browser restart failed",
+                            "retries": attempt,
+                            "verified": False,
+                            "worker_dead": True,
+                        }
 
             result = uploader.add_microsoft_account(email, password, mailbox_id)
             if result["success"]:
                 oauth_passed = True
                 break
             last_error = result["error"] or "Unknown error"
+            if _is_browser_infra_error(last_error):
+                logger.warning(
+                    f"[Worker {uploader.worker_id}] Browser infrastructure error for {email}: {last_error}"
+                )
+                if not uploader.restart_browser():
+                    return {
+                        "mailbox_id": mailbox_id,
+                        "success": False,
+                        "error": last_error,
+                        "retries": attempt,
+                        "verified": False,
+                        "worker_dead": True,
+                    }
+                if attempt >= max_retries:
+                    return {
+                        "mailbox_id": mailbox_id,
+                        "success": False,
+                        "error": last_error,
+                        "retries": attempt,
+                        "verified": False,
+                        "worker_dead": True,
+                    }
+                continue
 
             # Clear MS cookies between retries
             if uploader.is_driver_alive():
@@ -741,6 +971,16 @@ def process_mailbox_sync(
         except Exception as e:
             last_error = f"Exception during upload: {str(e)}"
             logger.error(f"[Worker {uploader.worker_id}] {last_error}")
+            if _is_browser_infra_error(last_error):
+                if not uploader.restart_browser() or attempt >= max_retries:
+                    return {
+                        "mailbox_id": mailbox_id,
+                        "success": False,
+                        "error": last_error,
+                        "retries": attempt,
+                        "verified": False,
+                        "worker_dead": True,
+                    }
             if attempt < max_retries:
                 time.sleep(3)
 
@@ -776,6 +1016,15 @@ def process_mailbox_sync(
         }
     else:
         logger.error(f"[Worker {uploader.worker_id}] All attempts failed for {email}: {last_error}")
+        if _is_browser_infra_error(last_error):
+            return {
+                "mailbox_id": mailbox_id,
+                "success": False,
+                "error": last_error,
+                "retries": max_retries,
+                "verified": False,
+                "worker_dead": True,
+            }
         return {
             "mailbox_id": mailbox_id,
             "success": False,
@@ -813,9 +1062,9 @@ async def run_instantly_upload_for_batch(
     api = None
     if instantly_api_key:
         api = InstantlyAPI(instantly_api_key)
-        if api.test_connection():
+        if await asyncio.to_thread(api.test_connection):
             logger.info("Instantly API connected - verification enabled")
-            existing = api.load_all_accounts()
+            existing = await asyncio.to_thread(api.load_all_accounts)
             logger.info(f"Loaded {len(existing)} existing accounts from Instantly")
         else:
             logger.warning("Instantly API test failed - proceeding without verification")
@@ -833,11 +1082,18 @@ async def run_instantly_upload_for_batch(
         query = (
             select(Mailbox)
             .join(Tenant, Mailbox.tenant_id == Tenant.id)
-            .where(Tenant.batch_id == batch_id)
+            .where(
+                Tenant.batch_id == batch_id,
+                Mailbox.setup_complete == True,
+            )
         )
 
         if skip_uploaded:
             query = query.where(Mailbox.instantly_uploaded == False)
+
+        # Move previously failed/problem mailboxes to the end so clean pending
+        # accounts keep flowing before slow retries are revisited.
+        query = query.order_by(Mailbox.instantly_upload_error.isnot(None), Mailbox.email)
 
         result = await session.execute(query)
         mailboxes = result.scalars().all()
@@ -850,7 +1106,8 @@ async def run_instantly_upload_for_batch(
             {
                 "id": str(mb.id),
                 "email": mb.email,
-                "password": mb.initial_password or mb.password or "#Sendemails1"
+                "password": mb.initial_password or mb.password or "#Sendemails1",
+                "tenant_id": str(mb.tenant_id),
             }
             for mb in mailboxes
         ]
@@ -867,17 +1124,25 @@ async def run_instantly_upload_for_batch(
                     logger.info(
                         f"Pre-filter: {len(already_uploaded)} accounts already in Instantly (API cache)"
                     )
-                    for mb in already_uploaded:
-                        await session.execute(
-                            update(Mailbox)
-                            .where(Mailbox.id == mb["id"])
-                            .values(
-                                instantly_uploaded=True,
-                                instantly_uploaded_at=datetime.utcnow(),
-                                instantly_upload_error=None,
-                            )
+                    already_uploaded_ids = [mb["id"] for mb in already_uploaded]
+                    now = datetime.utcnow()
+                    await session.execute(
+                        update(Mailbox)
+                        .where(Mailbox.id.in_(already_uploaded_ids))
+                        .values(
+                            instantly_uploaded=True,
+                            instantly_uploaded_at=now,
+                            instantly_upload_error=None,
+                            uploaded_to_sequencer=True,
+                            uploaded_at=now,
+                            sequencer_name="instantly",
+                            upload_error=None,
                         )
+                    )
                     await session.commit()
+                    logger.info(
+                        f"Pre-filter: marked {len(already_uploaded_ids)} existing accounts uploaded in DB"
+                    )
 
                     mailbox_list = [
                         mb for mb in mailbox_list
@@ -896,81 +1161,228 @@ async def run_instantly_upload_for_batch(
         errs: List[str] = []
         failed_mbs: List[Dict[str, Any]] = []
 
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            uploaders: List[InstantlyUploader] = []
-            for i in range(num_workers):
+        def setup_worker(worker_id: int, attempts: int = 3) -> Optional[InstantlyUploader]:
+            for attempt in range(1, attempts + 1):
                 upl = InstantlyUploader(
                     instantly_email=instantly_email,
                     instantly_password=instantly_password,
                     api=api,
-                    worker_id=i,
+                    worker_id=worker_id,
                 )
-                if not upl.setup_driver():
-                    logger.error(f"[{pass_label}] Worker {i} driver setup failed, skipping")
-                    upl.cleanup()
-                    continue
+                if upl.setup_driver() and upl.login_to_instantly():
+                    return upl
 
-                if not upl.login_to_instantly():
-                    logger.error(f"[{pass_label}] Worker {i} failed to login, skipping")
-                    upl.cleanup()
-                    continue
+                logger.error(
+                    f"[{pass_label}] Worker {worker_id} setup/login attempt "
+                    f"{attempt}/{attempts} failed"
+                )
+                upl.cleanup()
+                if attempt < attempts:
+                    time.sleep(5 * attempt)
 
-                uploaders.append(upl)
+            logger.error(f"[{pass_label}] Worker {worker_id} failed to start after {attempts} attempts")
+            return None
 
+        setup_results = []
+        for i in range(num_workers):
+            setup_results.append(await asyncio.to_thread(setup_worker, i))
+            await asyncio.sleep(1)
+        uploaders = [upl for upl in setup_results if upl is not None]
+
+        # Keep spare threads available so watchdog replacements can continue even
+        # if ChromeDriver leaves a timed-out Selenium call blocked.
+        executor_workers = max((len(uploaders) or 1) * 2, (len(uploaders) or 1) + 2)
+        executor = ThreadPoolExecutor(max_workers=executor_workers)
+        try:
             if not uploaders:
                 return {
                     "uploaded": 0,
-                    "failed": len(mb_list),
+                    "failed": 0,
                     "errors": ["All workers failed to login"],
-                    "failed_mailboxes": mb_list,
+                    "failed_mailboxes": [],
+                    "fatal": True,
                 }
 
             try:
-                futures = []
-                future_to_mb: Dict[Any, Dict[str, Any]] = {}
-                for idx, mb_data in enumerate(mb_list):
-                    upl = uploaders[idx % len(uploaders)]
+                pending = list(mb_list)
+                active_tenants: set[str] = set()
+                active: Dict[Any, Dict[str, Any]] = {}
+
+                def tenant_key(mb_data: Dict[str, Any]) -> str:
+                    return str(mb_data.get("tenant_id") or mb_data["email"].split("@")[-1]).lower()
+
+                def pop_next_mailbox() -> Optional[Dict[str, Any]]:
+                    if not pending:
+                        return None
+                    for idx, candidate in enumerate(pending):
+                        if tenant_key(candidate) not in active_tenants:
+                            return pending.pop(idx)
+                    return pending.pop(0)
+
+                def submit_next(upl: InstantlyUploader) -> bool:
+                    mb_data = pop_next_mailbox()
+                    if not mb_data:
+                        return False
+                    key = tenant_key(mb_data)
+                    active_tenants.add(key)
                     fut = executor.submit(process_mailbox_sync, upl, mb_data)
-                    futures.append(fut)
-                    future_to_mb[fut] = mb_data
+                    active[asyncio.wrap_future(fut)] = {
+                        "uploader": upl,
+                        "mailbox": mb_data,
+                        "tenant_key": key,
+                        "started_at": time.monotonic(),
+                    }
+                    return True
 
-                for fut in as_completed(futures):
-                    res = fut.result()
-                    mb_data = future_to_mb[fut]
+                async def replace_timed_out_worker(
+                    fut: Any,
+                    ctx: Dict[str, Any],
+                    elapsed: float,
+                ) -> None:
+                    upl = ctx["uploader"]
+                    mb_data = ctx["mailbox"]
+                    key = ctx["tenant_key"]
+                    active.pop(fut, None)
+                    active_tenants.discard(key)
+                    pending.append(mb_data)
+                    upl.retired = True
+                    fut.cancel()
 
-                    async with async_session_factory() as session:
-                        if res["success"]:
-                            await session.execute(
-                                update(Mailbox)
-                                .where(Mailbox.id == res["mailbox_id"])
-                                .values(
-                                    instantly_uploaded=True,
-                                    instantly_uploaded_at=datetime.utcnow(),
-                                    instantly_upload_error=None,
-                                )
-                            )
-                            uploaded += 1
-                        else:
-                            await session.execute(
-                                update(Mailbox)
-                                .where(Mailbox.id == res["mailbox_id"])
-                                .values(
-                                    instantly_uploaded=False,
-                                    instantly_upload_error=res["error"],
-                                )
-                            )
-                            failed += 1
-                            errs.append(res["error"])
-                            failed_mbs.append(mb_data)
-
-                        await session.commit()
-
-                    logger.info(
-                        f"[{pass_label}] Progress: {uploaded + failed}/{len(mb_list)} processed"
+                    logger.error(
+                        f"[{pass_label}] Hard timeout after {elapsed:.0f}s for "
+                        f"{mb_data['email']}; retiring worker {upl.worker_id} and re-queueing mailbox at end"
                     )
-            finally:
+
+                    if upl in uploaders:
+                        uploaders.remove(upl)
+                    await asyncio.to_thread(upl.cleanup)
+
+                    replacement = await asyncio.to_thread(setup_worker, upl.worker_id)
+                    if replacement:
+                        uploaders.append(replacement)
+                        submit_next(replacement)
+                    else:
+                        logger.error(
+                            f"[{pass_label}] Worker {upl.worker_id} replacement setup failed"
+                        )
+
                 for upl in uploaders:
-                    upl.cleanup()
+                    submit_next(upl)
+
+                while active:
+                    done, _ = await asyncio.wait(
+                        active.keys(),
+                        timeout=5,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+
+                    if not done:
+                        now = time.monotonic()
+                        timed_out = [
+                            (fut, ctx, now - ctx["started_at"])
+                            for fut, ctx in list(active.items())
+                            if now - ctx["started_at"] >= MAILBOX_HARD_TIMEOUT_SECONDS
+                        ]
+                        for fut, ctx, elapsed in timed_out:
+                            await replace_timed_out_worker(fut, ctx, elapsed)
+                        continue
+
+                    for fut in done:
+                        ctx = active.pop(fut, None)
+                        if not ctx:
+                            continue
+                        upl = ctx["uploader"]
+                        mb_data = ctx["mailbox"]
+                        key = ctx["tenant_key"]
+                        active_tenants.discard(key)
+                        try:
+                            res = fut.result()
+                        except Exception as exc:
+                            res = {
+                                "mailbox_id": mb_data["id"],
+                                "success": False,
+                                "error": f"Worker exception: {exc}",
+                                "retries": 0,
+                                "verified": False,
+                                "worker_dead": _is_browser_infra_error(exc),
+                            }
+
+                        if res.get("worker_dead"):
+                            logger.error(
+                                f"[{pass_label}] Retiring worker {upl.worker_id}; "
+                                f"re-queueing {mb_data['email']} at end after browser restart failure"
+                            )
+                            pending.append(mb_data)
+                            upl.retired = True
+                            if upl in uploaders:
+                                uploaders.remove(upl)
+                            await asyncio.to_thread(upl.cleanup)
+                            replacement = await asyncio.to_thread(setup_worker, upl.worker_id)
+                            if replacement:
+                                uploaders.append(replacement)
+                                submit_next(replacement)
+                            continue
+
+                        async with async_session_factory() as session:
+                            if res["success"]:
+                                await session.execute(
+                                    update(Mailbox)
+                                    .where(Mailbox.id == res["mailbox_id"])
+                                    .values(
+                                        instantly_uploaded=True,
+                                        instantly_uploaded_at=datetime.utcnow(),
+                                        instantly_upload_error=None,
+                                        uploaded_to_sequencer=True,
+                                        uploaded_at=datetime.utcnow(),
+                                        sequencer_name="instantly",
+                                        upload_error=None,
+                                    )
+                                )
+                                uploaded += 1
+                            else:
+                                await session.execute(
+                                    update(Mailbox)
+                                    .where(Mailbox.id == res["mailbox_id"])
+                                    .values(
+                                        instantly_uploaded=False,
+                                        instantly_upload_error=res["error"],
+                                        uploaded_to_sequencer=False,
+                                        upload_error=res["error"],
+                                    )
+                                )
+                                failed += 1
+                                errs.append(res["error"])
+                                failed_mbs.append(mb_data)
+
+                            await session.commit()
+
+                        logger.info(
+                            f"[{pass_label}] Progress: {uploaded + failed}/{len(mb_list)} processed"
+                        )
+
+                        submit_next(upl)
+
+                if pending:
+                    error = "No active Instantly upload workers available"
+                    logger.error(
+                        f"[{pass_label}] Upload pass stopped with {len(pending)} pending "
+                        f"mailboxes: {error}"
+                    )
+                    errs.append(error)
+                    return {
+                        "uploaded": uploaded,
+                        "failed": failed,
+                        "errors": errs,
+                        "failed_mailboxes": failed_mbs,
+                        "fatal": True,
+                    }
+            finally:
+                await asyncio.gather(
+                    *(asyncio.to_thread(upl.cleanup) for upl in uploaders),
+                    return_exceptions=True,
+                )
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
         return {
             "uploaded": uploaded,
@@ -982,6 +1394,8 @@ async def run_instantly_upload_for_batch(
     # ---------- Main upload pass ----------
     logger.info(f"=== Main upload pass: {len(mailbox_list)} mailboxes ===")
     pass_result = await _run_upload_pass(mailbox_list, pass_label="main")
+    if pass_result.get("fatal"):
+        raise RuntimeError("; ".join(pass_result.get("errors") or ["Instantly upload workers unavailable"]))
 
     total_uploaded = pass_result["uploaded"]
     total_failed = pass_result["failed"]
@@ -1008,6 +1422,7 @@ async def run_instantly_upload_for_batch(
                     .values(
                         instantly_uploaded=False,
                         instantly_upload_error=None,
+                        upload_error=None,
                     )
                 )
             await session.commit()
@@ -1015,6 +1430,10 @@ async def run_instantly_upload_for_batch(
         retry_result = await _run_upload_pass(
             remaining_failed, pass_label=f"retry-{retry_round}"
         )
+        if retry_result.get("fatal"):
+            raise RuntimeError(
+                "; ".join(retry_result.get("errors") or ["Instantly upload workers unavailable"])
+            )
 
         total_uploaded += retry_result["uploaded"]
         total_failed = retry_result["failed"]

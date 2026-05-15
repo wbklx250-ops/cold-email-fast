@@ -62,7 +62,7 @@ class SmartleadWarmupRequest(BaseModel):
     emails: list[str]
     warmup_enabled: bool = True
     total_warmup_per_day: int = 40
-    daily_rampup: int = 1
+    daily_rampup: int = 5
     reply_rate_percentage: int = 79
 
 
@@ -176,7 +176,7 @@ class SmartleadAPI:
         account_id: int,
         enabled: bool = True,
         per_day: int = 40,
-        rampup: int = 1,
+        rampup: int = 5,
         reply_rate: int = 79,
     ) -> bool:
         """POST /email-accounts/{id}/warmup — update warmup settings."""
@@ -287,9 +287,14 @@ class SmartleadOAuthUploader:
 
             # Verify
             time.sleep(3)
-            if "smartlead" in driver.current_url.lower():
+            current_url = driver.current_url.lower()
+            if "smartlead" in current_url:
                 logger.info(f"[Worker {self.worker_id}] OAuth success for {email}")
                 return True
+            elif "login.microsoftonline.com" in current_url:
+                logger.warning(f"[Worker {self.worker_id}] OAuth incomplete for {email}, URL: {driver.current_url}")
+                self._screenshot(driver, f"incomplete_{email.split('@')[0]}")
+                return False
             else:
                 logger.warning(f"[Worker {self.worker_id}] Unclear result for {email}, URL: {driver.current_url}")
                 self._screenshot(driver, f"unclear_{email.split('@')[0]}")
@@ -496,7 +501,7 @@ async def run_smartlead_upload_for_batch(
     
     # Default settings
     sending = sending_settings or {"max_per_day": 6, "wait_mins": 60, "tracking_url": ""}
-    warmup = warmup_settings or {"per_day": 40, "rampup": 1, "reply_rate": 79}
+    warmup = warmup_settings or {"per_day": 40, "rampup": 5, "reply_rate": 79}
 
     # Fetch mailboxes from database
     async with async_session_factory() as session:

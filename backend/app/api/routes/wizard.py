@@ -6332,14 +6332,19 @@ async def get_step8_status(
     if not batch:
         raise HTTPException(404, "Batch not found")
     
-    # Count mailboxes
+    # Count only setup-complete mailboxes. Historical batches can contain stale
+    # mailbox rows for domains that never objectively completed.
     mailboxes_total = await db.scalar(
-        select(func.count(Mailbox.id)).where(Mailbox.batch_id == batch_id)
+        select(func.count(Mailbox.id)).where(
+            Mailbox.batch_id == batch_id,
+            Mailbox.setup_complete == True,
+        )
     ) or 0
     
     mailboxes_uploaded = await db.scalar(
         select(func.count(Mailbox.id)).where(
             Mailbox.batch_id == batch_id,
+            Mailbox.setup_complete == True,
             Mailbox.instantly_uploaded == True
         )
     ) or 0
@@ -6347,6 +6352,7 @@ async def get_step8_status(
     mailboxes_failed = await db.scalar(
         select(func.count(Mailbox.id)).where(
             Mailbox.batch_id == batch_id,
+            Mailbox.setup_complete == True,
             Mailbox.instantly_uploaded == False,
             Mailbox.instantly_upload_error.isnot(None)
         )
@@ -6444,8 +6450,11 @@ async def start_step8_upload(
             "started_at": step8_jobs[job_id].get("started_at")
         }
     
-    # Count eligible mailboxes
-    mailboxes_query = select(func.count(Mailbox.id)).where(Mailbox.batch_id == batch_id)
+    # Count only objectively setup-complete mailboxes.
+    mailboxes_query = select(func.count(Mailbox.id)).where(
+        Mailbox.batch_id == batch_id,
+        Mailbox.setup_complete == True,
+    )
     if request.skip_uploaded:
         mailboxes_query = mailboxes_query.where(Mailbox.instantly_uploaded == False)
     
@@ -6544,6 +6553,7 @@ async def retry_step8_failed(
     failed_result = await db.execute(
         select(Mailbox).where(
             Mailbox.batch_id == batch_id,
+            Mailbox.setup_complete == True,
             Mailbox.instantly_uploaded == False,
             Mailbox.instantly_upload_error.isnot(None)
         )
@@ -6728,14 +6738,18 @@ async def get_batches_for_upload(db: AsyncSession = Depends(get_db)):
     
     batch_list = []
     for batch in batches:
-        # Count mailboxes
+        # Count only setup-complete mailboxes eligible for upload.
         total = await db.scalar(
-            select(func.count(Mailbox.id)).where(Mailbox.batch_id == batch.id)
+            select(func.count(Mailbox.id)).where(
+                Mailbox.batch_id == batch.id,
+                Mailbox.setup_complete == True,
+            )
         ) or 0
         
         uploaded = await db.scalar(
             select(func.count(Mailbox.id)).where(
                 Mailbox.batch_id == batch.id,
+                Mailbox.setup_complete == True,
                 Mailbox.instantly_uploaded == True
             )
         ) or 0
@@ -6743,6 +6757,7 @@ async def get_batches_for_upload(db: AsyncSession = Depends(get_db)):
         failed = await db.scalar(
             select(func.count(Mailbox.id)).where(
                 Mailbox.batch_id == batch.id,
+                Mailbox.setup_complete == True,
                 Mailbox.instantly_uploaded == False,
                 Mailbox.instantly_upload_error.isnot(None)
             )
@@ -6792,7 +6807,10 @@ async def upload_multiple_batches(
     # Count total mailboxes across all batches
     total_mailboxes = 0
     for batch_id in request.batch_ids:
-        count_query = select(func.count(Mailbox.id)).where(Mailbox.batch_id == batch_id)
+        count_query = select(func.count(Mailbox.id)).where(
+            Mailbox.batch_id == batch_id,
+            Mailbox.setup_complete == True,
+        )
         if request.skip_uploaded:
             count_query = count_query.where(Mailbox.instantly_uploaded == False)
         count = await db.scalar(count_query) or 0
@@ -6893,7 +6911,7 @@ class SmartleadStartRequest(BaseModel):
     max_email_per_day: int = 6
     time_to_wait_in_mins: int = 60
     total_warmup_per_day: int = 40
-    daily_rampup: int = 1
+    daily_rampup: int = 5
     reply_rate_percentage: int = 79
 
 
@@ -7129,7 +7147,7 @@ async def csv_sequencer_upload(
     max_email_per_day: int = Form(6),
     time_to_wait_in_mins: int = Form(60),
     total_warmup_per_day: int = Form(40),
-    daily_rampup: int = Form(1),
+    daily_rampup: int = Form(5),
     reply_rate_percentage: int = Form(79),
     # Shared
     num_workers: int = Form(2),
@@ -7280,7 +7298,7 @@ async def csv_sequencer_upload(
         async def run_csv_instantly_upload():
             try:
                 from app.services.instantly_uploader import InstantlyUploader, InstantlyAPI, process_mailbox_sync
-                from concurrent.futures import ThreadPoolExecutor, as_completed
+                from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
                 import uuid
                 
                 # Check for API key from saved account for verification
@@ -7347,32 +7365,45 @@ async def csv_sequencer_upload(
                         return
                     
                     try:
-                        futures = {}
-                        for idx, mb_data in enumerate(mailbox_list):
-                            upl = uploaders[idx % len(uploaders)]
-                            fut = executor.submit(process_mailbox_sync, upl, mb_data)
-                            futures[fut] = mb_data
+                        next_index = 0
+                        active = {}
                         
-                        for fut in as_completed(futures):
-                            result = fut.result()
-                            mb_data = futures[fut]
-                            csv_upload_jobs[job_id]["current_email"] = mb_data["email"]
-                            
-                            if result["success"]:
-                                csv_upload_jobs[job_id]["uploaded"] += 1
-                                csv_upload_jobs[job_id]["results"].append({
-                                    "email": mb_data["email"],
-                                    "status": "uploaded",
-                                    "error": None,
-                                })
-                            else:
-                                csv_upload_jobs[job_id]["failed"] += 1
-                                csv_upload_jobs[job_id]["errors"].append(f"{mb_data['email']}: {result['error']}")
-                                csv_upload_jobs[job_id]["results"].append({
-                                    "email": mb_data["email"],
-                                    "status": "failed",
-                                    "error": result["error"],
-                                })
+                        for upl in uploaders:
+                            if next_index >= len(mailbox_list):
+                                break
+                            mb_data = mailbox_list[next_index]
+                            next_index += 1
+                            fut = executor.submit(process_mailbox_sync, upl, mb_data)
+                            active[fut] = (upl, mb_data)
+                        
+                        while active:
+                            done, _ = wait(active.keys(), return_when=FIRST_COMPLETED)
+                            for fut in done:
+                                upl, mb_data = active.pop(fut)
+                                result = fut.result()
+                                csv_upload_jobs[job_id]["current_email"] = mb_data["email"]
+                                
+                                if result["success"]:
+                                    csv_upload_jobs[job_id]["uploaded"] += 1
+                                    csv_upload_jobs[job_id]["results"].append({
+                                        "email": mb_data["email"],
+                                        "status": "uploaded",
+                                        "error": None,
+                                    })
+                                else:
+                                    csv_upload_jobs[job_id]["failed"] += 1
+                                    csv_upload_jobs[job_id]["errors"].append(f"{mb_data['email']}: {result['error']}")
+                                    csv_upload_jobs[job_id]["results"].append({
+                                        "email": mb_data["email"],
+                                        "status": "failed",
+                                        "error": result["error"],
+                                    })
+                                
+                                if next_index < len(mailbox_list):
+                                    next_mb = mailbox_list[next_index]
+                                    next_index += 1
+                                    next_fut = executor.submit(process_mailbox_sync, upl, next_mb)
+                                    active[next_fut] = (upl, next_mb)
                     finally:
                         for upl in uploaders:
                             upl.cleanup()

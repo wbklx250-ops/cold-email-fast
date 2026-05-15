@@ -66,16 +66,27 @@ export default function Step8InstantlyUpload({ batchId, onComplete, suppressAuto
         `${API_BASE}/api/v1/wizard/batches/${batchId}/step8/status`
       );
       if (res.ok) {
-        const data: Step8Status = await res.json();
-        setStatus(data);
+        const data = await res.json();
+        const convertedStatus: Step8Status = {
+          batch_complete: (data.summary?.total || 0) > 0 && (data.summary?.uploaded || 0) === (data.summary?.total || 0),
+          total: data.summary?.total || 0,
+          uploaded: data.summary?.uploaded || 0,
+          failed: data.summary?.failed || 0,
+          pending: data.summary?.pending || 0,
+          uploading: 0,
+          mailboxes: [],
+        };
+        setStatus(convertedStatus);
 
-        // Auto-stop polling when all done
-        if (data.total > 0 && data.uploaded === data.total) {
+        const jobStatus = data.job?.status;
+        if (jobStatus === "running") {
+          setIsRunning(true);
+        } else if (jobStatus === "completed" || jobStatus === "failed" || convertedStatus.batch_complete) {
           setIsRunning(false);
         }
 
         // Notify parent if batch is fully complete
-        if (data.batch_complete && !suppressAutoComplete) {
+        if (convertedStatus.batch_complete && !suppressAutoComplete) {
           onComplete?.();
         }
       }

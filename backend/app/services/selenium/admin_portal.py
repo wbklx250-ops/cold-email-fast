@@ -6,7 +6,9 @@ import pyotp
 import tempfile
 import uuid
 import shutil
+import threading
 from datetime import datetime
+from typing import Optional
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -21,12 +23,148 @@ import logging
 from app.services.tenant_automation import BrowserWorker
 
 logger = logging.getLogger(__name__)
+_driver_state = threading.local()
 SCREENSHOTS = "C:/temp/screenshots"
 STATUS_DIR = "C:/temp/automation_status"
 os.makedirs(SCREENSHOTS, exist_ok=True)
 os.makedirs(STATUS_DIR, exist_ok=True)
 SCREENSHOT_DIR = "/tmp/screenshots"
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+
+MFA_SETUP_URL_MARKERS = ("mfasetup", "registered=false")
+MFA_SETUP_TEXT_MARKERS = (
+    "you need to set up multifactor authentication",
+    "more information required",
+    "keep your account secure",
+    "set up multifactor authentication",
+    "set up your account",
+    "skip for now",
+)
+NON_RETRYABLE_SETUP_ERRORS = (
+    "MFA setup is required",
+    "MFA required but no TOTP secret",
+    "MFA code input appeared but no TOTP secret",
+)
+
+
+def _remember_active_driver(driver):
+    """Track the Selenium driver owned by the current worker thread."""
+    _driver_state.active_driver = driver
+
+
+def _clear_active_driver(driver=None):
+    active_driver = getattr(_driver_state, "active_driver", None)
+    if driver is None or active_driver is driver:
+        _driver_state.active_driver = None
+
+
+def _cleanup_active_driver(domain: str):
+    """Close only the failed attempt's driver, not browsers owned by other workers."""
+    driver = getattr(_driver_state, "active_driver", None)
+    if not driver:
+        return
+    try:
+        _cleanup_driver(driver)
+        logger.info(f"[{domain}] Browser closed after failed attempt")
+    finally:
+        _clear_active_driver(driver)
+
+
+def _safe_current_url(driver) -> str:
+    try:
+        return driver.current_url or ""
+    except Exception as e:
+        logger.debug(f"Could not read current URL: {e}")
+        return ""
+
+
+def _safe_page_text(driver) -> str:
+    try:
+        text = driver.execute_script("return document.body ? document.body.innerText : '';")
+        return text or ""
+    except Exception as e:
+        logger.debug(f"Could not read page text via JavaScript: {e}")
+    try:
+        driver.implicitly_wait(1)
+    except Exception:
+        pass
+    try:
+        return driver.find_element(By.TAG_NAME, "body").text or ""
+    except Exception as e:
+        logger.debug(f"Could not read page body text: {e}")
+        return ""
+    finally:
+        try:
+            driver.implicitly_wait(15)
+        except Exception:
+            pass
+
+
+def _mfa_setup_blocking_reason(driver) -> Optional[str]:
+    current_url = _safe_current_url(driver).lower()
+    if any(marker in current_url for marker in MFA_SETUP_URL_MARKERS):
+        return f"MFA setup page is open ({current_url})"
+
+    page_text = _safe_page_text(driver).lower()
+    for marker in MFA_SETUP_TEXT_MARKERS:
+        if marker in page_text:
+            return f"MFA setup prompt detected: {marker}"
+    return None
+
+
+def _build_admin_url(driver, hash_path: str) -> str:
+    """Preserve the admin host Microsoft redirected us to, then append a hash route."""
+    current_url = _safe_current_url(driver).lower()
+    route = hash_path.lstrip("/")
+    if "admin.microsoft.com" in current_url and "admin.cloud.microsoft" not in current_url:
+        return f"https://admin.microsoft.com/#{route}"
+    return f"https://admin.cloud.microsoft/#{route}"
+
+
+def _is_domains_page_loaded(driver) -> bool:
+    current_url = _safe_current_url(driver).lower()
+    if "domains" in current_url and "mfasetup" not in current_url:
+        return True
+
+    page_text = _safe_page_text(driver).lower()
+    return (
+        ".onmicrosoft.com" in page_text
+        or "add domain" in page_text
+        or ("domains" in page_text and "microsoft 365 admin center" in page_text)
+    )
+
+
+def _handle_mfa_setup_interrupt(driver, domain: str, totp_secret: Optional[str], context: str) -> bool:
+    """
+    Dismiss an MFA setup interrupt when Microsoft allows it.
+
+    Tenants without a TOTP secret are valid if Microsoft does not require MFA.
+    If Microsoft does require MFA setup and there is no stored TOTP, fail with a
+    clear error instead of retrying browser navigation until Chrome stalls.
+    """
+    reason = _mfa_setup_blocking_reason(driver)
+    if not reason:
+        return False
+
+    logger.warning(f"[{domain}] {reason} during {context}")
+    dismissed = dismiss_mfa_setup_interrupt(driver, domain)
+    if dismissed and not _mfa_setup_blocking_reason(driver):
+        return True
+
+    reason = _mfa_setup_blocking_reason(driver) or reason
+    if not totp_secret:
+        raise Exception(
+            f"MFA setup is required during {context}, but no TOTP secret is stored for this tenant. "
+            "Rerun the tenant first-login/MFA enrollment step, or disable the MFA setup requirement for this tenant."
+        )
+
+    raise Exception(f"MFA setup interrupt is still blocking {context}: {reason}")
+
+
+def _is_non_retryable_setup_error(error: Optional[str]) -> bool:
+    if not error:
+        return False
+    return any(marker in error for marker in NON_RETRYABLE_SETUP_ERRORS)
 
 
 def dismiss_mfa_setup_interrupt(driver, domain: str = "unknown", max_attempts: int = 2) -> bool:
@@ -40,25 +178,32 @@ def dismiss_mfa_setup_interrupt(driver, domain: str = "unknown", max_attempts: i
     from selenium.webdriver.common.by import By
     import time
 
+    try:
+        driver.implicitly_wait(1)
+    except Exception:
+        pass
+
     for attempt in range(max_attempts):
         try:
-            current_url = (driver.current_url or "").lower()
+            current_url = _safe_current_url(driver).lower()
 
             # Detect by URL first (fastest)
-            on_mfa_setup = "mfasetup" in current_url or "registered=false" in current_url
+            on_mfa_setup = any(marker in current_url for marker in MFA_SETUP_URL_MARKERS)
 
             # Also detect by page text (in case URL doesn't match but modal is overlaid)
             if not on_mfa_setup:
+                page_text = _safe_page_text(driver).lower()
+                on_mfa_setup = any(marker in page_text for marker in MFA_SETUP_TEXT_MARKERS)
                 try:
-                    page_text = driver.find_element(By.TAG_NAME, "body").text.lower()
-                    on_mfa_setup = (
-                        "you need to set up multifactor authentication" in page_text
-                        and "skip for now" in page_text
-                    )
+                    driver.implicitly_wait(1)
                 except Exception:
                     pass
 
             if not on_mfa_setup:
+                try:
+                    driver.implicitly_wait(15)
+                except Exception:
+                    pass
                 return False
 
             logger.info(f"[{domain}] MFA setup interrupt detected, clicking 'Skip for now'")
@@ -84,9 +229,13 @@ def dismiss_mfa_setup_interrupt(driver, domain: str = "unknown", max_attempts: i
                             logger.info(f"[{domain}] Clicked 'Skip for now' via {sel}")
                             time.sleep(2)
                             # Verify dismissed
-                            new_url = (driver.current_url or "").lower()
+                            new_url = _safe_current_url(driver).lower()
                             if "mfasetup" not in new_url:
                                 logger.info(f"[{domain}] MFA setup interrupt dismissed")
+                                try:
+                                    driver.implicitly_wait(15)
+                                except Exception:
+                                    pass
                                 return True
                 except Exception as e:
                     logger.debug(f"[{domain}] Selector {sel} failed: {e}")
@@ -103,14 +252,22 @@ def dismiss_mfa_setup_interrupt(driver, domain: str = "unknown", max_attempts: i
     # at least we'll see the failure in logs instead of a stuck session.
     try:
         logger.warning(f"[{domain}] Falling back to direct navigation to escape MFA interrupt")
-        driver.get("https://admin.microsoft.com/Adminportal/Home#/Domains")
+        driver.get("https://admin.cloud.microsoft/#/Domains")
         time.sleep(3)
-        final_url = (driver.current_url or "").lower()
+        final_url = _safe_current_url(driver).lower()
         if "mfasetup" not in final_url:
+            try:
+                driver.implicitly_wait(15)
+            except Exception:
+                pass
             return True
     except Exception as e:
         logger.error(f"[{domain}] Fallback navigation failed: {e}")
 
+    try:
+        driver.implicitly_wait(15)
+    except Exception:
+        pass
     return False
 
 
@@ -369,6 +526,52 @@ def wait_for_body_text(driver, min_length: int = 50, timeout: int = 30) -> str:
     return last_text
 
 
+def _navigate_to_domains_page(driver, domain: str, totp_secret: Optional[str]) -> None:
+    """Navigate to the M365 domains page, handling optional MFA setup interrupts."""
+    _handle_mfa_setup_interrupt(driver, domain, totp_secret, "before domains navigation")
+
+    candidate_urls = []
+    for url in (
+        "https://admin.cloud.microsoft/#/Domains",
+        _build_admin_url(driver, "/Domains"),
+        "https://admin.microsoft.com/#/Domains",
+    ):
+        if url not in candidate_urls:
+            candidate_urls.append(url)
+
+    last_error = None
+    for nav_attempt, domains_url in enumerate(candidate_urls, start=1):
+        logger.info(f"[{domain}] Navigating to domains page ({nav_attempt}/{len(candidate_urls)}): {domains_url}")
+        try:
+            driver.get(domains_url)
+            wait_for_page_load(driver, timeout=25)
+        except Exception as e:
+            last_error = str(e)
+            logger.warning(f"[{domain}] Domains navigation attempt {nav_attempt} raised: {e}")
+
+        time.sleep(5)
+
+        if _handle_mfa_setup_interrupt(driver, domain, totp_secret, "domains navigation"):
+            time.sleep(2)
+            continue
+
+        for check_attempt in range(10):
+            if _is_domains_page_loaded(driver):
+                logger.info(f"[{domain}] Successfully reached domains page")
+                return
+
+            if _mfa_setup_blocking_reason(driver):
+                _handle_mfa_setup_interrupt(driver, domain, totp_secret, "domains page load")
+                break
+
+            time.sleep(2)
+
+        logger.warning(f"[{domain}] Domains page not ready after navigation attempt {nav_attempt}")
+
+    detail = f": {last_error}" if last_error else ""
+    raise Exception(f"Could not reach domains page after {len(candidate_urls)} navigation attempts{detail}")
+
+
 # ============================================================
 # RETRY WRAPPER FOR RESILIENT DOMAIN SETUP
 # ============================================================
@@ -378,7 +581,7 @@ def setup_domain_with_retry(
     zone_id: str,
     admin_email: str,
     admin_password: str,
-    totp_secret: str,
+    totp_secret: Optional[str],
     max_retries: int = 2,
     headless: bool = True,
 ) -> dict:
@@ -394,15 +597,18 @@ def setup_domain_with_retry(
         zone_id: Cloudflare zone ID
         admin_email: M365 admin email
         admin_password: M365 admin password  
-        totp_secret: TOTP secret for MFA
+        totp_secret: Optional TOTP secret for MFA
         max_retries: Number of retry attempts (default 2, so 3 total attempts)
     
     Returns:
         Dict with success, verified, dns_configured, error keys
     """
     last_error = None
+    attempts_used = 0
     
     for attempt in range(max_retries + 1):
+        attempts_used = attempt + 1
+        _cleanup_active_driver(domain)
         if attempt > 0:
             logger.info(f"[{domain}] Retry attempt {attempt}/{max_retries} - waiting 60s before retry...")
             time.sleep(60)  # Wait before retry to let resources free up (increased from 30s)
@@ -426,31 +632,39 @@ def setup_domain_with_retry(
             
             last_error = result.get("error", "Unknown error")
             logger.warning(f"[{domain}] Attempt {attempt + 1} failed: {last_error}")
+            _cleanup_active_driver(domain)
+            if _is_non_retryable_setup_error(last_error):
+                logger.error(f"[{domain}] Non-retryable setup error, not retrying: {last_error}")
+                break
             
         except Exception as e:
             last_error = str(e)
             logger.error(f"[{domain}] Attempt {attempt + 1} exception: {e}")
+            _cleanup_active_driver(domain)
+            if _is_non_retryable_setup_error(last_error):
+                logger.error(f"[{domain}] Non-retryable setup exception, not retrying: {last_error}")
+                break
     
     # All attempts failed
-    logger.error(f"[{domain}] FAILED after {max_retries + 1} attempts. Last error: {last_error}")
+    logger.error(f"[{domain}] FAILED after {attempts_used} attempts. Last error: {last_error}")
     return {
         "success": False, 
         "verified": False,
         "dns_configured": False,
-        "error": f"Failed after {max_retries + 1} attempts: {last_error}"
+        "error": f"Failed after {attempts_used} attempts: {last_error}"
     }
 
 
-def _login_with_mfa(driver, admin_email: str, admin_password: str, totp_secret: str, domain: str) -> None:
-    """Log into M365 admin portal with robust MFA handling.
+def _login_with_mfa(driver, admin_email: str, admin_password: str, totp_secret: Optional[str], domain: str) -> None:
+    """Log into M365 admin portal with robust optional MFA handling.
 
     Raises:
         Exception: if required login steps are not reachable.
     """
-    if not totp_secret:
-        raise Exception("Missing TOTP secret for MFA")
-
     logger.info(f"[{domain}] Logging into M365 Admin Portal")
+    if not totp_secret:
+        logger.info(f"[{domain}] No TOTP secret stored; will proceed if Microsoft does not require MFA")
+
     driver.get("https://admin.microsoft.com")
     wait_for_page_load(driver, timeout=30)
     time.sleep(3)
@@ -518,6 +732,13 @@ def _login_with_mfa(driver, admin_email: str, admin_password: str, totp_secret: 
     if mfa_detected:
         logger.info(f"[{domain}] MFA detected, handling MFA flow...")
         _save_screenshot(driver, domain, "mfa_page_detected")
+        if not totp_secret:
+            try:
+                page_body = driver.find_element(By.TAG_NAME, "body").text
+                logger.error(f"[{domain}] MFA is required but no TOTP secret is stored. Page text: {page_body[:500]}")
+            except Exception:
+                pass
+            raise Exception("MFA required but no TOTP secret is stored for this tenant")
 
         # STEP A: Try to find the TOTP input directly (maybe already on code page)
         try:
@@ -660,6 +881,8 @@ def _login_with_mfa(driver, admin_email: str, admin_password: str, totp_secret: 
 
     # STEP C: Enter the TOTP code (if we have an input)
     if totp_input:
+        if not totp_secret:
+            raise Exception("MFA code input appeared but no TOTP secret is stored for this tenant")
         code = pyotp.TOTP(totp_secret).now()
         logger.info(f"[{domain}] Entering TOTP code: {code[:2]}****")
         totp_input.clear()
@@ -712,20 +935,16 @@ def _login_with_mfa(driver, admin_email: str, admin_password: str, totp_secret: 
     except Exception:
         logger.debug(f"[{domain}] No stay signed in prompt")
 
-    # Dismiss the "You need to set up multifactor authentication" interrupt
-    # that admin.cloud.microsoft/mfasetup shows after login even when TOTP
-    # is already enrolled via SSPR. We always click "Skip for now".
-    try:
-        dismiss_mfa_setup_interrupt(driver, domain)
-    except Exception as e:
-        logger.warning(f"[{domain}] MFA setup interrupt dismiss raised: {e}")
+    # Dismiss the MFA setup interrupt if Microsoft allows skipping it. Tenants
+    # without TOTP can continue only when Microsoft is not requiring MFA setup.
+    _handle_mfa_setup_interrupt(driver, domain, totp_secret, "post-login")
 
 
-def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_password, totp_secret, cloudflare_service=None, headless=False):
+def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_password, totp_secret=None, cloudflare_service=None, headless=False):
     """Complete M365 domain setup following EXACT wizard flow.
     
     IMPORTANT: Each step has individual error handling for better resilience.
-    Browser is ALWAYS closed in finally block to ensure cleanup even on crash.
+    The retry wrapper closes this attempt's browser if an unhandled exception bubbles out.
     """
     from app.services.cloudflare_sync import add_txt, add_mx, add_spf, add_cname, cleanup_before_verification, cleanup_before_dns_setup, resolve_zone_id
     
@@ -754,11 +973,17 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
         try:
             worker = BrowserWorker(worker_id=f"step5-{uuid.uuid4()}", headless=headless)
             driver = worker._create_driver()
+            _remember_active_driver(driver)
             driver.implicitly_wait(15)  # Increased from 10
             driver.set_page_load_timeout(60)  # Add page load timeout
+            try:
+                driver.set_script_timeout(20)
+            except Exception:
+                pass
             logger.info(f"[{domain}] Browser initialized successfully on attempt {chrome_attempt + 1}")
             break
         except Exception as e:
+            _cleanup_active_driver(domain)
             error_msg = str(e).lower()
             if "session not created" in error_msg or "chrome" in error_msg:
                 logger.warning(f"[{domain}] Chrome startup failed (attempt {chrome_attempt + 1}/{CHROME_STARTUP_RETRIES}): {e}")
@@ -787,6 +1012,7 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
         logger.error(f"[{domain}] Zone ID validation failed: {e}")
         result["error"] = f"Zone ID validation failed: {e}"
         _cleanup_driver(driver)
+        _clear_active_driver(driver)
         return result
 
     # ===== STEP 1: LOGIN =====
@@ -805,24 +1031,8 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     time.sleep(5)  # Extra wait after login
     
     # ===== STEP 2: NAVIGATE TO DOMAINS =====
-    # Dismiss MFA-setup interrupt if it's still lingering before we navigate
-    try:
-        dismiss_mfa_setup_interrupt(driver, domain)
-    except Exception:
-        pass
     logger.info(f"[{domain}] Step 2: Navigate to domains page")
-    driver.get("https://admin.microsoft.com/#/Domains")
-    wait_for_page_load(driver, timeout=30)
-    time.sleep(8)  # Increased from 5 for page to fully render
-    
-    # Verify we're on domains page
-    for check_attempt in range(10):
-        if "domains" in driver.current_url.lower():
-            logger.info(f"[{domain}] Successfully reached domains page")
-            break
-        time.sleep(1)
-    else:
-        raise Exception("Could not reach domains page after 10 attempts")
+    _navigate_to_domains_page(driver, domain, totp_secret)
     
     screenshot(driver, "02_domains", domain)
     
@@ -836,11 +1046,8 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     except:
         logger.info(f"[{domain}] Add domain button not found, navigating to wizard directly")
         # Dismiss MFA setup interrupt if it intercepted the page
-        try:
-            dismiss_mfa_setup_interrupt(driver, domain)
-        except Exception:
-            pass
-        driver.get("https://admin.microsoft.com/#/Domains/Wizard")
+        _handle_mfa_setup_interrupt(driver, domain, totp_secret, "before domain wizard navigation")
+        driver.get("https://admin.cloud.microsoft/#/Domains/Wizard")
         wait_for_page_load(driver, timeout=30)
     time.sleep(5)  # Increased from 3
     
@@ -872,6 +1079,7 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
         result["error"] = f"Enter domain failed: {e}"
         screenshot(driver, "error_enter_domain", domain)
         _cleanup_driver(driver)
+        _clear_active_driver(driver)
         return result
     
     # ===== STEP 5: DETECT PAGE STATE AFTER ENTERING DOMAIN =====
@@ -973,6 +1181,7 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
             result["error"] = "TXT value not found"
             logger.error(f"[{domain}] FAILED - cleaning up browser")
             _cleanup_driver(driver)
+            _clear_active_driver(driver)
             return result
         
         txt_value = txt_match.group(0)  
@@ -1052,6 +1261,7 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
             update_status_file(domain, "verification", "failed", "Could not click Verify button")
             logger.error(f"[{domain}] FAILED - cleaning up browser")
             _cleanup_driver(driver)
+            _clear_active_driver(driver)
             return result
         
         # ===== VERIFICATION RESULT DETECTION WITH RETRY =====
@@ -1155,6 +1365,7 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
                     result["error"] = f"Domain verification failed after {MAX_VERIFY_RETRIES + 1} attempts - M365 could not detect TXT record"
                     update_status_file(domain, "verification", "failed", result["error"])
                     _cleanup_driver(driver)
+                    _clear_active_driver(driver)
                     return result
                 # Will retry at top of loop
                 continue
@@ -1168,6 +1379,7 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
                 if verify_attempt >= MAX_VERIFY_RETRIES:
                     result["error"] = "Verification did not complete - unknown page state"
                     _cleanup_driver(driver)
+                    _clear_active_driver(driver)
                     return result
                 continue
             else:
@@ -1286,6 +1498,7 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
             result["error"] = "Could not click Continue on connect page"
             logger.error(f"[{domain}] FAILED - cleaning up browser")
             _cleanup_driver(driver)
+            _clear_active_driver(driver)
             return result
         
         # Wait for DNS records page to load
@@ -1673,6 +1886,8 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     
     # ===== CLOSE BROWSER =====
     _cleanup_driver(driver)
+    _clear_active_driver(driver)
+    driver = None
     logger.info(f"[{domain}] Browser closed and profile cleaned up")
     
     return result
@@ -1681,7 +1896,7 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
 async def enable_org_smtp_auth(
     admin_email: str,
     admin_password: str,
-    totp_secret: str,
+    totp_secret: Optional[str],
     domain: str,
 ) -> dict:
     """

@@ -55,6 +55,11 @@ class Settings(BaseSettings):
     # True = headless mode (REQUIRED for production/Railway - no display available!)
     step6_headless: bool = True
 
+    # Step 6 M365 domain setup can hang indefinitely if ChromeDriver stops
+    # responding. This is a per-domain wall-clock guard so one bad browser
+    # session cannot block the whole batch.
+    step6_domain_timeout_seconds: int = 2400
+
     # Domain Checker parallel browsers
     # Lighter than Step 5 (read-only), so can be slightly more aggressive
     # 3 = safe default (~1.1GB RAM), 4-5 for larger Railway instances

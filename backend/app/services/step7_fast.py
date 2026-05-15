@@ -141,7 +141,7 @@ try {{
 
     $body2 = @{{
         grant_type = "password"
-        client_id = "1950a258-227b-4e31-a9cf-717495945fc2"
+        client_id = "1b730954-1685-4b74-9bfd-dac224a7b894"
         scope = "https://graph.microsoft.com/.default"
         username = "{escaped_email}"
         password = "{escaped_password}"
@@ -246,7 +246,12 @@ try {{
     @{{ success=$true; email=$targetUpn; user_id=$userId; was_created=$wasCreated; has_license=$hasAllowedLicense; license_action=$licenseAction; license_sku=$licenseSku }} | ConvertTo-Json -Compress
     Disconnect-MgGraph -ErrorAction SilentlyContinue
 }} catch {{
-    @{{ success=$false; error=$_.Exception.Message }} | ConvertTo-Json -Compress
+    $detail = $_.ErrorDetails.Message
+    $msg = $_.Exception.Message
+    if (-not [string]::IsNullOrWhiteSpace($detail)) {{
+        $msg = "$msg :: $detail"
+    }}
+    @{{ success=$false; error=$msg }} | ConvertTo-Json -Compress
     Disconnect-MgGraph -ErrorAction SilentlyContinue
 }}
 '''
@@ -300,6 +305,68 @@ async def ensure_licensed_user_for_domain(
         await save_to_db_with_retry(_save_licensed_user, description=f"{domain} licensed user save")
 
     return result
+
+
+def build_expected_mailbox_data(
+    domain: str,
+    display_name: str,
+    batch_data: Dict[str, Any] = None,
+    mailboxes_per_tenant: int = 50,
+    mailbox_password: str = MAILBOX_PASSWORD,
+) -> List[Dict[str, str]]:
+    """
+    Build the authoritative mailbox list for a domain from batch config.
+
+    This is intentionally count/list based, not DB-state based: if stale DB rows
+    exist, they do not define completion.
+    """
+    domain = (domain or "").strip().lower()
+    custom_emails_for_domain = None
+    if batch_data and batch_data.get("custom_mailbox_map"):
+        custom_emails_for_domain = batch_data["custom_mailbox_map"].get(domain)
+
+    if custom_emails_for_domain:
+        mailbox_data = []
+        for entry in custom_emails_for_domain:
+            email = (entry.get("email") or "").strip().lower()
+            if not email or "@" not in email:
+                continue
+            local_part = email.split("@", 1)[0]
+            mailbox_data.append(
+                {
+                    "email": email,
+                    "local_part": local_part,
+                    "display_name": (entry.get("display_name") or "").strip() or display_name,
+                    "password": (entry.get("password") or "").strip() or mailbox_password,
+                }
+            )
+    else:
+        mailbox_data = generate_emails_for_domain(
+            display_name=display_name,
+            domain=domain,
+            count=mailboxes_per_tenant,
+        )
+
+    deduped: List[Dict[str, str]] = []
+    seen = set()
+    for mb in mailbox_data:
+        email = (mb.get("email") or "").strip().lower()
+        if not email or email in seen:
+            continue
+        local_part = mb.get("local_part") or email.split("@", 1)[0]
+        password = mb.get("password") or mailbox_password
+        if local_part.strip().lower() == "m" and password == mailbox_password:
+            password = "#S3ndPost1!"
+        seen.add(email)
+        deduped.append(
+            {
+                "email": email,
+                "local_part": local_part,
+                "display_name": mb.get("display_name") or display_name,
+                "password": password,
+            }
+        )
+    return deduped
 
 
 async def process_domain_fast(
@@ -394,75 +461,78 @@ async def process_domain_fast(
         # ================================================================
         logger.info("[%s] Phase 2: Generate emails", domain)
 
+        desired_mailboxes = build_expected_mailbox_data(
+            domain=domain,
+            display_name=display_name,
+            batch_data=batch_data,
+            mailboxes_per_tenant=mailboxes_per_tenant,
+            mailbox_password=mailbox_password,
+        )
+        desired_emails = [mb["email"] for mb in desired_mailboxes]
+        desired_password_by_email = {
+            mb["email"].lower(): mb["password"] or mailbox_password
+            for mb in desired_mailboxes
+        }
+        if not desired_emails:
+            raise Exception("No expected mailboxes could be generated")
+
         async with BackgroundSessionLocal() as db:
             existing_rows = await db.execute(
                 select(Mailbox.email).where(
                     Mailbox.tenant_id == tenant_id,
-                    Mailbox.email.like(f"%@{domain}"),
+                    Mailbox.email.in_(desired_emails),
                 )
             )
             existing_emails = {email.lower() for email in existing_rows.scalars().all()}
-            existing_count = len(existing_emails)
 
-        if existing_count >= mailboxes_per_tenant:
-            logger.info("[%s] Mailboxes already generated (%s exist)", domain, existing_count)
-        else:
-            # Check for custom mailbox map (CSV-imported emails)
-            custom_emails_for_domain = None
-            if batch_data and batch_data.get("custom_mailbox_map"):
-                custom_emails_for_domain = batch_data["custom_mailbox_map"].get(domain.lower())
+        missing_mailboxes = [
+            mb for mb in desired_mailboxes
+            if mb["email"].lower() not in existing_emails
+        ]
+        if missing_mailboxes:
+            async with BackgroundSessionLocal() as gen_db:
+                for mb in missing_mailboxes:
+                    mailbox = Mailbox(
+                        email=mb["email"],
+                        local_part=mb["local_part"],
+                        display_name=mb["display_name"],
+                        password=mb["password"],
+                        tenant_id=tenant_id,
+                        batch_id=batch_id,
+                        status=MailboxStatus.PENDING,
+                        warmup_stage="none",
+                    )
+                    gen_db.add(mailbox)
+                await gen_db.commit()
 
-            if custom_emails_for_domain:
-                logger.info("[%s] Using %d custom email addresses from CSV", domain, len(custom_emails_for_domain))
-                mailbox_data = []
-                for entry in custom_emails_for_domain:
-                    email = entry.get("email", "").strip().lower()
-                    if not email or "@" not in email:
-                        continue
-                    local_part = email.split("@")[0]
-                    dn = entry.get("display_name", "").strip() or display_name
-                    pw = entry.get("password", "").strip() or mailbox_password
-                    mailbox_data.append({"email": email, "local_part": local_part, "display_name": dn, "password": pw})
-                if not mailbox_data:
-                    mailbox_data = generate_emails_for_domain(display_name=display_name, domain=domain, count=mailboxes_per_tenant)
-            else:
-                mailbox_data = generate_emails_for_domain(display_name=display_name, domain=domain, count=mailboxes_per_tenant)
+        logger.info(
+            "[%s] Expected mailbox rows: %s total, %s inserted (%.1fs)",
+            domain,
+            len(desired_mailboxes),
+            len(missing_mailboxes),
+            time.time() - start_time,
+        )
 
-            mailbox_data = [
-                mb for mb in mailbox_data
-                if (mb.get("email") or "").strip().lower() not in existing_emails
-            ]
-
-            if not mailbox_data:
-                logger.info("[%s] No missing mailbox DB records to generate", domain)
-            else:
-                async with BackgroundSessionLocal() as gen_db:
-                    for mb in mailbox_data:
-                        mailbox = Mailbox(
-                            email=mb["email"],
-                            local_part=mb["local_part"],
-                            display_name=mb["display_name"],
-                            password=mb["password"],
-                            tenant_id=tenant_id,
-                            batch_id=batch_id,
-                            status=MailboxStatus.PENDING,
-                            warmup_stage="none",
-                        )
-                        gen_db.add(mailbox)
-                    await gen_db.commit()
-
-            logger.info("[%s] Generated %s missing mailboxes (%.1fs)", domain, len(mailbox_data), time.time() - start_time)
-
-        # Reload mailboxes from DB
+        # Reload only the authoritative mailbox set from DB.
         async with BackgroundSessionLocal() as db:
             result = await db.execute(
-                select(Mailbox).where(Mailbox.tenant_id == tenant_id, Mailbox.email.like(f"%@{domain}"))
+                select(Mailbox).where(
+                    Mailbox.tenant_id == tenant_id,
+                    Mailbox.email.in_(desired_emails),
+                )
             )
             mailboxes = result.scalars().all()
-            mailbox_list = [
-                {"email": mb.email, "display_name": mb.display_name, "password": mb.password or mailbox_password}
-                for mb in mailboxes
-            ]
+            mailboxes_by_email = {mb.email.lower(): mb for mb in mailboxes}
+            mailbox_list = []
+            for desired in desired_mailboxes:
+                mb = mailboxes_by_email.get(desired["email"].lower())
+                mailbox_list.append(
+                    {
+                        "email": desired["email"],
+                        "display_name": (mb.display_name if mb else None) or desired["display_name"],
+                        "password": desired["password"] or (mb.password if mb else None) or mailbox_password,
+                    }
+                )
 
         if not mailbox_list:
             raise Exception("No mailboxes found after generation")
@@ -472,7 +542,7 @@ async def process_domain_fast(
         #          ALL in one PowerShell session (~12-15 min)
         # ================================================================
         logger.info(
-            "[%s] Phase 3: PowerShell mailbox creation (ROPC auth, no browser; can be silent up to 15 min)",
+            "[%s] Phase 3: PowerShell mailbox creation (ROPC auth, no browser; can be silent up to 30 min)",
             domain,
         )
 
@@ -498,7 +568,8 @@ async def process_domain_fast(
             mailbox_array=mailbox_array,
         )
 
-        ps_result = await _run_powershell(master_script, timeout=900)  # 15 min timeout
+        ps_timeout = int(os.getenv("STEP7_FAST_POWERSHELL_TIMEOUT_SECONDS", "1800") or "1800")
+        ps_result = await _run_powershell(master_script, timeout=ps_timeout)
 
         if ps_result.get("success") is False and "created" not in ps_result:
             raise Exception(
@@ -506,6 +577,7 @@ async def process_domain_fast(
             )
 
         created = ps_result.get("created", 0)
+        create_requested = ps_result.get("create_requested", 0)
         delegated = ps_result.get("delegated", 0)
         passwords_set = ps_result.get("passwords_set", 0)
         upns_fixed = ps_result.get("upns_fixed", 0)
@@ -519,8 +591,8 @@ async def process_domain_fast(
             logger.warning("[%s] PowerShell errors: %s", domain, "; ".join(str(e) for e in ps_errors[:5]))
 
         logger.info(
-            "[%s] PowerShell results: created=%s, delegated=%s, passwords=%s, upns=%s",
-            domain, created, delegated, passwords_set, upns_fixed,
+            "[%s] PowerShell results: requested=%s, created=%s, delegated=%s, passwords=%s, upns=%s",
+            domain, create_requested, created, delegated, passwords_set, upns_fixed,
         )
 
         # ================================================================
@@ -545,11 +617,15 @@ async def process_domain_fast(
                     .where(Mailbox.tenant_id == tenant_id, Mailbox.email.in_(delegated_emails))
                     .values(delegated=True)
                 )
-            if password_emails:
+            for email in password_emails:
                 await db.execute(
                     update(Mailbox)
-                    .where(Mailbox.tenant_id == tenant_id, Mailbox.email.in_(password_emails))
-                    .values(password_set=True, account_enabled=True, password=mailbox_password)
+                    .where(Mailbox.tenant_id == tenant_id, Mailbox.email == email)
+                    .values(
+                        password_set=True,
+                        account_enabled=True,
+                        password=desired_password_by_email.get(email.lower(), mailbox_password),
+                    )
                 )
             if upn_emails:
                 await db.execute(
@@ -557,6 +633,25 @@ async def process_domain_fast(
                     .where(Mailbox.tenant_id == tenant_id, Mailbox.email.in_(upn_emails))
                     .values(upn_fixed=True)
                 )
+
+            await db.execute(
+                update(Mailbox)
+                .where(
+                    Mailbox.tenant_id == tenant_id,
+                    Mailbox.email.in_(desired_emails),
+                    Mailbox.created_in_exchange == True,
+                    Mailbox.account_enabled == True,
+                    Mailbox.password_set == True,
+                    Mailbox.upn_fixed == True,
+                    Mailbox.delegated == True,
+                )
+                .values(
+                    setup_complete=True,
+                    setup_completed_at=datetime.utcnow(),
+                    status=MailboxStatus.READY,
+                    error_message=None,
+                )
+            )
 
             # Update tenant counters
             t = await db.get(Tenant, tenant_id)
@@ -646,6 +741,7 @@ def _build_master_script(
 $ErrorActionPreference = "Continue"
 $results = @{{
     created=0
+    create_requested=0
     delegated=0
     passwords_set=0
     upns_fixed=0
@@ -676,25 +772,48 @@ $mailboxes = @(
 
 $licensedUser = "me1@{domain}"
 
+function Get-StableMailboxAlias([string]$Email) {{
+    $normalized = $Email.ToLowerInvariant()
+    $clean = (($normalized -replace "@", "-at-") -replace "[^a-z0-9-]", "-").Trim("-")
+    if ([string]::IsNullOrWhiteSpace($clean)) {{
+        $clean = "shared-mailbox"
+    }}
+    $sha1 = [System.Security.Cryptography.SHA1]::Create()
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($normalized)
+    $hash = [System.BitConverter]::ToString($sha1.ComputeHash($bytes)).Replace("-", "").Substring(0, 8).ToLowerInvariant()
+    if ($clean.Length -gt 54) {{
+        $clean = $clean.Substring(0, 54).Trim("-")
+    }}
+    return "$clean-$hash"
+}}
+
+function Get-StableMailboxName([object]$Mailbox) {{
+    $alias = Get-StableMailboxAlias $Mailbox.Email
+    return "shared-$alias"
+}}
+
 # === STEP 1: CREATE SHARED MAILBOXES ===
 Write-Host "STEP1_CREATE"
 foreach ($mb in $mailboxes) {{
     try {{
         $existing = Get-Mailbox -Identity $mb.Email -ErrorAction SilentlyContinue
         if ($existing) {{
-            $results.created++
-            $results.created_emails += $mb.Email
+            $results.create_requested++
         }} else {{
-            $tempName = "$("{escaped_display}") $($mb.Index)"
-            New-Mailbox -Shared -Name $tempName -DisplayName $tempName -PrimarySmtpAddress $mb.Email -ErrorAction Stop | Out-Null
-            $results.created++
-            $results.created_emails += $mb.Email
+            $tempName = Get-StableMailboxName $mb
+            $alias = Get-StableMailboxAlias $mb.Email
+            New-Mailbox -Shared -Name $tempName -Alias $alias -DisplayName "{escaped_display}" -PrimarySmtpAddress $mb.Email -ErrorAction Stop | Out-Null
+            $results.create_requested++
         }}
     }} catch {{
         $errMsg = $_.Exception.Message
         if ($errMsg -like "*already being used*" -or $errMsg -like "*already exists*") {{
-            $results.created++
-            $results.created_emails += $mb.Email
+            $afterConflict = Get-Mailbox -Identity $mb.Email -ErrorAction SilentlyContinue
+            if ($afterConflict) {{
+                $results.create_requested++
+            }} else {{
+                $results.errors += "Create failed: $($mb.Email): $errMsg"
+            }}
         }} else {{
             $results.errors += "Create failed: $($mb.Email): $errMsg"
         }}
@@ -702,49 +821,102 @@ foreach ($mb in $mailboxes) {{
     Start-Sleep -Milliseconds 200
 }}
 
-# Wait for provisioning
-Start-Sleep -Seconds 10
+# Wait until Exchange can actually resolve the mailbox objects. New-Mailbox can
+# return before permissions or Graph user operations can see the object.
+Write-Host "STEP1_WAIT_VISIBLE"
+$pending = @{{}}
+foreach ($mb in $mailboxes) {{
+    $pending[$mb.Email.ToLowerInvariant()] = $mb.Email
+}}
+$visibleLookup = @{{}}
+$waitDeadline = (Get-Date).AddSeconds(480)
+do {{
+    foreach ($mb in $mailboxes) {{
+        $key = $mb.Email.ToLowerInvariant()
+        if (-not $pending.ContainsKey($key)) {{
+            continue
+        }}
+        try {{
+            $visible = Get-Mailbox -Identity $mb.Email -ErrorAction SilentlyContinue
+            if ($visible) {{
+                $visibleLookup[$key] = $mb.Email
+                [void]$pending.Remove($key)
+            }}
+        }} catch {{}}
+        Start-Sleep -Milliseconds 100
+    }}
+    if ($pending.Count -gt 0 -and (Get-Date) -lt $waitDeadline) {{
+        Start-Sleep -Seconds 15
+    }}
+}} while ($pending.Count -gt 0 -and (Get-Date) -lt $waitDeadline)
+
+foreach ($email in $visibleLookup.Values) {{
+    $results.created++
+    $results.created_emails += $email
+}}
+if ($pending.Count -gt 0) {{
+    $results.errors += "Mailbox not visible after wait: $($pending.Values -join ', ')"
+}}
+
+$readyMailboxes = @()
+foreach ($mb in $mailboxes) {{
+    if ($visibleLookup.ContainsKey($mb.Email.ToLowerInvariant())) {{
+        $readyMailboxes += $mb
+    }}
+}}
 
 # === STEP 2: FIX DISPLAY NAMES ===
 Write-Host "STEP2_NAMES"
-foreach ($mb in $mailboxes) {{
+foreach ($mb in $readyMailboxes) {{
     try {{
-        Set-Mailbox -Identity $mb.Email -DisplayName "{escaped_display}" -Name "{escaped_display}" -ErrorAction SilentlyContinue
+        Set-Mailbox -Identity $mb.Email -DisplayName "{escaped_display}" -ErrorAction SilentlyContinue
     }} catch {{}}
     Start-Sleep -Milliseconds 100
 }}
 
 # === STEP 3: DELEGATE ===
 Write-Host "STEP3_DELEGATE"
-foreach ($mb in $mailboxes) {{
-    $delegateErrors = @()
-    try {{
-        Add-MailboxPermission -Identity $mb.Email -User $licensedUser -AccessRights FullAccess -AutoMapping $true -ErrorAction Stop | Out-Null
-    }} catch {{
-        if ($_.Exception.Message -notlike "*already*") {{
-            $delegateErrors += "FullAccess: $($_.Exception.Message)"
+foreach ($mb in $readyMailboxes) {{
+    $delegateSucceeded = $false
+    $lastDelegateErrors = @()
+    for ($attempt = 1; $attempt -le 6 -and -not $delegateSucceeded; $attempt++) {{
+        $delegateErrors = @()
+        try {{
+            Add-MailboxPermission -Identity $mb.Email -User $licensedUser -AccessRights FullAccess -AutoMapping $true -ErrorAction Stop | Out-Null
+        }} catch {{
+            if ($_.Exception.Message -notlike "*already*") {{
+                $delegateErrors += "FullAccess: $($_.Exception.Message)"
+            }}
         }}
-    }}
-    try {{
-        Add-RecipientPermission -Identity $mb.Email -Trustee $licensedUser -AccessRights SendAs -Confirm:$false -ErrorAction Stop | Out-Null
-    }} catch {{
-        if ($_.Exception.Message -notlike "*already*") {{
-            $delegateErrors += "SendAs: $($_.Exception.Message)"
+        try {{
+            Add-RecipientPermission -Identity $mb.Email -Trustee $licensedUser -AccessRights SendAs -Confirm:$false -ErrorAction Stop | Out-Null
+        }} catch {{
+            if ($_.Exception.Message -notlike "*already*") {{
+                $delegateErrors += "SendAs: $($_.Exception.Message)"
+            }}
+        }}
+
+        if ($delegateErrors.Count -eq 0) {{
+            $results.delegated++
+            $results.delegated_emails += $mb.Email
+            $delegateSucceeded = $true
+        }} else {{
+            $lastDelegateErrors = $delegateErrors
+            if ($attempt -lt 6) {{
+                Start-Sleep -Seconds 15
+            }}
         }}
     }}
 
-    if ($delegateErrors.Count -eq 0) {{
-        $results.delegated++
-        $results.delegated_emails += $mb.Email
-    }} else {{
-        $results.errors += "Delegate failed: $($mb.Email): $($delegateErrors -join '; ')"
+    if (-not $delegateSucceeded) {{
+        $results.errors += "Delegate failed: $($mb.Email): $($lastDelegateErrors -join '; ')"
     }}
     Start-Sleep -Milliseconds 100
 }}
 
 # === STEP 4: FIX UPNs via Exchange ===
 Write-Host "STEP4_UPNS"
-foreach ($mb in $mailboxes) {{
+foreach ($mb in $readyMailboxes) {{
     try {{
         Set-Mailbox -Identity $mb.Email -MicrosoftOnlineServicesID $mb.Email -ErrorAction SilentlyContinue
         $results.upns_fixed++
@@ -761,7 +933,7 @@ try {{
     Import-Module Microsoft.Graph.Users -ErrorAction Stop
     $body = @{{
         grant_type = "password"
-        client_id = "1950a258-227b-4e31-a9cf-717495945fc2"
+        client_id = "1b730954-1685-4b74-9bfd-dac224a7b894"
         scope = "https://graph.microsoft.com/.default"
         username = "{escaped_email}"
         password = "{escaped_password}"
@@ -771,17 +943,23 @@ try {{
     $sec = ConvertTo-SecureString $tok.access_token -AsPlainText -Force
     Connect-MgGraph -AccessToken $sec -NoWelcome -ErrorAction Stop
 
-    foreach ($mb in $mailboxes) {{
+    foreach ($mb in $readyMailboxes) {{
         try {{
             $user = $null
-            try {{
-                $user = Get-MgUser -UserId $mb.Email -ErrorAction Stop
-            }} catch {{
-                $user = Get-MgUser -Filter "mail eq '$($mb.Email)'" -ErrorAction SilentlyContinue
+            for ($attempt = 1; $attempt -le 12 -and -not $user; $attempt++) {{
+                try {{
+                    $user = Get-MgUser -UserId $mb.Email -ErrorAction Stop
+                }} catch {{
+                    $user = Get-MgUser -Filter "mail eq '$($mb.Email)'" -ErrorAction SilentlyContinue
+                }}
+                if (-not $user) {{
+                    $user = Get-MgUser -Filter "userPrincipalName eq '$($mb.Email)'" -ErrorAction SilentlyContinue
+                }}
+                if (-not $user -and $attempt -lt 12) {{
+                    Start-Sleep -Seconds 10
+                }}
             }}
-            if (-not $user) {{
-                $user = Get-MgUser -Filter "userPrincipalName eq '$($mb.Email)'" -ErrorAction SilentlyContinue
-            }}
+
             if ($user) {{
                 $params = @{{
                     AccountEnabled = $true

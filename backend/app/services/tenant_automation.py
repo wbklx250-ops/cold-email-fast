@@ -83,6 +83,22 @@ DEFAULT_WAIT = 10  # seconds for element waits
 LONG_WAIT = 20     # seconds for slow operations
 CANT_SCAN_WAIT = 5  # seconds to wait after clicking "Can't scan" for secret to appear
 
+MFA_ENROLLMENT_KEYWORDS = [
+    "action required",
+    "authenticator",
+    "protect your account",
+    "more information required",
+    "keep your account secure",
+    "let's keep your account secure",
+    "lets keep your account secure",
+    "another way to verify",
+    "verify it's you",
+    "verify it is you",
+    "help you set up another way",
+    "scan the qr code",
+    "set up your account",
+]
+
 import os
 import psycopg2
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
@@ -621,13 +637,6 @@ class BrowserWorker:
         - MFA setup page keywords are present
         """
         worker_id = getattr(self, 'worker_id', 0)
-        mfa_keywords = [
-            "protect your account",
-            "authenticator",
-            "action required",
-            "more information required",
-            "keep your account secure",
-        ]
 
         def password_change_complete(driver) -> bool:
             url = driver.current_url.lower()
@@ -638,7 +647,7 @@ class BrowserWorker:
             except Exception:
                 page_text = ""
 
-            has_mfa_keywords = any(keyword in page_text for keyword in mfa_keywords)
+            has_mfa_keywords = any(keyword in page_text for keyword in MFA_ENROLLMENT_KEYWORDS)
             return url_moved_on or has_mfa_keywords
 
         try:
@@ -650,7 +659,7 @@ class BrowserWorker:
                 page_text = ""
 
             url_moved_on = "update" not in url and "password" not in url
-            matched_keywords = [keyword for keyword in mfa_keywords if keyword in page_text]
+            matched_keywords = [keyword for keyword in MFA_ENROLLMENT_KEYWORDS if keyword in page_text]
             logger.info(
                 f"[W{worker_id}] ✓ Password change transition detected: "
                 f"url_moved_on={url_moved_on}, keywords={matched_keywords}"
@@ -658,6 +667,124 @@ class BrowserWorker:
             return True
         except Exception as e:
             logger.warning(f"[W{worker_id}] Password change transition not detected within {timeout}s: {e}")
+            return False
+
+    def _combined_page_text_lower(self) -> str:
+        """Return current URL, visible body text, and source as one lowercase string."""
+        chunks = []
+        try:
+            chunks.append(self.driver.current_url or "")
+        except Exception:
+            pass
+        try:
+            chunks.append(self.driver.find_element(By.TAG_NAME, "body").text or "")
+        except Exception:
+            pass
+        try:
+            chunks.append(self.driver.page_source or "")
+        except Exception:
+            pass
+        return "\n".join(chunks).lower()
+
+    def _find_mfa_enrollment_keywords(self) -> List[str]:
+        page = self._combined_page_text_lower()
+        return [keyword for keyword in MFA_ENROLLMENT_KEYWORDS if keyword in page]
+
+    def _wait_for_mfa_enrollment_decision(self, timeout: int = 45) -> List[str]:
+        """
+        Wait until post-login prompts settle enough to decide whether MFA enrollment is required.
+
+        Microsoft can show "Stay signed in?" first, then redirect to "Let's keep your
+        account secure". Step 5 must not mark the tenant complete until that second page
+        has had a chance to appear.
+        """
+        worker_id = getattr(self, 'worker_id', 0)
+        last_state = LoginState.UNKNOWN
+
+        for second in range(timeout):
+            keywords = self._find_mfa_enrollment_keywords()
+            if keywords:
+                logger.info(f"[W{worker_id}] MFA enrollment keywords detected after {second}s: {keywords}")
+                return keywords
+
+            state = self._detect_login_state()
+            last_state = state
+
+            if state == LoginState.NEEDS_MFA_SETUP:
+                logger.info(f"[W{worker_id}] Login state indicates MFA enrollment after {second}s")
+                return ["login_state_needs_mfa_setup"]
+
+            if state == LoginState.NEEDS_STAY_SIGNED_IN:
+                logger.info(f"[W{worker_id}] Stay signed-in prompt appeared before MFA decision; dismissing it")
+                self._handle_stay_signed_in()
+                time.sleep(2)
+                continue
+
+            if state == LoginState.NEEDS_PASSWORD_CHANGE:
+                logger.info(f"[W{worker_id}] Still on password-change page while checking MFA")
+                return []
+
+            if state == LoginState.LOGGED_IN and second in (5, 15, 30):
+                logger.info(
+                    f"[W{worker_id}] Logged in after {second}s; still watching for delayed MFA enrollment redirect"
+                )
+
+            time.sleep(1)
+
+        keywords = self._find_mfa_enrollment_keywords()
+        if keywords:
+            logger.info(f"[W{worker_id}] MFA enrollment keywords detected after final wait: {keywords}")
+            return keywords
+
+        logger.info(f"[W{worker_id}] No MFA enrollment prompt after {timeout}s (last_state={last_state.value})")
+        return []
+
+    def _submit_existing_mfa_code(self, totp_secret: str) -> bool:
+        """Submit a standard Microsoft 6-digit MFA code using an already stored TOTP secret."""
+        worker_id = getattr(self, 'worker_id', 0)
+        if not totp_secret:
+            logger.error(f"[W{worker_id}] MFA code requested but no stored TOTP secret is available")
+            return False
+
+        try:
+            code = pyotp.TOTP(totp_secret.upper()).now()
+            logger.info(f"[W{worker_id}] Existing MFA challenge detected; entering TOTP code: {code[:2]}****")
+
+            code_input = self._find_element([
+                (By.CSS_SELECTOR, "input[name='otc']"),
+                (By.CSS_SELECTOR, "input[type='tel']"),
+                (By.CSS_SELECTOR, "input[maxlength='6']"),
+                (By.ID, "idTxtBx_SAOTCC_OTC"),
+                (By.XPATH, "//input[@type='tel']"),
+                (By.XPATH, "//input[@maxlength='6']"),
+            ], timeout=10)
+
+            if not code_input:
+                logger.error(f"[W{worker_id}] Could not find MFA code input for stored TOTP challenge")
+                self._screenshot("mfa_existing_code_input_missing")
+                return False
+
+            code_input.clear()
+            code_input.send_keys(code)
+            self._screenshot("mfa_existing_code_entered")
+            time.sleep(1)
+
+            clicked = self._click_if_exists([
+                (By.XPATH, "//button[contains(text(),'Verify')]"),
+                (By.ID, "idSubmit_SAOTCC_Continue"),
+                (By.ID, "idSIButton9"),
+                (By.XPATH, "//input[@type='submit']"),
+            ], timeout=5)
+
+            if not clicked:
+                code_input.send_keys(Keys.RETURN)
+
+            time.sleep(4)
+            self._screenshot("mfa_existing_code_submitted")
+            logger.info(f"[W{worker_id}] Submitted existing TOTP MFA code")
+            return True
+        except Exception as e:
+            logger.error(f"[W{worker_id}] Failed to submit stored TOTP MFA code: {e}")
             return False
     
     def _extract_totp_with_retry(self, max_attempts: int = 3) -> Optional[str]:
@@ -807,7 +934,12 @@ class BrowserWorker:
         # MFA / Security Defaults
         if "action required" in page_text or "more information required" in page_text:
             return LoginState.NEEDS_MFA_SETUP
-        if "protect your account" in page_text or "keep your account secure" in page_text:
+        if (
+            "protect your account" in page_text
+            or "keep your account secure" in page_text
+            or "another way to verify" in page_text
+            or "verify it's you" in page_text
+        ):
             return LoginState.NEEDS_MFA_SETUP
         if "sspr" in url:
             return LoginState.NEEDS_MFA_SETUP
@@ -1504,6 +1636,7 @@ class BrowserWorker:
         """Process one tenant - fully automated."""
         result = TenantResult(tenant_id=tenant_id, admin_email=admin_email)
         self.tenant_id = tenant_id  # Set for screenshot naming
+        existing_totp_secret = None
         
         # === BUG FIX 4.3: Check state before retry ===
         # Load fresh state from DB to see if this tenant is already done
@@ -1513,6 +1646,8 @@ class BrowserWorker:
                 from app.models.tenant import Tenant as TenantModel
                 existing = check_db.get(TenantModel, UUID(tenant_id))
                 if existing:
+                    existing_totp_secret = existing.totp_secret
+                    result.totp_secret = existing_totp_secret
                     if existing.password_changed and existing.totp_secret:
                         logger.info(f"[W{self.worker_id}] ✅ Tenant already complete (pwd_changed + totp), SKIPPING")
                         return TenantResult(
@@ -1636,6 +1771,25 @@ class BrowserWorker:
                 
                 elif state == LoginState.ACCOUNT_LOCKED:
                     raise Exception("Account is locked!")
+
+                elif state == LoginState.NEEDS_MFA_CODE:
+                    if not existing_totp_secret:
+                        raise Exception("MFA code required, but no TOTP secret is stored for this tenant")
+
+                    logger.info(f"[W{self.worker_id}] Existing MFA code challenge detected after password entry")
+                    if not self._submit_existing_mfa_code(existing_totp_secret):
+                        raise Exception("Failed to submit stored TOTP MFA code")
+
+                    result.totp_secret = existing_totp_secret
+                    time.sleep(2)
+                    post_mfa_state = self._detect_login_state()
+                    logger.info(f"[W{self.worker_id}] State after stored TOTP submit: {post_mfa_state}")
+
+                    password_accepted = True
+                    used_password = password
+                    used_password_type = pwd_type
+                    logger.info(f"[W{self.worker_id}] ✓ {pwd_type} password accepted after stored TOTP challenge")
+                    break
                 
                 else:
                     # Password accepted! (Could be password change, MFA, logged in, etc.)
@@ -1672,7 +1826,12 @@ class BrowserWorker:
                 logger.info(f"[W{self.worker_id}] [STATE DETECTION] Already logged in (stay signed in prompt)")
                 result.new_password = used_password
                 # Skip password change - already done
-            elif "protect your account" in page_text or "keep your account secure" in page_text:
+            elif (
+                "protect your account" in page_text
+                or "keep your account secure" in page_text
+                or "another way to verify" in page_text
+                or "verify it's you" in page_text
+            ):
                 logger.info(f"[W{self.worker_id}] [STATE DETECTION] On MFA setup page - skipping password change")
                 result.new_password = used_password
                 # Skip to MFA handling
@@ -1923,11 +2082,7 @@ class BrowserWorker:
             
             # MFA ENROLLMENT - Check if required
             logger.info(f"[W{self.worker_id}] 🔐 Checking if MFA enrollment is required...")
-            time.sleep(2)
-            page = self.driver.page_source.lower()
-            
-            mfa_keywords = ['action required', 'authenticator', 'protect your account', 'more information required']
-            found_mfa_keywords = [kw for kw in mfa_keywords if kw in page]
+            found_mfa_keywords = self._wait_for_mfa_enrollment_decision(timeout=45)
             
             if found_mfa_keywords:
                 logger.info(f"[W{self.worker_id}] ✓ MFA enrollment DETECTED! Keywords: {found_mfa_keywords}")

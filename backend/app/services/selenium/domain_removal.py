@@ -11,6 +11,7 @@ import os
 import subprocess
 import tempfile
 import urllib.parse
+import json
 import pyotp
 import msal
 import aiohttp
@@ -31,9 +32,57 @@ os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 # Well-known Azure AD PowerShell client ID (public client, no secret needed)
 AZURE_AD_POWERSHELL_CLIENT_ID = "1b730954-1685-4b74-9bfd-dac224a7b894"
 GRAPH_SCOPE = ["https://graph.microsoft.com/.default"]
+GRAPH_ROOT = "https://graph.microsoft.com"
 
 # PowerShell path detection
 PWSH_PATH = os.environ.get("PWSH_PATH", "/usr/bin/pwsh")
+
+
+def _graph_domain_url(domain_name):
+    return f"{GRAPH_ROOT}/v1.0/domains/{urllib.parse.quote(domain_name, safe='')}"
+
+
+def _domain_name_from_graph_payload(domain):
+    return (domain.get("id") or domain.get("name") or "").strip()
+
+
+def _is_default_domain_deletion_error(body):
+    body_lc = (body or "").lower()
+    return (
+        "defaultdomaindeletion" in body_lc
+        or "cannot delete the default domain" in body_lc
+        or '"target":"isdefault"' in body_lc.replace(" ", "")
+    )
+
+
+def _select_default_fallback_domain(domains, target_domain):
+    """Pick the best non-target .onmicrosoft.com domain to become default."""
+    target_lc = target_domain.lower()
+    candidates = []
+    for domain in domains:
+        name = _domain_name_from_graph_payload(domain)
+        name_lc = name.lower()
+        if not name or name_lc == target_lc:
+            continue
+        if not name_lc.endswith(".onmicrosoft.com"):
+            continue
+        if name_lc.endswith(".mail.onmicrosoft.com"):
+            continue
+        if domain.get("isVerified") is False:
+            continue
+        candidates.append(domain)
+
+    if not candidates:
+        return None
+
+    candidates.sort(
+        key=lambda d: (
+            not bool(d.get("isInitial")),
+            not bool(d.get("isDefault")),
+            _domain_name_from_graph_payload(d).lower(),
+        )
+    )
+    return _domain_name_from_graph_payload(candidates[0])
 
 
 def screenshot(driver, step, domain=""):
@@ -114,50 +163,182 @@ async def _graph_api_force_delete(access_token, domain_name):
     try:
         async with aiohttp.ClientSession() as session:
             # Check domain exists
+            target_domain = None
             async with session.get(
-                f"https://graph.microsoft.com/v1.0/domains/{domain_name}",
+                _graph_domain_url(domain_name),
                 headers=headers
             ) as resp:
+                body = await resp.text()
                 if resp.status == 404:
                     logger.info(f"[Graph API] Domain '{domain_name}' not found — already removed")
                     return {"success": True, "error": None, "note": "Domain already removed"}
                 elif resp.status == 401:
                     return {"success": False, "error": "Access token expired or insufficient permissions"}
+                elif resp.status == 200:
+                    try:
+                        target_domain = json.loads(body)
+                    except json.JSONDecodeError:
+                        logger.warning(f"[Graph API] Could not parse domain check response: {body[:200]}")
                 elif resp.status != 200:
-                    body = await resp.text()
                     logger.warning(f"[Graph API] Domain check returned {resp.status}: {body[:200]}")
+
+            default_domain_reset_to = None
+            if target_domain and target_domain.get("isDefault"):
+                logger.info(
+                    f"[Graph API] '{domain_name}' is the tenant default domain; "
+                    "moving default back to .onmicrosoft.com before deletion"
+                )
+                reset_result = await _graph_api_set_onmicrosoft_default(session, headers, domain_name)
+                if not reset_result.get("success"):
+                    return {
+                        "success": False,
+                        "error": reset_result.get("error", "Could not reset tenant default domain"),
+                    }
+                default_domain_reset_to = reset_result.get("default_domain")
             
-            # Try forceDelete (beta endpoint)
-            logger.info(f"[Graph API] Attempting forceDelete for '{domain_name}'...")
-            async with session.post(
-                f"https://graph.microsoft.com/beta/domains/{domain_name}/forceDelete",
-                headers=headers,
-                json={"disableUserAccounts": True}
-            ) as resp:
-                if resp.status in (200, 204):
-                    logger.info(f"[Graph API] forceDelete succeeded for '{domain_name}'")
-                    return {"success": True, "error": None, "method": "forceDelete"}
-                else:
+            # Try forceDelete first. It handles UPN/proxy address reassignment server-side.
+            force_delete_error = None
+            for attempt in range(2):
+                logger.info(f"[Graph API] Attempting forceDelete for '{domain_name}'...")
+                async with session.post(
+                    f"{_graph_domain_url(domain_name)}/forceDelete",
+                    headers=headers,
+                    json={"disableUserAccounts": True}
+                ) as resp:
                     body = await resp.text()
-                    logger.warning(f"[Graph API] forceDelete returned {resp.status}: {body[:300]}")
+                    if resp.status in (200, 204):
+                        logger.info(f"[Graph API] forceDelete succeeded for '{domain_name}'")
+                        result = {"success": True, "error": None, "method": "forceDelete"}
+                        if default_domain_reset_to:
+                            result["default_domain_reset_to"] = default_domain_reset_to
+                        return result
+
+                    force_delete_error = f"forceDelete returned {resp.status}: {body[:300]}"
+                    logger.warning(f"[Graph API] {force_delete_error}")
+
+                    if attempt == 0 and _is_default_domain_deletion_error(body):
+                        reset_result = await _graph_api_set_onmicrosoft_default(session, headers, domain_name)
+                        if reset_result.get("success"):
+                            default_domain_reset_to = reset_result.get("default_domain")
+                            continue
+                        return {
+                            "success": False,
+                            "error": (
+                                "Domain is default and could not switch default domain: "
+                                f"{reset_result.get('error', 'unknown error')}"
+                            ),
+                        }
+                    break
             
             # Fallback: regular DELETE
-            logger.info(f"[Graph API] Trying regular DELETE for '{domain_name}'...")
-            async with session.delete(
-                f"https://graph.microsoft.com/v1.0/domains/{domain_name}",
-                headers=headers
-            ) as resp:
-                if resp.status in (200, 204):
-                    logger.info(f"[Graph API] DELETE succeeded for '{domain_name}'")
-                    return {"success": True, "error": None, "method": "delete"}
-                else:
+            delete_error = None
+            for attempt in range(2):
+                logger.info(f"[Graph API] Trying regular DELETE for '{domain_name}'...")
+                async with session.delete(
+                    _graph_domain_url(domain_name),
+                    headers=headers
+                ) as resp:
                     body = await resp.text()
-                    error_msg = f"DELETE returned {resp.status}: {body[:300]}"
-                    logger.error(f"[Graph API] {error_msg}")
-                    return {"success": False, "error": error_msg}
+                    if resp.status in (200, 204):
+                        logger.info(f"[Graph API] DELETE succeeded for '{domain_name}'")
+                        result = {"success": True, "error": None, "method": "delete"}
+                        if default_domain_reset_to:
+                            result["default_domain_reset_to"] = default_domain_reset_to
+                        return result
+
+                    delete_error = f"DELETE returned {resp.status}: {body[:300]}"
+                    logger.error(f"[Graph API] {delete_error}")
+
+                    if attempt == 0 and _is_default_domain_deletion_error(body):
+                        reset_result = await _graph_api_set_onmicrosoft_default(session, headers, domain_name)
+                        if reset_result.get("success"):
+                            default_domain_reset_to = reset_result.get("default_domain")
+                            continue
+                        return {
+                            "success": False,
+                            "error": (
+                                "Domain is default and could not switch default domain: "
+                                f"{reset_result.get('error', 'unknown error')}"
+                            ),
+                        }
+                    break
+
+            return {"success": False, "error": delete_error or force_delete_error or "Graph delete failed"}
                     
     except Exception as e:
         logger.error(f"[Graph API] Error removing '{domain_name}': {e}")
+        return {"success": False, "error": str(e)}
+
+
+async def _graph_api_set_onmicrosoft_default(session, headers, target_domain):
+    """
+    Set the tenant's initial .onmicrosoft.com domain as default so a custom
+    default domain can be deleted.
+    """
+    try:
+        async with session.get(f"{GRAPH_ROOT}/v1.0/domains", headers=headers) as resp:
+            body = await resp.text()
+            if resp.status != 200:
+                return {
+                    "success": False,
+                    "error": f"Could not list tenant domains ({resp.status}): {body[:300]}",
+                }
+            try:
+                domains = json.loads(body).get("value", [])
+            except json.JSONDecodeError:
+                return {"success": False, "error": f"Could not parse tenant domains: {body[:300]}"}
+
+        fallback_domain = _select_default_fallback_domain(domains, target_domain)
+        if not fallback_domain:
+            return {
+                "success": False,
+                "error": "No verified non-mail .onmicrosoft.com domain found to use as default",
+            }
+
+        logger.info(f"[Graph API] Setting '{fallback_domain}' as tenant default domain...")
+        async with session.patch(
+            _graph_domain_url(fallback_domain),
+            headers=headers,
+            json={"isDefault": True},
+        ) as resp:
+            body = await resp.text()
+            if resp.status not in (200, 204):
+                return {
+                    "success": False,
+                    "error": f"Could not set default domain ({resp.status}): {body[:300]}",
+                }
+
+        for attempt in range(6):
+            if attempt:
+                await asyncio.sleep(2)
+            async with session.get(_graph_domain_url(target_domain), headers=headers) as resp:
+                body = await resp.text()
+                if resp.status == 404:
+                    return {"success": True, "default_domain": fallback_domain}
+                if resp.status != 200:
+                    logger.warning(
+                        f"[Graph API] Could not verify default-domain switch "
+                        f"({resp.status}): {body[:200]}"
+                    )
+                    continue
+                try:
+                    target = json.loads(body)
+                except json.JSONDecodeError:
+                    logger.warning(f"[Graph API] Could not parse default-domain verification: {body[:200]}")
+                    continue
+                if not target.get("isDefault"):
+                    logger.info(
+                        f"[Graph API] '{target_domain}' is no longer default; "
+                        f"'{fallback_domain}' is ready as fallback"
+                    )
+                    return {"success": True, "default_domain": fallback_domain}
+
+        return {
+            "success": False,
+            "error": f"Set '{fallback_domain}' as default but '{target_domain}' still appears default",
+        }
+    except Exception as e:
+        logger.error(f"[Graph API] Error setting onmicrosoft default domain: {e}")
         return {"success": False, "error": str(e)}
 
 
@@ -292,6 +473,12 @@ try {{
     # Try to reassign any users on this domain to the onmicrosoft.com domain first
     $tenantDomain = (Get-MsolDomain | Where-Object {{ $_.Name -like "*.onmicrosoft.com" -and $_.Name -notlike "*.mail.onmicrosoft.com" }} | Select-Object -First 1).Name
     
+    if ($domain.IsDefault -and $tenantDomain) {{
+        Set-MsolDomain -Name $tenantDomain -IsDefault -ErrorAction Stop
+        Write-Host "Set default domain to $tenantDomain before removing {domain_name}"
+        Start-Sleep -Seconds 5
+    }}
+    
     if ($tenantDomain) {{
         $usersOnDomain = Get-MsolUser -All | Where-Object {{ $_.UserPrincipalName -like "*@{domain_name}" }}
         foreach ($user in $usersOnDomain) {{
@@ -321,6 +508,11 @@ try {{
         try {{
             $usersOnDomain = Get-MsolUser -All | Where-Object {{ $_.UserPrincipalName -like "*@{domain_name}" }}
             $tenantDomain = (Get-MsolDomain | Where-Object {{ $_.Name -like "*.onmicrosoft.com" -and $_.Name -notlike "*.mail.onmicrosoft.com" }} | Select-Object -First 1).Name
+            
+            if ($tenantDomain) {{
+                Set-MsolDomain -Name $tenantDomain -IsDefault -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 5
+            }}
             
             foreach ($user in $usersOnDomain) {{
                 $newUPN = $user.UserPrincipalName.Split("@")[0] + "@" + $tenantDomain
