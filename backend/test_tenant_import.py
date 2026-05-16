@@ -8,6 +8,7 @@ import sys
 sys.path.insert(0, 'app')
 
 from app.services.tenant_import import TenantImportService
+from app.services.validation_service import parse_tenants_csv_content, cross_validate
 
 
 def test_domain_matching():
@@ -153,10 +154,55 @@ OrphanPassword"""
     print(f"✓ Unmatched credential reported: {unmatched_creds[0]}")
 
 
+def test_provider_csv_with_preconfigured_totp():
+    """Test provider CSV where password and TOTP secret are embedded."""
+
+    service = TenantImportService()
+
+    csv_content = """Tenant Name,Passoword,secret key
+admin@nexorahubs1679.onmicrosoft.com,ghazi@110,2mpccgbhxdltz6vm
+admin@nexorapath1680.onmicrosoft.com,ghazi@110,YZGZFSVN5YFM6CDH"""
+
+    tenants = service.parse_tenant_csv(csv_content)
+    assert len(tenants) == 2
+    assert tenants[0]["company_name"] == "nexorahubs1679"
+    assert tenants[0]["onmicrosoft_domain"] == "nexorahubs1679.onmicrosoft.com"
+    assert tenants[0]["admin_email"] == "admin@nexorahubs1679.onmicrosoft.com"
+    assert tenants[0]["admin_password"] == "ghazi@110"
+    assert tenants[0]["totp_secret"] == "2MPCCGBHXDLTZ6VM"
+
+    merged, unmatched_tenants, unmatched_creds = service.merge_data(tenants, {})
+    assert len(merged) == 2
+    assert not unmatched_tenants
+    assert not unmatched_creds
+    assert merged[1]["admin_email"] == "admin@nexorapath1680.onmicrosoft.com"
+    assert merged[1]["admin_password"] == "ghazi@110"
+    assert merged[1]["totp_secret"] == "YZGZFSVN5YFM6CDH"
+
+    parsed_preview, errors = parse_tenants_csv_content(csv_content)
+    assert not errors
+    assert parsed_preview[0]["name"] == "nexorahubs1679"
+    assert parsed_preview[0]["password"] == "ghazi@110"
+    assert parsed_preview[0]["totp_secret"] == "2MPCCGBHXDLTZ6VM"
+
+    validation = cross_validate(
+        domains=[{"name": "example.com", "first_name": "Tom", "last_name": "Tenant"}],
+        tenants=parsed_preview[:1],
+        credentials={},
+        first_name="",
+        last_name="",
+    )
+    assert validation["summary"]["credentials_matched"] == 1
+    assert validation["summary"]["first_login_precompleted"] == 1
+
+    print("✓ Provider CSV with preconfigured TOTP parses and validates correctly")
+
+
 if __name__ == '__main__':
     test_domain_matching()
     test_tab_separated_format()
     test_unmatched_reporting()
+    test_provider_csv_with_preconfigured_totp()
     
     print("\n" + "=" * 60)
     print("ALL TESTS PASSED!")

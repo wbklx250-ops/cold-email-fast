@@ -20,7 +20,9 @@ import io
 import logging
 import re
 import uuid as _uuid
+from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
+from urllib.parse import unquote
 from uuid import UUID
 from dataclasses import dataclass
 
@@ -68,6 +70,68 @@ def _normalize_domain_name(raw: str) -> str:
     # Strip trailing slash / dot
     s = s.rstrip("/.")
     return s
+
+
+def _normalize_header(raw: str) -> str:
+    """Normalize a CSV header for tolerant provider column matching."""
+    return re.sub(r"[^a-z0-9]+", "", (raw or "").strip().lower())
+
+
+def _is_password_column(column_name: str) -> bool:
+    """
+    Identify password columns, including the provider typo "Passoword".
+    """
+    normalized = _normalize_header(column_name)
+    if not normalized:
+        return False
+    return (
+        "password" in normalized
+        or "passoword" in normalized
+        or normalized in {"pass", "pwd", "adminpass", "adminpwd"}
+    )
+
+
+def _is_totp_secret_column(column_name: str) -> bool:
+    """Identify columns containing a preconfigured MFA/TOTP secret."""
+    normalized = _normalize_header(column_name)
+    if not normalized:
+        return False
+    explicit_names = {
+        "totp",
+        "totpsecret",
+        "mfasecret",
+        "mfacode",
+        "otpsecret",
+        "2fasecret",
+        "twofasecret",
+        "authenticatorsecret",
+        "authenticatorsecretkey",
+        "secretkey",
+    }
+    if normalized in explicit_names:
+        return True
+    return (
+        ("totp" in normalized or "mfa" in normalized or "2fa" in normalized or "otp" in normalized)
+        and ("secret" in normalized or "key" in normalized)
+    )
+
+
+def _normalize_totp_secret(raw: str) -> str:
+    """
+    Normalize a TOTP secret from provider CSV data.
+
+    Accepts plain base32 values and otpauth URLs. Removes whitespace/grouping
+    characters and uppercases for pyotp compatibility.
+    """
+    if not raw:
+        return ""
+    value = raw.strip()
+    match = re.search(r"[?&]secret=([^&\s]+)", value, re.IGNORECASE)
+    if match:
+        value = match.group(1)
+    value = unquote(value)
+    value = re.sub(r"[\s-]+", "", value).upper().rstrip("=")
+    return value
 
 
 def _is_explicit_domain_column(column_name: str) -> bool:
@@ -222,7 +286,22 @@ class TenantImportService:
         id_col = self._find_column(columns, ["uuid", "tenant_id", "id"])
 
         # Password column (may be embedded in the CSV)
-        password_col = self._find_column(columns, ["password"])
+        password_col = next(
+            (
+                c for c in columns
+                if not _is_explicit_domain_column(c) and _is_password_column(c)
+            ),
+            None,
+        )
+
+        # TOTP/MFA secret column (optional; provider may preconfigure MFA)
+        totp_col = next(
+            (
+                c for c in columns
+                if not _is_explicit_domain_column(c) and _is_totp_secret_column(c)
+            ),
+            None,
+        )
 
         # Admin email column (may be embedded in the CSV)
         admin_email_col = self._find_column(columns, ["admin_email", "admin email"])
@@ -243,7 +322,7 @@ class TenantImportService:
 
         logger.info(
             f"Column mapping: onmicrosoft={onmicrosoft_col}, name={name_col}, "
-            f"id={id_col}, password={password_col}, admin_email={admin_email_col}, "
+            f"id={id_col}, password={password_col}, totp={totp_col}, admin_email={admin_email_col}, "
             f"address={address_col}, contact_name={contact_name_col}, "
             f"contact_email={contact_email_col}, phone={contact_phone_col}, "
             f"provider={provider_col}, explicit_domain_cols={explicit_domain_cols}"
@@ -278,10 +357,16 @@ class TenantImportService:
                 continue
 
             # --- Build tenant dict ---
-            company_name = clean.get(name_col, "").strip() if name_col else ""
+            company_name = clean.get(name_col, "").strip() if name_col and name_col != onmicrosoft_col else ""
+            if company_name and "onmicrosoft.com" in company_name.lower():
+                company_name = ""
             if not company_name:
                 # Derive from onmicrosoft prefix
                 company_name = onmicrosoft_domain.split(".")[0]
+
+            admin_email = clean.get(admin_email_col, "").strip() if admin_email_col else ""
+            if not admin_email and "@" in onmicrosoft_raw:
+                admin_email = onmicrosoft_raw.strip()
 
             # --- Extract explicit domain assignments (in slot order) ---
             explicit_domains: List[str] = []
@@ -299,8 +384,9 @@ class TenantImportService:
                 "contact_email": clean.get(contact_email_col, "").strip() if contact_email_col else "",
                 "contact_phone": clean.get(contact_phone_col, "").strip() if contact_phone_col else "",
                 "tenant_id": clean.get(id_col, "").strip() if id_col else "",
-                "admin_email": clean.get(admin_email_col, "").strip() if admin_email_col else "",
+                "admin_email": admin_email,
                 "admin_password": clean.get(password_col, "").strip() if password_col else "",
+                "totp_secret": _normalize_totp_secret(clean.get(totp_col, "")) if totp_col else "",
                 "provider": clean.get(provider_col, "").strip() if provider_col else "",
                 "explicit_domains": explicit_domains,
             }
@@ -406,6 +492,7 @@ class TenantImportService:
             ms_tenant_id = raw_tid if raw_tid else f"PENDING-{_uuid.uuid4()}"
 
             explicit_domains = list(tenant.get("explicit_domains") or [])
+            totp_secret = (tenant.get("totp_secret") or "").strip()
 
             # Look up credentials by domain
             cred = credentials.get(domain)
@@ -422,6 +509,7 @@ class TenantImportService:
                     "contact_phone": tenant["contact_phone"],
                     "admin_email": cred.email,
                     "admin_password": cred.password,
+                    "totp_secret": totp_secret,
                     "provider": tenant.get("provider", ""),
                     "explicit_domains": explicit_domains,
                 })
@@ -431,7 +519,7 @@ class TenantImportService:
                 csv_email = tenant.get("admin_email", "")
                 csv_password = tenant.get("admin_password", "")
 
-                if not csv_email and not csv_password:
+                if not csv_password:
                     unmatched_tenants.append(tenant)
 
                 merged.append({
@@ -444,6 +532,7 @@ class TenantImportService:
                     "contact_phone": tenant["contact_phone"],
                     "admin_email": csv_email or f"admin@{tenant['onmicrosoft_domain']}",
                     "admin_password": csv_password or "",
+                    "totp_secret": totp_secret,
                     "provider": tenant.get("provider", ""),
                     "explicit_domains": explicit_domains,
                 })
@@ -510,8 +599,12 @@ class TenantImportService:
         skipped_limit = 0
         skipped_empty = 0
         missing_pwd = 0
+        preconfigured_totp_saved = 0
 
         for data in merged:
+            preconfigured_totp = (data.get("totp_secret") or "").strip()
+            has_preconfigured_mfa = bool(preconfigured_totp)
+
             # Skip guard: if both microsoft_tenant_id is missing/placeholder
             # AND onmicrosoft_domain is empty, there's nothing useful to import.
             tid = data.get("microsoft_tenant_id", "")
@@ -551,6 +644,17 @@ class TenantImportService:
 
             if existing:
                 if existing.batch_id == batch_id:
+                    if data["admin_password"]:
+                        existing.admin_password = data["admin_password"]
+                        existing.initial_password = data["admin_password"]
+                    if has_preconfigured_mfa:
+                        existing.totp_secret = preconfigured_totp
+                        existing.first_login_completed = True
+                        existing.first_login_at = existing.first_login_at or datetime.utcnow()
+                        existing.password_changed = True
+                        existing.setup_error = None
+                        existing.status = TenantStatus.FIRST_LOGIN_COMPLETE
+                        preconfigured_totp_saved += 1
                     skipped += 1
                     continue
                 else:
@@ -567,15 +671,21 @@ class TenantImportService:
                     if data["admin_password"]:
                         existing.admin_password = data["admin_password"]
                         existing.initial_password = data["admin_password"]
+                    if has_preconfigured_mfa:
+                        existing.totp_secret = preconfigured_totp
                     existing.provider = provider or data.get("provider") or existing.provider
-                    existing.status = TenantStatus.IMPORTED
+                    existing.status = (
+                        TenantStatus.FIRST_LOGIN_COMPLETE
+                        if has_preconfigured_mfa
+                        else TenantStatus.IMPORTED
+                    )
 
                     # === CRITICAL: Reset ALL step progress flags ===
                     # When a tenant moves to a new batch, it must go through
                     # ALL steps again from scratch.
-                    existing.first_login_completed = False
-                    existing.first_login_at = None
-                    existing.password_changed = False
+                    existing.first_login_completed = has_preconfigured_mfa
+                    existing.first_login_at = datetime.utcnow() if has_preconfigured_mfa else None
+                    existing.password_changed = has_preconfigured_mfa
                     existing.setup_error = None
                     existing.setup_step = None
 
@@ -635,6 +745,8 @@ class TenantImportService:
                     existing.custom_domain = None
                     reassigned += 1
                     imported += 1
+                    if has_preconfigured_mfa:
+                        preconfigured_totp_saved += 1
                     continue
 
             if not data["admin_password"]:
@@ -654,16 +766,27 @@ class TenantImportService:
                 admin_email=data["admin_email"],
                 admin_password=initial_pwd,       # Current password (will be updated after change)
                 initial_password=initial_pwd,     # Original password (never changes)
+                totp_secret=preconfigured_totp or None,
+                first_login_completed=has_preconfigured_mfa,
+                first_login_at=datetime.utcnow() if has_preconfigured_mfa else None,
+                password_changed=has_preconfigured_mfa,
                 provider=provider or data.get("provider") or "Unknown",
-                status=TenantStatus.IMPORTED
+                status=(
+                    TenantStatus.FIRST_LOGIN_COMPLETE
+                    if has_preconfigured_mfa
+                    else TenantStatus.IMPORTED
+                )
             )
             db.add(tenant)
             imported += 1
+            if has_preconfigured_mfa:
+                preconfigured_totp_saved += 1
 
         logger.info(
             f"Tenant import pre-commit: imported={imported}, skipped_dup={skipped}, "
             f"reassigned={reassigned}, skipped_limit={skipped_limit}, "
             f"skipped_empty={skipped_empty}, missing_pwd={missing_pwd}, "
+            f"preconfigured_totp_saved={preconfigured_totp_saved}, "
             f"explicit_assignments={len(explicit_domain_map)}"
         )
         await db.commit()
@@ -679,6 +802,8 @@ class TenantImportService:
             "domains_needing_tenants": needed_count,
             "skipped_empty_rows": skipped_empty,
             "missing_password": missing_pwd,
+            "preconfigured_totp": preconfigured_totp_saved,
+            "first_login_precompleted": preconfigured_totp_saved,
             "unmatched_tenants": len(unmatched_tenants),
             "unmatched_credentials": len(unmatched_creds),
             "explicit_domain_map": explicit_domain_map,  # NEW

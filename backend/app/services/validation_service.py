@@ -13,8 +13,11 @@ from typing import Dict, List, Any, Optional, Tuple
 # "Domain N to link tenant" columns identically.
 from app.services.tenant_import import (
     _is_explicit_domain_column,
+    _is_password_column,
+    _is_totp_secret_column,
     _extract_column_index,
     _normalize_domain_name,
+    _normalize_totp_secret,
 )
 
 logger = logging.getLogger(__name__)
@@ -175,13 +178,22 @@ def parse_tenants_csv_content(content: str) -> Tuple[List[Dict], List[str]]:
                 id_col = columns[i]
                 break
 
-        # Find password column
+        # Find password column, including provider typo "Passoword"
         password_col = None
         for i, col in enumerate(columns_lower):
             if col in explicit_set_lower:
                 continue
-            if "password" in col:
+            if _is_password_column(columns[i]):
                 password_col = columns[i]
+                break
+
+        # Find preconfigured TOTP/MFA secret column
+        totp_col = None
+        for i, col in enumerate(columns_lower):
+            if col in explicit_set_lower:
+                continue
+            if _is_totp_secret_column(columns[i]):
+                totp_col = columns[i]
                 break
 
         if not onmicrosoft_col:
@@ -210,11 +222,16 @@ def parse_tenants_csv_content(content: str) -> Tuple[List[Dict], List[str]]:
                 if normalized:
                     explicit_domains.append(normalized)
 
+            tenant_name = row.get(name_col, "").strip() if name_col and name_col != onmicrosoft_col else ""
+            if tenant_name and "onmicrosoft.com" in tenant_name.lower():
+                tenant_name = ""
+
             tenants.append({
-                "name": row.get(name_col, "").strip() if name_col else onmicrosoft.split(".")[0],
+                "name": tenant_name or onmicrosoft.split(".")[0],
                 "onmicrosoft_domain": onmicrosoft,
                 "microsoft_tenant_id": row.get(id_col, "").strip() if id_col else "",
                 "password": row.get(password_col, "").strip() if password_col else "",
+                "totp_secret": _normalize_totp_secret(row.get(totp_col, "")) if totp_col else "",
                 "explicit_domains": explicit_domains,
                 "_row_number": i,
             })
@@ -352,15 +369,14 @@ def cross_validate(
             tenant["admin_email"] = credentials[domain_key]["email"]
             tenant["admin_password"] = credentials[domain_key]["password"]
             matched_count += 1
+        elif tenant.get("password"):
+            matched_count += 1
         else:
             unmatched_tenants.append(tenant["onmicrosoft_domain"])
 
-    # Count tenants that have embedded passwords
-    tenants_with_embedded_creds = sum(1 for t in tenants if t.get("password"))
-    if matched_count == 0 and tenants_with_embedded_creds > 0:
-        matched_count = tenants_with_embedded_creds
+    tenants_with_preconfigured_totp = sum(1 for t in tenants if t.get("totp_secret"))
 
-    if unmatched_tenants and tenants_with_embedded_creds == 0:
+    if unmatched_tenants:
         warnings.append(f"{len(unmatched_tenants)} tenant(s) have no matching credentials")
 
     # 2. Check domain-tenant capacity (allow partial fills, error only on overflow)
@@ -509,6 +525,7 @@ def cross_validate(
             "domains_explicitly_linked": domains_explicitly_linked,
             "domains_auto_linked": domains_auto_linked,
             "explicit_overflow_count": overflow_total,
+            "tenants_with_preconfigured_totp": tenants_with_preconfigured_totp,
+            "first_login_precompleted": tenants_with_preconfigured_totp,
         }
     }
-

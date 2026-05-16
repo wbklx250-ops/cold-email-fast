@@ -20,6 +20,11 @@ from app.schemas.tenant import TenantCreate, TenantRead, TenantUpdate
 from app.services.cloudflare import CloudflareService, CloudflareError
 from app.services.microsoft import MicrosoftGraphService, MicrosoftGraphError
 from app.services.powershell import PowerShellService, PowerShellError
+from app.services.tenant_import import (
+    _is_totp_secret_column,
+    _normalize_totp_secret,
+    tenant_import_service,
+)
 
 router = APIRouter(prefix="/api/v1/tenants", tags=["tenants"])
 
@@ -278,11 +283,120 @@ async def bulk_import_tenants_csv(
         text_content = content.decode('utf-8-sig')  # Handle BOM
     
     csv_reader = csv.DictReader(io.StringIO(text_content))
+    headers = [h.strip().lower() for h in (csv_reader.fieldnames or []) if h]
+    standard_required = {
+        "tenant_name",
+        "microsoft_tenant_id",
+        "onmicrosoft_domain",
+        "admin_email",
+        "admin_password",
+        "provider",
+    }
     
     results: list[dict] = []
     created = 0
     skipped = 0
     failed = 0
+    preconfigured_totp_count = 0
+
+    if not standard_required.issubset(set(headers)):
+        tenant_list = tenant_import_service.parse_tenant_csv(text_content)
+        merged, _, _ = tenant_import_service.merge_data(tenant_list, {})
+
+        for row_num, tenant_data in enumerate(merged, start=2):
+            tenant_name = tenant_data["name"]
+            microsoft_tenant_id = tenant_data["microsoft_tenant_id"]
+            onmicrosoft_domain = tenant_data["onmicrosoft_domain"]
+            admin_email = tenant_data["admin_email"]
+            admin_password = tenant_data["admin_password"]
+            provider = tenant_data.get("provider") or "Unknown"
+            totp_secret = tenant_data.get("totp_secret") or ""
+            has_preconfigured_mfa = bool(totp_secret)
+
+            if not all([tenant_name, microsoft_tenant_id, onmicrosoft_domain, admin_email, admin_password, provider]):
+                results.append({
+                    "row": row_num,
+                    "tenant": tenant_name or onmicrosoft_domain,
+                    "status": "failed",
+                    "reason": "Missing required tenant credentials",
+                })
+                failed += 1
+                continue
+
+            try:
+                existing_tid = await db.execute(
+                    select(Tenant).where(Tenant.microsoft_tenant_id == microsoft_tenant_id)
+                )
+                if existing_tid.scalar_one_or_none():
+                    results.append({
+                        "row": row_num,
+                        "tenant": tenant_name,
+                        "status": "skipped",
+                        "reason": "Tenant with this microsoft_tenant_id already exists",
+                    })
+                    skipped += 1
+                    continue
+
+                existing_omd = await db.execute(
+                    select(Tenant).where(Tenant.onmicrosoft_domain == onmicrosoft_domain)
+                )
+                if existing_omd.scalar_one_or_none():
+                    results.append({
+                        "row": row_num,
+                        "tenant": tenant_name,
+                        "status": "skipped",
+                        "reason": "Tenant with this onmicrosoft_domain already exists",
+                    })
+                    skipped += 1
+                    continue
+
+                tenant = Tenant(
+                    microsoft_tenant_id=microsoft_tenant_id,
+                    name=tenant_name,
+                    onmicrosoft_domain=onmicrosoft_domain,
+                    provider=provider,
+                    admin_email=admin_email,
+                    admin_password=admin_password,
+                    initial_password=admin_password,
+                    totp_secret=totp_secret or None,
+                    first_login_completed=has_preconfigured_mfa,
+                    first_login_at=datetime.utcnow() if has_preconfigured_mfa else None,
+                    password_changed=has_preconfigured_mfa,
+                    status=(
+                        TenantStatus.FIRST_LOGIN_COMPLETE
+                        if has_preconfigured_mfa
+                        else TenantStatus.NEW
+                    ),
+                )
+                db.add(tenant)
+                created += 1
+                if has_preconfigured_mfa:
+                    preconfigured_totp_count += 1
+                results.append({
+                    "row": row_num,
+                    "tenant": tenant_name,
+                    "status": "created",
+                    "reason": "Tenant created with preconfigured TOTP" if has_preconfigured_mfa else "Tenant created successfully",
+                })
+            except Exception as e:
+                results.append({
+                    "row": row_num,
+                    "tenant": tenant_name,
+                    "status": "failed",
+                    "reason": str(e),
+                })
+                failed += 1
+
+        await db.commit()
+
+        return {
+            "total": created + skipped + failed,
+            "created": created,
+            "skipped": skipped,
+            "failed": failed,
+            "preconfigured_totp": preconfigured_totp_count,
+            "results": results,
+        }
     
     for row_num, row in enumerate(csv_reader, start=2):  # Start at 2 (header is row 1)
         tenant_name = row.get('tenant_name', '').strip()
@@ -293,6 +407,14 @@ async def bulk_import_tenants_csv(
         provider = row.get('provider', '').strip()
         licensed_user_upn = row.get('licensed_user_upn', '').strip() or row.get('licensed_user_email', '').strip()
         domain_name = row.get('domain_name', '').strip()
+        totp_secret = row.get('totp_secret', '').strip()
+        if not totp_secret:
+            for key, value in row.items():
+                if _is_totp_secret_column(key):
+                    totp_secret = value.strip() if value else ""
+                    break
+        totp_secret = _normalize_totp_secret(totp_secret)
+        has_preconfigured_mfa = bool(totp_secret)
         
         # Validate required fields
         if not all([tenant_name, microsoft_tenant_id, onmicrosoft_domain, admin_email, admin_password, provider]):
@@ -342,11 +464,22 @@ async def bulk_import_tenants_csv(
                 provider=provider,
                 admin_email=admin_email,
                 admin_password=admin_password,  # Plain text for MVP
+                initial_password=admin_password,
+                totp_secret=totp_secret or None,
+                first_login_completed=has_preconfigured_mfa,
+                first_login_at=datetime.utcnow() if has_preconfigured_mfa else None,
+                password_changed=has_preconfigured_mfa,
                 licensed_user_upn=licensed_user_upn or "",
-                status=TenantStatus.NEW,
+                status=(
+                    TenantStatus.FIRST_LOGIN_COMPLETE
+                    if has_preconfigured_mfa
+                    else TenantStatus.NEW
+                ),
             )
             db.add(tenant)
             await db.flush()  # Get tenant ID without committing
+            if has_preconfigured_mfa:
+                preconfigured_totp_count += 1
             
             # Auto-link to domain if domain_name is provided
             domain_linked = False
@@ -422,6 +555,7 @@ async def bulk_import_tenants_csv(
         "created": created,
         "skipped": skipped,
         "failed": failed,
+        "preconfigured_totp": preconfigured_totp_count,
         "results": results,
     }
 
