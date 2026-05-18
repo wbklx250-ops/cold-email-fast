@@ -135,3 +135,17 @@ class BulkZoneResult(BaseModel):
     failed: int
     results: List[Dict[str, Any]]
     nameserver_groups: List[NameserverGroup]
+
+
+class CloudflareZoneSetupRequest(BaseModel):
+    """Standalone request for creating or finding Cloudflare zones."""
+    domains: List[str]
+
+
+class CloudflareZoneSetupResult(BaseModel):
+    """Result of standalone Cloudflare zone setup."""
+    total: int
+    success: int
+    failed: int
+    results: List[Dict[str, Any]]
+    nameserver_groups: List[NameserverGroup]

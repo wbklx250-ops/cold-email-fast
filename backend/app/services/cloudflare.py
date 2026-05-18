@@ -1298,6 +1298,63 @@ class CloudflareService:
 
         return results
 
+    async def bulk_setup_zones_only(self, domains: list[str]) -> list[dict[str, Any]]:
+        """
+        Create or find Cloudflare zones and return nameservers only.
+
+        This intentionally does not create DNS records or advance the broader
+        setup workflow. It is for registrar nameserver handoff.
+        """
+        logger.info("Standalone Cloudflare zone setup for %d domains", len(domains))
+        results: list[dict[str, Any]] = []
+
+        for i, domain in enumerate(domains):
+            result: dict[str, Any] = {
+                "domain": domain,
+                "success": False,
+                "zone_id": None,
+                "nameservers": [],
+                "zone_status": None,
+                "already_existed": False,
+                "account_label": None,
+                "error": None,
+            }
+
+            try:
+                zone_data = await self.get_or_create_zone(domain)
+                zone_id = zone_data["zone_id"]
+                nameservers = zone_data.get("nameservers", [])
+                if not nameservers and zone_id:
+                    nameservers = await self.get_zone_nameservers(zone_id)
+
+                result.update(
+                    {
+                        "success": True,
+                        "zone_id": zone_id,
+                        "nameservers": nameservers,
+                        "zone_status": zone_data.get("status", "pending"),
+                        "already_existed": zone_data.get("already_existed", False),
+                        "account_label": zone_data.get("account_label"),
+                    }
+                )
+                logger.info("Standalone zone setup complete for %s (%d/%d)", domain, i + 1, len(domains))
+            except Exception as e:
+                result["error"] = str(e)
+                logger.error("Standalone zone setup failed for %s: %s", domain, e)
+
+            results.append(result)
+
+            if i < len(domains) - 1:
+                await asyncio.sleep(0.25)
+
+        success_count = sum(1 for r in results if r["success"])
+        logger.info(
+            "Standalone Cloudflare zone setup complete: %d/%d successful",
+            success_count,
+            len(domains),
+        )
+        return results
+
     async def create_redirect_rule(
         self, 
         zone_id: str, 
@@ -1790,6 +1847,67 @@ class MultiCloudflareService:
 
         success_count = sum(1 for r in results if r["success"])
         logger.info("Multi-account bulk zone creation complete: %d/%d successful", success_count, len(domains))
+        return results
+
+    async def bulk_setup_zones_only(self, domains: list[str]) -> list[dict]:
+        """
+        Create or find Cloudflare zones across all configured accounts and return nameservers only.
+        Does not create DNS records.
+        """
+        logger.info("Multi-account standalone Cloudflare zone setup for %d domains", len(domains))
+        results: list[dict] = []
+
+        for i, domain in enumerate(domains):
+            result: dict = {
+                "domain": domain,
+                "success": False,
+                "zone_id": None,
+                "nameservers": [],
+                "zone_status": None,
+                "already_existed": False,
+                "account_label": None,
+                "error": None,
+            }
+
+            try:
+                zone_data = await self.get_or_create_zone(domain)
+                zone_id = zone_data["zone_id"]
+                nameservers = zone_data.get("nameservers", [])
+                if not nameservers and zone_id:
+                    nameservers = await self.get_zone_nameservers(zone_id)
+
+                result.update(
+                    {
+                        "success": True,
+                        "zone_id": zone_id,
+                        "nameservers": nameservers,
+                        "zone_status": zone_data.get("status", "pending"),
+                        "already_existed": zone_data.get("already_existed", False),
+                        "account_label": zone_data.get("account_label"),
+                    }
+                )
+                logger.info(
+                    "Standalone zone setup complete for %s (%d/%d) from account %s",
+                    domain,
+                    i + 1,
+                    len(domains),
+                    zone_data.get("account_label", "?"),
+                )
+            except Exception as e:
+                result["error"] = str(e)
+                logger.error("Standalone zone setup failed for %s: %s", domain, e)
+
+            results.append(result)
+
+            if i < len(domains) - 1:
+                await asyncio.sleep(0.25)
+
+        success_count = sum(1 for r in results if r["success"])
+        logger.info(
+            "Multi-account standalone Cloudflare zone setup complete: %d/%d successful",
+            success_count,
+            len(domains),
+        )
         return results
 
     async def bulk_create_redirect_rules(self, domains: list[dict]) -> list[dict]:

@@ -15,6 +15,7 @@ const navigation: NavItem[] = [
   { name: "New Batch", href: "/pipeline/new", icon: "🚀" },
   { name: "Dashboard", href: "/", icon: "📊" },
   { name: "Domains", href: "/domains", icon: "🌐" },
+  { name: "Cloudflare Zones", href: "/cloudflare-zones", icon: "☁️" },
   { name: "Domain Lookup", href: "/domain-lookup", icon: "🔍" },
   { name: "Tenants", href: "/tenants", icon: "🏢" },
   { name: "Domain Removal", href: "/domain-removal", icon: "🗑️" },

@@ -18,6 +18,8 @@ from app.models.domain import Domain, DomainStatus
 from app.schemas.domain import (
     BulkImportResult,
     BulkZoneResult,
+    CloudflareZoneSetupRequest,
+    CloudflareZoneSetupResult,
     DomainCreate,
     DomainRead,
     DomainUpdate,
@@ -40,6 +42,17 @@ def extract_tld(domain_name: str) -> str:
     """Extract TLD from domain name."""
     parts = domain_name.rsplit(".", 1)
     return f".{parts[-1]}" if len(parts) > 1 else ""
+
+
+def normalize_domain_input(value: str) -> str:
+    """Normalize pasted domain or URL input to a bare domain."""
+    domain = value.strip().lower().rstrip(".")
+    domain = re.sub(r"^https?://", "", domain)
+    domain = domain.split("/", 1)[0]
+    domain = domain.split("?", 1)[0]
+    domain = domain.rsplit("@", 1)[-1]
+    domain = domain.split(":", 1)[0]
+    return domain
 
 
 async def get_domain_or_404(domain_id: UUID, db: AsyncSession) -> Domain:
@@ -150,6 +163,134 @@ async def get_nameserver_groups(
         "total_domains": total_with_ns,
         "status_filter": status,
     }
+
+
+@router.post("/cloudflare-zone-setup", response_model=CloudflareZoneSetupResult)
+async def setup_cloudflare_zones_only(
+    request: CloudflareZoneSetupRequest,
+    db: AsyncSession = Depends(get_db),
+    cf_service: CloudflareService = Depends(get_cloudflare_service),
+) -> CloudflareZoneSetupResult:
+    """
+    Standalone Cloudflare zone setup.
+
+    Creates or reuses Cloudflare zones and returns registrar nameservers. This
+    does not create DNS records or run the wider M365 setup workflow.
+    """
+    seen: set[str] = set()
+    domain_names: list[str] = []
+    results: list[dict[str, Any]] = []
+
+    for raw_domain in request.domains:
+        domain_name = normalize_domain_input(raw_domain)
+        if not domain_name or domain_name in seen:
+            continue
+
+        seen.add(domain_name)
+
+        if not DOMAIN_REGEX.match(domain_name):
+            results.append(
+                {
+                    "domain": domain_name or raw_domain,
+                    "success": False,
+                    "zone_id": None,
+                    "nameservers": [],
+                    "zone_status": None,
+                    "already_existed": False,
+                    "account_label": None,
+                    "database_action": None,
+                    "error": "Invalid domain name format",
+                }
+            )
+            continue
+
+        domain_names.append(domain_name)
+
+    if len(domain_names) > 500:
+        raise HTTPException(status_code=400, detail="Maximum 500 domains per request")
+
+    if domain_names:
+        existing_query = await db.execute(select(Domain).where(Domain.name.in_(domain_names)))
+        existing_domains = {domain.name: domain for domain in existing_query.scalars().all()}
+
+        cf_results = await cf_service.bulk_setup_zones_only(domain_names)
+        early_statuses = {
+            DomainStatus.PURCHASED,
+            DomainStatus.CF_ZONE_PENDING,
+            DomainStatus.CF_ZONE_ACTIVE,
+            DomainStatus.ERROR,
+            DomainStatus.PROBLEM,
+        }
+
+        for cf_result in cf_results:
+            domain_name = cf_result["domain"]
+            domain_obj = existing_domains.get(domain_name)
+            cf_result["database_action"] = None
+
+            if cf_result.get("success"):
+                zone_status = cf_result.get("zone_status") or "pending"
+                nameservers = cf_result.get("nameservers") or []
+                next_status = (
+                    DomainStatus.CF_ZONE_ACTIVE
+                    if zone_status == "active"
+                    else DomainStatus.CF_ZONE_PENDING
+                )
+
+                if domain_obj:
+                    domain_obj.cloudflare_zone_id = cf_result.get("zone_id")
+                    domain_obj.cloudflare_nameservers = nameservers
+                    domain_obj.cloudflare_zone_status = zone_status
+                    domain_obj.error_message = None
+                    if domain_obj.status in early_statuses:
+                        domain_obj.status = next_status
+                        cf_result["database_action"] = "updated"
+                    else:
+                        cf_result["database_action"] = "updated_status_preserved"
+                else:
+                    domain_obj = Domain(
+                        name=domain_name,
+                        tld=extract_tld(domain_name),
+                        status=next_status,
+                        cloudflare_zone_id=cf_result.get("zone_id"),
+                        cloudflare_nameservers=nameservers,
+                        cloudflare_zone_status=zone_status,
+                    )
+                    db.add(domain_obj)
+                    cf_result["database_action"] = "created"
+            elif domain_obj and domain_obj.status in early_statuses:
+                domain_obj.status = DomainStatus.ERROR
+                domain_obj.error_message = cf_result.get("error", "Cloudflare zone setup failed")
+                cf_result["database_action"] = "error_recorded"
+
+            results.append(cf_result)
+
+        await db.commit()
+
+    ns_groups: dict[tuple[str, ...], list[str]] = defaultdict(list)
+    for result in results:
+        nameservers = result.get("nameservers") or []
+        if result.get("success") and nameservers:
+            ns_groups[tuple(sorted(nameservers))].append(result["domain"])
+
+    nameserver_groups = [
+        NameserverGroup(
+            nameservers=list(ns_tuple),
+            domain_count=len(domain_list),
+            domains=sorted(domain_list),
+        )
+        for ns_tuple, domain_list in ns_groups.items()
+    ]
+    nameserver_groups.sort(key=lambda group: group.domain_count, reverse=True)
+
+    success_count = sum(1 for result in results if result.get("success"))
+
+    return CloudflareZoneSetupResult(
+        total=len(results),
+        success=success_count,
+        failed=len(results) - success_count,
+        results=results,
+        nameserver_groups=nameserver_groups,
+    )
 
 
 @router.post("/bulk-import", response_model=BulkImportResult)

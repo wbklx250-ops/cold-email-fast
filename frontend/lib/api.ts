@@ -607,6 +607,26 @@ export interface NameserverGroupsResponse {
   status_filter: string | null;
 }
 
+export interface CloudflareZoneSetupResultItem {
+  domain: string;
+  success: boolean;
+  zone_id: string | null;
+  nameservers: string[];
+  zone_status: string | null;
+  already_existed: boolean;
+  account_label: string | null;
+  database_action: string | null;
+  error: string | null;
+}
+
+export interface CloudflareZoneSetupResult {
+  total: number;
+  success: number;
+  failed: number;
+  results: CloudflareZoneSetupResultItem[];
+  nameserver_groups: NameserverGroup[];
+}
+
 // ============================================================================
 // Domain Bulk Operations API Functions
 // ============================================================================
@@ -643,6 +663,13 @@ export const bulkCreateZones = async (domainIds?: string[]): Promise<BulkZoneRes
 export const getNameserverGroups = async (status?: string): Promise<NameserverGroupsResponse> => {
   return apiRequest<NameserverGroupsResponse>(`${API_BASE}/api/v1/domains/nameserver-groups`, {
     params: { status },
+  });
+};
+
+export const setupCloudflareZones = async (domains: string[]): Promise<CloudflareZoneSetupResult> => {
+  return apiRequest<CloudflareZoneSetupResult>(`${API_BASE}/api/v1/domains/cloudflare-zone-setup`, {
+    method: "POST",
+    body: { domains },
   });
 };
 
