@@ -7,10 +7,11 @@ const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 interface ReconciliationTenantResult {
   tenant_id?: string;
   tenant_name?: string;
+  domain?: string;
   admin_email?: string;
   sd?: {
     success?: boolean;
-    sd_disabled?: boolean;
+    sd_disabled?: boolean | null;
     action?: string;
     error?: string | null;
     fallback_used?: boolean;
@@ -18,9 +19,16 @@ interface ReconciliationTenantResult {
   smtp?: {
     success?: boolean;
     smtp_auth_disabled?: boolean;
+    enabled?: boolean;
     action?: string;
     error?: string | null;
   };
+  error?: string | null;
+}
+
+interface ReconciliationIssue {
+  domain?: string;
+  stage?: string;
   error?: string | null;
 }
 
@@ -29,6 +37,7 @@ interface ReconciliationSummary {
   batch_id?: string;
   started_at?: string;
   finished_at?: string;
+  completed_at?: string;
   auto_fix?: boolean;
   total_tenants?: number;
   processed?: number;
@@ -39,8 +48,9 @@ interface ReconciliationSummary {
   smtp_ok?: number;
   smtp_drift_fixed?: number;
   smtp_drift_unfixable?: number;
-  errors?: number;
+  errors?: number | ReconciliationIssue[];
   results?: ReconciliationTenantResult[];
+  tenants?: ReconciliationTenantResult[];
   message?: string;
 }
 
@@ -160,10 +170,27 @@ export default function BatchDetail({ batchId }: BatchDetailProps) {
     ? "Error"
     : "Idle";
 
-  const problemResults = (summary?.results || []).filter((r) => {
+  const resultRows = Array.isArray(summary?.results)
+    ? summary.results
+    : Array.isArray(summary?.tenants)
+    ? summary.tenants
+    : [];
+
+  const errorCount =
+    typeof summary?.errors === "number"
+      ? summary.errors
+      : Array.isArray(summary?.errors)
+      ? summary.errors.length
+      : 0;
+
+  const finishedAt = summary?.finished_at || summary?.completed_at;
+
+  const problemResults = resultRows.filter((r) => {
     if (r.error) return true;
     if (r.sd && r.sd.success === false) return true;
     if (r.smtp && r.smtp.success === false) return true;
+    if (r.sd?.action === "unfixable" || r.smtp?.action === "unfixable") return true;
+    if (r.sd?.error || r.smtp?.error) return true;
     return false;
   });
 
@@ -243,21 +270,21 @@ export default function BatchDetail({ batchId }: BatchDetailProps) {
               value={summary.smtp_drift_unfixable}
               tone="red"
             />
-            <SummaryTile label="Errors" value={summary.errors} tone="red" />
+            <SummaryTile label="Errors" value={errorCount} tone="red" />
           </div>
 
           {/* Timing */}
-          {(summary.started_at || summary.finished_at) && (
+          {(summary.started_at || finishedAt) && (
             <div className="mt-3 text-xs text-gray-500">
               {summary.started_at && (
                 <span>
                   Started: {new Date(summary.started_at).toLocaleTimeString()}
                 </span>
               )}
-              {summary.finished_at && (
+              {finishedAt && (
                 <span className="ml-3">
                   Finished:{" "}
-                  {new Date(summary.finished_at).toLocaleTimeString()}
+                  {new Date(finishedAt).toLocaleTimeString()}
                 </span>
               )}
             </div>
@@ -298,9 +325,9 @@ export default function BatchDetail({ batchId }: BatchDetailProps) {
                         <tr key={r.tenant_id || i} className="hover:bg-gray-50">
                           <td
                             className="px-2 py-1 font-mono text-[11px] max-w-[220px] truncate"
-                            title={r.tenant_name || r.admin_email || r.tenant_id}
+                            title={r.domain || r.tenant_name || r.admin_email || r.tenant_id}
                           >
-                            {r.tenant_name || r.admin_email || r.tenant_id}
+                            {r.domain || r.tenant_name || r.admin_email || r.tenant_id}
                           </td>
                           <td className="px-2 py-1">
                             {r.sd
