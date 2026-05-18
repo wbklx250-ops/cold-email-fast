@@ -55,6 +55,21 @@ def normalize_domain_input(value: str) -> str:
     return domain
 
 
+def normalize_redirect_url(value: str | None) -> str | None:
+    """Normalize a redirect target URL."""
+    if not value:
+        return None
+
+    redirect_url = value.strip()
+    if not redirect_url:
+        return None
+
+    if not re.match(r"^https?://", redirect_url, flags=re.IGNORECASE):
+        redirect_url = f"https://{redirect_url}"
+
+    return redirect_url
+
+
 async def get_domain_or_404(domain_id: UUID, db: AsyncSession) -> Domain:
     """Get domain by ID or raise 404."""
     result = await db.execute(select(Domain).where(Domain.id == domain_id))
@@ -174,12 +189,13 @@ async def setup_cloudflare_zones_only(
     """
     Standalone Cloudflare zone setup.
 
-    Creates or reuses Cloudflare zones and returns registrar nameservers. This
-    does not create DNS records or run the wider M365 setup workflow.
+    Creates or reuses Cloudflare zones, optionally configures redirect rules,
+    and returns registrar nameservers.
     """
     seen: set[str] = set()
     domain_names: list[str] = []
     results: list[dict[str, Any]] = []
+    redirect_url = normalize_redirect_url(request.redirect_url)
 
     for raw_domain in request.domains:
         domain_name = normalize_domain_input(raw_domain)
@@ -199,6 +215,10 @@ async def setup_cloudflare_zones_only(
                     "already_existed": False,
                     "account_label": None,
                     "database_action": None,
+                    "redirect_url": redirect_url,
+                    "redirect_configured": False,
+                    "redirect_error": None,
+                    "phase1_dns": None,
                     "error": "Invalid domain name format",
                 }
             )
@@ -226,6 +246,11 @@ async def setup_cloudflare_zones_only(
             domain_name = cf_result["domain"]
             domain_obj = existing_domains.get(domain_name)
             cf_result["database_action"] = None
+            cf_result["redirect_url"] = redirect_url
+            cf_result["redirect_configured"] = False
+            cf_result["redirect_error"] = None
+            cf_result["phase1_dns"] = None
+            cf_result["redirect_result"] = None
 
             if cf_result.get("success"):
                 zone_status = cf_result.get("zone_status") or "pending"
@@ -241,6 +266,9 @@ async def setup_cloudflare_zones_only(
                     domain_obj.cloudflare_nameservers = nameservers
                     domain_obj.cloudflare_zone_status = zone_status
                     domain_obj.error_message = None
+                    if redirect_url:
+                        domain_obj.redirect_url = redirect_url
+                        domain_obj.redirect_configured = False
                     if domain_obj.status in early_statuses:
                         domain_obj.status = next_status
                         cf_result["database_action"] = "updated"
@@ -254,9 +282,36 @@ async def setup_cloudflare_zones_only(
                         cloudflare_zone_id=cf_result.get("zone_id"),
                         cloudflare_nameservers=nameservers,
                         cloudflare_zone_status=zone_status,
+                        redirect_url=redirect_url,
+                        redirect_configured=False,
                     )
                     db.add(domain_obj)
                     cf_result["database_action"] = "created"
+
+                if redirect_url and cf_result.get("zone_id"):
+                    try:
+                        phase1_result = await cf_service.create_phase1_dns(
+                            cf_result["zone_id"],
+                            domain_name,
+                        )
+                        cf_result["phase1_dns"] = phase1_result
+
+                        redirect_result = await cf_service.create_redirect_rule(
+                            cf_result["zone_id"],
+                            domain_name,
+                            redirect_url,
+                        )
+                        cf_result["redirect_result"] = redirect_result
+                        cf_result["redirect_configured"] = redirect_result.get("success", False)
+                        if domain_obj:
+                            domain_obj.redirect_configured = cf_result["redirect_configured"]
+                    except Exception as e:
+                        cf_result["success"] = False
+                        cf_result["redirect_error"] = str(e)
+                        cf_result["error"] = f"Redirect setup failed: {e}"
+                        if domain_obj:
+                            domain_obj.redirect_configured = False
+                            domain_obj.error_message = cf_result["error"]
             elif domain_obj and domain_obj.status in early_statuses:
                 domain_obj.status = DomainStatus.ERROR
                 domain_obj.error_message = cf_result.get("error", "Cloudflare zone setup failed")
@@ -269,7 +324,7 @@ async def setup_cloudflare_zones_only(
     ns_groups: dict[tuple[str, ...], list[str]] = defaultdict(list)
     for result in results:
         nameservers = result.get("nameservers") or []
-        if result.get("success") and nameservers:
+        if result.get("zone_id") and nameservers:
             ns_groups[tuple(sorted(nameservers))].append(result["domain"])
 
     nameserver_groups = [

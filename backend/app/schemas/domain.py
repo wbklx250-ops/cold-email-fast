@@ -140,6 +140,7 @@ class BulkZoneResult(BaseModel):
 class CloudflareZoneSetupRequest(BaseModel):
     """Standalone request for creating or finding Cloudflare zones."""
     domains: List[str]
+    redirect_url: str | None = None
 
 
 class CloudflareZoneSetupResult(BaseModel):

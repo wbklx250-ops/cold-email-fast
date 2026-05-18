@@ -616,6 +616,14 @@ export interface CloudflareZoneSetupResultItem {
   already_existed: boolean;
   account_label: string | null;
   database_action: string | null;
+  redirect_url: string | null;
+  redirect_configured: boolean;
+  redirect_error: string | null;
+  phase1_dns?: {
+    cname_created: boolean;
+    dmarc_created: boolean;
+    errors: string[];
+  } | null;
   error: string | null;
 }
 
@@ -666,10 +674,13 @@ export const getNameserverGroups = async (status?: string): Promise<NameserverGr
   });
 };
 
-export const setupCloudflareZones = async (domains: string[]): Promise<CloudflareZoneSetupResult> => {
+export const setupCloudflareZones = async (
+  domains: string[],
+  redirectUrl?: string,
+): Promise<CloudflareZoneSetupResult> => {
   return apiRequest<CloudflareZoneSetupResult>(`${API_BASE}/api/v1/domains/cloudflare-zone-setup`, {
     method: "POST",
-    body: { domains },
+    body: { domains, redirect_url: redirectUrl || null },
   });
 };
 

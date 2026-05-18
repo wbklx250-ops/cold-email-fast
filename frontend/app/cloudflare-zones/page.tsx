@@ -77,15 +77,17 @@ const buildGroupedHandoff = (groups: NameserverGroup[]) =>
 
 const buildTableText = (results: CloudflareZoneSetupResultItem[]) =>
   [
-    ["Domain", "Nameserver 1", "Nameserver 2", "Zone Status"].join("\t"),
+    ["Domain", "Nameserver 1", "Nameserver 2", "Zone Status", "Redirect", "Redirect URL"].join("\t"),
     ...results
-      .filter((result) => result.success)
+      .filter((result) => result.zone_id)
       .map((result) =>
         [
           result.domain,
           result.nameservers[0] || "",
           result.nameservers[1] || "",
           result.zone_status || "",
+          result.redirect_url ? (result.redirect_configured ? "Yes" : "No") : "",
+          result.redirect_url || "",
         ].join("\t"),
       ),
   ].join("\n");
@@ -217,7 +219,12 @@ function ResultRow({
   result: CloudflareZoneSetupResultItem;
   onCopied: (label: string) => void;
 }) {
-  const rowText = [result.domain, ...result.nameservers].join("\t");
+  const rowText = [
+    result.domain,
+    ...result.nameservers,
+    result.redirect_configured ? "redirect configured" : "",
+    result.redirect_url || "",
+  ].join("\t");
 
   return (
     <tr className={result.success ? "bg-white" : "bg-red-50/60"}>
@@ -250,10 +257,25 @@ function ResultRow({
         {result.zone_status || "-"}
         {result.already_existed && <span className="ml-2 text-xs text-gray-400">existing</span>}
       </td>
+      <td className="whitespace-nowrap px-4 py-3 text-sm">
+        {result.redirect_url ? (
+          result.redirect_configured ? (
+            <span className="rounded-full bg-green-100 px-2 py-1 text-xs font-medium text-green-700">
+              Configured
+            </span>
+          ) : (
+            <span className="rounded-full bg-amber-100 px-2 py-1 text-xs font-medium text-amber-700">
+              Not configured
+            </span>
+          )
+        ) : (
+          <span className="text-gray-400">Skipped</span>
+        )}
+      </td>
       <td className="whitespace-nowrap px-4 py-3 text-sm text-gray-600">
         {databaseActionLabel(result.database_action)}
       </td>
-      <td className="px-4 py-3 text-sm text-red-600">{result.error || ""}</td>
+      <td className="px-4 py-3 text-sm text-red-600">{result.error || result.redirect_error || ""}</td>
       <td className="whitespace-nowrap px-4 py-3 text-right text-sm">
         <CopyButton
           label="Copy Row"
@@ -268,6 +290,7 @@ function ResultRow({
 
 export default function CloudflareZonesPage() {
   const [domainInput, setDomainInput] = useState("");
+  const [redirectUrl, setRedirectUrl] = useState("");
   const [result, setResult] = useState<CloudflareZoneSetupResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -275,7 +298,11 @@ export default function CloudflareZonesPage() {
 
   const parsed = useMemo(() => parseDomains(domainInput), [domainInput]);
   const successfulResults = useMemo(
-    () => result?.results.filter((item) => item.success) || [],
+    () => result?.results.filter((item) => item.zone_id) || [],
+    [result],
+  );
+  const configuredRedirects = useMemo(
+    () => result?.results.filter((item) => item.redirect_configured).length || 0,
     [result],
   );
 
@@ -299,15 +326,21 @@ export default function CloudflareZonesPage() {
     }
 
     try {
-      const response = await setupCloudflareZones(parsed.domains);
+      const requestedRedirect = redirectUrl.trim();
+      const response = await setupCloudflareZones(parsed.domains, requestedRedirect || undefined);
       setResult(response);
       if (response.failed > 0) {
         warning(
-          `${response.success} zones ready, ${response.failed} failed`,
+          `${response.success} ready, ${response.failed} failed`,
           "Review the per-domain results below.",
         );
       } else {
-        success(`${response.success} Cloudflare zones ready`);
+        const redirectCount = response.results.filter((item) => item.redirect_configured).length;
+        success(
+          requestedRedirect
+            ? `${response.success} zones ready, ${redirectCount} redirects configured`
+            : `${response.success} Cloudflare zones ready`,
+        );
       }
     } catch (err) {
       console.error("Cloudflare zone setup failed:", err);
@@ -327,7 +360,7 @@ export default function CloudflareZonesPage() {
         <div>
           <h1 className="text-2xl font-bold text-gray-900">Cloudflare Zone Setup</h1>
           <p className="mt-1 text-sm text-gray-500">
-            Create zones and collect registrar nameservers without running the rest of setup.
+            Create zones, configure redirects, and collect registrar nameservers.
           </p>
         </div>
       </div>
@@ -366,6 +399,20 @@ export default function CloudflareZonesPage() {
             </div>
           )}
 
+          <div className="mt-4">
+            <label htmlFor="cloudflare-redirect-url" className="mb-2 block text-sm font-semibold text-gray-800">
+              Redirect target
+            </label>
+            <input
+              id="cloudflare-redirect-url"
+              type="url"
+              value={redirectUrl}
+              onChange={(event) => setRedirectUrl(event.target.value)}
+              placeholder="https://example.com"
+              className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm text-gray-900 outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-500"
+            />
+          </div>
+
           <div className="mt-4 flex flex-wrap items-center gap-3">
             <button
               type="button"
@@ -394,6 +441,7 @@ export default function CloudflareZonesPage() {
               type="button"
               onClick={() => {
                 setDomainInput("");
+                setRedirectUrl("");
                 setResult(null);
                 setError(null);
               }}
@@ -410,10 +458,14 @@ export default function CloudflareZonesPage() {
 
         <aside className="rounded-lg border border-gray-200 bg-white p-5">
           <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-500">Copy Workspace</h2>
-          <div className="mt-4 grid grid-cols-3 gap-3">
+          <div className="mt-4 grid grid-cols-4 gap-3">
             <div>
               <div className="text-2xl font-bold text-gray-900">{result?.success || 0}</div>
               <div className="text-xs text-gray-500">Ready</div>
+            </div>
+            <div>
+              <div className="text-2xl font-bold text-green-600">{configuredRedirects}</div>
+              <div className="text-xs text-gray-500">Redirects</div>
             </div>
             <div>
               <div className="text-2xl font-bold text-red-600">{result?.failed || 0}</div>
@@ -505,6 +557,9 @@ export default function CloudflareZonesPage() {
                   </th>
                   <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-gray-500">
                     Zone
+                  </th>
+                  <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-gray-500">
+                    Redirect
                   </th>
                   <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-gray-500">
                     Database
