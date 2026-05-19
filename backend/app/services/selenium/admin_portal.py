@@ -46,6 +46,84 @@ NON_RETRYABLE_SETUP_ERRORS = (
     "MFA code input appeared but no TOTP secret",
 )
 
+MFA_CODE_INPUT_SELECTORS = (
+    (By.NAME, "otc"),
+    (By.ID, "idTxtBx_SAOTCC_OTC"),
+    (By.CSS_SELECTOR, "input[name='otc']"),
+    (By.CSS_SELECTOR, "input[type='tel']"),
+    (By.CSS_SELECTOR, "input[maxlength='6']"),
+    (By.CSS_SELECTOR, "input[autocomplete='one-time-code']"),
+    (By.CSS_SELECTOR, "input[aria-label*='code']"),
+    (By.CSS_SELECTOR, "input[aria-label*='Code']"),
+    (By.XPATH, "//input[contains(@aria-label, 'code') or contains(@aria-label, 'Code')]"),
+    (By.XPATH, "//input[@type='tel' or @maxlength='6']"),
+)
+
+MFA_CODE_SUBMIT_SELECTORS = (
+    (By.ID, "idSubmit_SAOTCC_Continue"),
+    (By.ID, "idSIButton9"),
+    (By.CSS_SELECTOR, "input[type='submit']"),
+    (By.CSS_SELECTOR, "button[type='submit']"),
+    (By.XPATH, "//input[@value='Verify']"),
+    (By.XPATH, "//button[normalize-space()='Verify']"),
+    (By.XPATH, "//button[contains(normalize-space(), 'Verify')]"),
+    (By.XPATH, "//button[normalize-space()='Next']"),
+    (By.XPATH, "//button[normalize-space()='Continue']"),
+    (By.XPATH, "//button[normalize-space()='Sign in']"),
+)
+
+MFA_SETUP_PROCEED_SELECTORS = (
+    (By.ID, "idSubmit_ProofUp_Redirect"),
+    (By.ID, "idSIButton9"),
+    (By.CSS_SELECTOR, "button[data-testid='reskin-step-next-button']"),
+    (By.XPATH, "//button[normalize-space()='Next']"),
+    (By.XPATH, "//button[contains(normalize-space(), 'Next')]"),
+    (By.XPATH, "//button[normalize-space()='Set up']"),
+    (By.XPATH, "//button[contains(normalize-space(), 'Set up')]"),
+    (By.XPATH, "//button[normalize-space()='Set up now']"),
+    (By.XPATH, "//button[normalize-space()='Continue']"),
+    (By.XPATH, "//button[contains(normalize-space(), 'Continue')]"),
+    (By.XPATH, "//button[normalize-space()='Done']"),
+    (By.XPATH, "//button[normalize-space()='Yes']"),
+)
+
+MFA_METHOD_SWITCH_SELECTORS = (
+    (By.ID, "signInAnotherWay"),
+    (By.CSS_SELECTOR, "a#signInAnotherWay"),
+    (By.XPATH, "//*[contains(normalize-space(), 'Sign in another way')]"),
+    (By.XPATH, "//*[contains(normalize-space(), 'sign in another way')]"),
+    (By.XPATH, "//*[contains(normalize-space(), 'verification code')]"),
+    (By.XPATH, "//*[contains(normalize-space(), 'Verification code')]"),
+    (By.XPATH, "//*[contains(normalize-space(), \"can't use\")]"),
+    (By.XPATH, "//*[contains(normalize-space(), \"Can't use\")]"),
+    (By.XPATH, "//*[contains(normalize-space(), 'different verification')]"),
+    (By.XPATH, "//*[contains(normalize-space(), 'authenticator app')]"),
+)
+
+CONNECT_MORE_OPTIONS_SELECTORS = (
+    (By.XPATH, "//a[contains(normalize-space(), 'More options')]"),
+    (By.XPATH, "//button[contains(normalize-space(), 'More options')]"),
+    (By.XPATH, "//span[contains(normalize-space(), 'More options')]"),
+    (By.XPATH, "//*[contains(normalize-space(), 'More options')]"),
+)
+
+CONNECT_OWN_DNS_SELECTORS = (
+    (By.XPATH, "//*[@role='radio' and contains(normalize-space(), 'Add your own DNS records')]"),
+    (By.XPATH, "//*[contains(normalize-space(), 'Add your own DNS records')]/ancestor::*[@role='radio'][1]"),
+    (By.XPATH, "//input[@type='radio'][following-sibling::*[contains(normalize-space(), 'Add your own')]]"),
+    (By.XPATH, "//input[@type='radio'][..//*[contains(normalize-space(), 'Add your own')]]"),
+    (By.XPATH, "//label[contains(normalize-space(), 'Add your own')]"),
+    (By.XPATH, "//span[contains(normalize-space(), 'Add your own DNS records')]"),
+    (By.XPATH, "//*[contains(normalize-space(), 'Add your own DNS records')]"),
+)
+
+CONNECT_CONTINUE_SELECTORS = (
+    (By.XPATH, "//button[normalize-space()='Continue']"),
+    (By.XPATH, "//button[contains(normalize-space(), 'Continue')]"),
+    (By.CSS_SELECTOR, "button.ms-Button--primary"),
+    (By.CSS_SELECTOR, "button[type='submit']"),
+)
+
 
 def _remember_active_driver(driver):
     """Track the Selenium driver owned by the current worker thread."""
@@ -121,6 +199,167 @@ def _build_admin_url(driver, hash_path: str) -> str:
     return f"https://admin.cloud.microsoft/#{route}"
 
 
+def _find_first_visible(driver, selectors, timeout: int = 0):
+    """Return the first displayed and enabled element matching any selector."""
+    deadline = time.time() + max(timeout, 0)
+    try:
+        driver.implicitly_wait(1)
+    except Exception:
+        pass
+
+    try:
+        while True:
+            for by, selector in selectors:
+                try:
+                    for elem in driver.find_elements(by, selector):
+                        try:
+                            if elem.is_displayed() and elem.is_enabled():
+                                return elem, selector
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+
+            if timeout <= 0 or time.time() >= deadline:
+                return None, None
+            time.sleep(0.5)
+    finally:
+        try:
+            driver.implicitly_wait(15)
+        except Exception:
+            pass
+
+
+def _click_first_visible(driver, domain: str, selectors, description: str, timeout: int = 3) -> bool:
+    elem, selector = _find_first_visible(driver, selectors, timeout=timeout)
+    if not elem:
+        return False
+
+    try:
+        if safe_click(driver, elem, description):
+            logger.info(f"[{domain}] Clicked {description}: {selector}")
+            return True
+    except Exception as e:
+        logger.debug(f"[{domain}] safe_click failed for {description}: {e}")
+
+    try:
+        driver.execute_script("arguments[0].click();", elem)
+        logger.info(f"[{domain}] Clicked {description} with JavaScript: {selector}")
+        return True
+    except Exception as e:
+        logger.debug(f"[{domain}] JavaScript click failed for {description}: {e}")
+        return False
+
+
+def _submit_visible_totp_code(driver, domain: str, totp_secret: Optional[str], context: str, timeout: int = 3) -> bool:
+    code_input, selector = _find_first_visible(driver, MFA_CODE_INPUT_SELECTORS, timeout=timeout)
+    if not code_input:
+        return False
+    if not totp_secret:
+        raise Exception(f"MFA code input appeared during {context}, but no TOTP secret is stored for this tenant")
+
+    code = pyotp.TOTP(totp_secret.upper().replace(" ", "")).now()
+    logger.info(f"[{domain}] Entering TOTP code during {context}: {code[:2]}****")
+
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", code_input)
+        driver.execute_script("arguments[0].focus();", code_input)
+    except Exception:
+        pass
+
+    code_input.clear()
+    code_input.send_keys(code)
+    time.sleep(1)
+
+    if not _click_first_visible(driver, domain, MFA_CODE_SUBMIT_SELECTORS, "MFA code submit", timeout=4):
+        code_input.send_keys(Keys.RETURN)
+        logger.info(f"[{domain}] Pressed Enter to submit TOTP code during {context}")
+
+    time.sleep(4)
+    return True
+
+
+def _handle_stay_signed_in_prompt(driver, domain: str) -> None:
+    try:
+        yes_btn = driver.find_element(By.ID, "idSIButton9")
+        if yes_btn.is_displayed():
+            yes_btn.click()
+            logger.info(f"[{domain}] Clicked 'Yes' on stay signed in")
+            time.sleep(2)
+            return
+    except Exception:
+        pass
+
+    try:
+        no_btn = driver.find_element(By.ID, "idBtn_Back")
+        if no_btn.is_displayed():
+            no_btn.click()
+            logger.info(f"[{domain}] Clicked 'No' on stay signed in")
+            time.sleep(2)
+    except Exception:
+        logger.debug(f"[{domain}] No stay signed in prompt")
+
+
+def _wait_for_mfa_setup_to_clear(driver, timeout: int = 20) -> bool:
+    for _ in range(timeout):
+        if not _mfa_setup_blocking_reason(driver):
+            return True
+        time.sleep(1)
+    return False
+
+
+def _mfa_code_input_is_visible(driver) -> bool:
+    code_input, _ = _find_first_visible(driver, MFA_CODE_INPUT_SELECTORS, timeout=0)
+    return bool(code_input)
+
+
+def _complete_mfa_setup_with_totp(driver, domain: str, totp_secret: Optional[str], context: str) -> bool:
+    """Proceed through a required Microsoft MFA setup interrupt using the stored TOTP secret."""
+    if not totp_secret:
+        return False
+
+    logger.info(f"[{domain}] Proceeding through required MFA setup during {context}")
+    _save_screenshot(driver, domain, "mfa_setup_required")
+
+    for attempt in range(1, 9):
+        logger.info(f"[{domain}] MFA setup recovery attempt {attempt}/8 during {context}")
+
+        if _submit_visible_totp_code(driver, domain, totp_secret, context, timeout=3):
+            _save_screenshot(driver, domain, f"mfa_setup_totp_submitted_{attempt}")
+            _handle_stay_signed_in_prompt(driver, domain)
+            if _wait_for_mfa_setup_to_clear(driver, timeout=20):
+                if _mfa_code_input_is_visible(driver):
+                    logger.warning(f"[{domain}] MFA code input is still visible after TOTP submit")
+                    continue
+                logger.info(f"[{domain}] MFA setup interrupt cleared after TOTP submit")
+                return True
+            continue
+
+        if not _mfa_setup_blocking_reason(driver):
+            if _mfa_code_input_is_visible(driver):
+                logger.warning(f"[{domain}] MFA code input is visible without setup URL during {context}")
+                continue
+            logger.info(f"[{domain}] MFA setup interrupt cleared during {context}")
+            return True
+
+        if _click_first_visible(driver, domain, MFA_SETUP_PROCEED_SELECTORS, "MFA setup proceed", timeout=4):
+            time.sleep(4)
+            continue
+
+        if _click_first_visible(driver, domain, MFA_METHOD_SWITCH_SELECTORS, "MFA method switch", timeout=2):
+            time.sleep(4)
+            continue
+
+        logger.warning(f"[{domain}] MFA setup recovery attempt {attempt} found no actionable control")
+        _save_screenshot(driver, domain, f"mfa_setup_no_action_{attempt}")
+        time.sleep(2)
+
+    if _wait_for_mfa_setup_to_clear(driver, timeout=5):
+        return True
+
+    return False
+
+
 def _is_domains_page_loaded(driver) -> bool:
     current_url = _safe_current_url(driver).lower()
     if "domains" in current_url and "mfasetup" not in current_url:
@@ -136,11 +375,13 @@ def _is_domains_page_loaded(driver) -> bool:
 
 def _handle_mfa_setup_interrupt(driver, domain: str, totp_secret: Optional[str], context: str) -> bool:
     """
-    Dismiss an MFA setup interrupt when Microsoft allows it.
+    Dismiss or complete an MFA setup interrupt.
 
     Tenants without a TOTP secret are valid if Microsoft does not require MFA.
     If Microsoft does require MFA setup and there is no stored TOTP, fail with a
-    clear error instead of retrying browser navigation until Chrome stalls.
+    clear error instead of retrying browser navigation until Chrome stalls. When
+    Microsoft no longer allows "Skip for now", proceed through the setup prompt
+    and submit the stored TOTP code.
     """
     reason = _mfa_setup_blocking_reason(driver)
     if not reason:
@@ -158,6 +399,13 @@ def _handle_mfa_setup_interrupt(driver, domain: str, totp_secret: Optional[str],
             "Rerun the tenant first-login/MFA enrollment step, or disable the MFA setup requirement for this tenant."
         )
 
+    if _complete_mfa_setup_with_totp(driver, domain, totp_secret, context):
+        _handle_stay_signed_in_prompt(driver, domain)
+        reason = _mfa_setup_blocking_reason(driver)
+        if not reason:
+            return True
+
+    reason = _mfa_setup_blocking_reason(driver) or reason
     raise Exception(f"MFA setup interrupt is still blocking {context}: {reason}")
 
 
@@ -1429,22 +1677,13 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
         logger.info(f"[{domain}] Step 7a: On 'Connect domain' page - clicking 'More options'")
         
         # Click "More options" link
-        more_clicked = False
-        for xpath in [
-            "//a[contains(text(), 'More options')]",
-            "//span[contains(text(), 'More options')]",
-            "//*[contains(text(), 'More options')]"
-        ]:
-            try:
-                elem = driver.find_element(By.XPATH, xpath)
-                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", elem)
-                time.sleep(0.5)
-                driver.execute_script("arguments[0].click();", elem)
-                more_clicked = True
-                logger.info(f"[{domain}] Clicked 'More options'")
-                break
-            except:
-                continue
+        more_clicked = _click_first_visible(
+            driver,
+            domain,
+            CONNECT_MORE_OPTIONS_SELECTORS,
+            "Connect page More options",
+            timeout=6,
+        )
         
         if not more_clicked:
             logger.warning(f"[{domain}] Could not click 'More options' - may already be expanded")
@@ -1454,24 +1693,34 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
         
         # Select "Add your own DNS records" radio button
         logger.info(f"[{domain}] Step 7b: Selecting 'Add your own DNS records'")
-        dns_selected = False
-        for xpath in [
-            "//input[@type='radio'][following-sibling::*[contains(text(), 'Add your own')]]",
-            "//input[@type='radio'][..//*[contains(text(), 'Add your own')]]",
-            "//*[contains(text(), 'Add your own DNS records')]",
-            "//label[contains(., 'Add your own')]",
-            "//span[contains(text(), 'Add your own DNS records')]"
-        ]:
+        dns_selected = _click_first_visible(
+            driver,
+            domain,
+            CONNECT_OWN_DNS_SELECTORS,
+            "Add your own DNS records option",
+            timeout=8,
+        )
+
+        if not dns_selected:
             try:
-                elem = driver.find_element(By.XPATH, xpath)
-                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", elem)
-                time.sleep(0.5)
-                driver.execute_script("arguments[0].click();", elem)
-                dns_selected = True
-                logger.info(f"[{domain}] Selected 'Add your own DNS records'")
-                break
-            except:
-                continue
+                dns_selected = bool(driver.execute_script(
+                    """
+                    const phrase = 'add your own dns records';
+                    const nodes = Array.from(document.querySelectorAll('input,label,button,[role="radio"],span,div'))
+                      .filter(node => ((node.innerText || node.textContent || node.value || '').toLowerCase()).includes(phrase));
+                    for (const node of nodes) {
+                      const clickable = node.closest('[role="radio"], label, button') || node;
+                      clickable.scrollIntoView({block: 'center'});
+                      clickable.click();
+                      return true;
+                    }
+                    return false;
+                    """
+                ))
+                if dns_selected:
+                    logger.info(f"[{domain}] Selected 'Add your own DNS records' via DOM fallback")
+            except Exception as e:
+                logger.warning(f"[{domain}] DOM fallback could not select 'Add your own DNS records': {e}")
         
         if not dns_selected:
             logger.warning(f"[{domain}] Could not select 'Add your own DNS records'")
@@ -1481,17 +1730,30 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
         
         # Click Continue
         logger.info(f"[{domain}] Step 7c: Clicking Continue")
-        continue_clicked = False
-        try:
-            btns = driver.find_elements(By.TAG_NAME, "button")
-            for btn in btns:
-                if "continue" in btn.text.lower():
-                    driver.execute_script("arguments[0].click();", btn)
-                    continue_clicked = True
-                    logger.info(f"[{domain}] Clicked Continue")
-                    break
-        except:
-            pass
+        continue_clicked = _click_first_visible(
+            driver,
+            domain,
+            CONNECT_CONTINUE_SELECTORS,
+            "Connect page Continue",
+            timeout=8,
+        )
+
+        if not continue_clicked:
+            try:
+                continue_clicked = bool(driver.execute_script(
+                    """
+                    const buttons = Array.from(document.querySelectorAll('button,input[type="submit"]'));
+                    const target = buttons.find(btn => ((btn.innerText || btn.value || '').toLowerCase()).includes('continue'));
+                    if (!target) return false;
+                    target.scrollIntoView({block: 'center'});
+                    target.click();
+                    return true;
+                    """
+                ))
+                if continue_clicked:
+                    logger.info(f"[{domain}] Clicked Continue via DOM fallback")
+            except Exception as e:
+                logger.warning(f"[{domain}] DOM fallback could not click Continue: {e}")
         
         if not continue_clicked:
             logger.error(f"[{domain}] Could not click Continue on connect page!")

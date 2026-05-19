@@ -3490,15 +3490,27 @@ async def mark_tenant_step5_complete(
     tenant.setup_step = "6"
     tenant.step5_complete = True
     tenant.step5_completed_at = tenant.step5_completed_at or datetime.utcnow()
+    tenant.step5_retry_count = 0
     
     # Update domain if exists
     if domain:
+        domain.domain_added_to_m365 = True
+        domain.domain_verified_in_m365 = True
+        domain.domain_verified_at = domain.domain_verified_at or datetime.utcnow()
+        domain.mx_record_added = True
+        domain.spf_record_added = True
+        domain.autodiscover_added = True
         domain.status = DomainStatus.ACTIVE
         domain.mx_configured = True
         domain.spf_configured = True
         domain.dns_records_created = True
         domain.dkim_cnames_added = True
         domain.dkim_enabled = True
+        domain.dkim_enabled_at = domain.dkim_enabled_at or datetime.utcnow()
+        domain.step5_complete = True
+        domain.step5_retry_count = 0
+        domain.step5_skipped = False
+        domain.error_message = None
     
     await db.commit()
     
@@ -3562,17 +3574,29 @@ async def mark_bulk_tenants_step5_complete(
         tenant.setup_step = "6"
         tenant.step5_complete = True
         tenant.step5_completed_at = tenant.step5_completed_at or datetime.utcnow()
+        tenant.step5_retry_count = 0
         
         # Update domain if exists
         if tenant.domain_id:
             domain = await db.get(Domain, tenant.domain_id)
             if domain:
+                domain.domain_added_to_m365 = True
+                domain.domain_verified_in_m365 = True
+                domain.domain_verified_at = domain.domain_verified_at or datetime.utcnow()
+                domain.mx_record_added = True
+                domain.spf_record_added = True
+                domain.autodiscover_added = True
                 domain.status = DomainStatus.ACTIVE
                 domain.mx_configured = True
                 domain.spf_configured = True
                 domain.dns_records_created = True
                 domain.dkim_cnames_added = True
                 domain.dkim_enabled = True
+                domain.dkim_enabled_at = domain.dkim_enabled_at or datetime.utcnow()
+                domain.step5_complete = True
+                domain.step5_retry_count = 0
+                domain.step5_skipped = False
+                domain.error_message = None
         
         updated_count += 1
         updated_domains.append(tenant.custom_domain)
