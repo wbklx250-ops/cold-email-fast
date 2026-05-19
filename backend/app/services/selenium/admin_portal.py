@@ -279,6 +279,39 @@ def _submit_visible_totp_code(driver, domain: str, totp_secret: Optional[str], c
     return True
 
 
+def _handle_visible_mfa_challenge(driver, domain: str, totp_secret: Optional[str], context: str) -> bool:
+    """
+    Submit a standard Microsoft MFA code prompt if it appears outside the
+    initial login handler. Microsoft can show this after MFA setup or after a
+    direct admin-center navigation, before the Domains UI actually loads.
+    """
+    page_text = _safe_page_text(driver).lower()
+    challenge_markers = (
+        "enter code",
+        "enter the code displayed",
+        "code displayed in the authenticator app",
+        "verify your identity",
+        "verification code",
+    )
+    code_input, _ = _find_first_visible(driver, MFA_CODE_INPUT_SELECTORS, timeout=0)
+    if not code_input and not any(marker in page_text for marker in challenge_markers):
+        return False
+
+    logger.info(f"[{domain}] MFA code challenge detected during {context}")
+    submitted = _submit_visible_totp_code(driver, domain, totp_secret, context, timeout=8)
+    if submitted:
+        _handle_stay_signed_in_prompt(driver, domain)
+        return True
+
+    if any(marker in page_text for marker in challenge_markers):
+        _save_screenshot(driver, domain, f"mfa_challenge_no_input_{context.replace(' ', '_')}")
+        if not totp_secret:
+            raise Exception(f"MFA code challenge appeared during {context}, but no TOTP secret is stored")
+        raise Exception(f"MFA code challenge appeared during {context}, but no code input was found")
+
+    return False
+
+
 def _handle_stay_signed_in_prompt(driver, domain: str) -> None:
     try:
         yes_btn = driver.find_element(By.ID, "idSIButton9")
@@ -777,6 +810,8 @@ def wait_for_body_text(driver, min_length: int = 50, timeout: int = 30) -> str:
 def _navigate_to_domains_page(driver, domain: str, totp_secret: Optional[str]) -> None:
     """Navigate to the M365 domains page, handling optional MFA setup interrupts."""
     _handle_mfa_setup_interrupt(driver, domain, totp_secret, "before domains navigation")
+    if _handle_visible_mfa_challenge(driver, domain, totp_secret, "before domains navigation"):
+        time.sleep(2)
 
     candidate_urls = []
     for url in (
@@ -802,6 +837,9 @@ def _navigate_to_domains_page(driver, domain: str, totp_secret: Optional[str]) -
         if _handle_mfa_setup_interrupt(driver, domain, totp_secret, "domains navigation"):
             time.sleep(2)
             continue
+        if _handle_visible_mfa_challenge(driver, domain, totp_secret, "domains navigation"):
+            time.sleep(2)
+            continue
 
         for check_attempt in range(10):
             if _is_domains_page_loaded(driver):
@@ -810,6 +848,8 @@ def _navigate_to_domains_page(driver, domain: str, totp_secret: Optional[str]) -
 
             if _mfa_setup_blocking_reason(driver):
                 _handle_mfa_setup_interrupt(driver, domain, totp_secret, "domains page load")
+                break
+            if _handle_visible_mfa_challenge(driver, domain, totp_secret, "domains page load"):
                 break
 
             time.sleep(2)
@@ -1186,6 +1226,7 @@ def _login_with_mfa(driver, admin_email: str, admin_password: str, totp_secret: 
     # Dismiss the MFA setup interrupt if Microsoft allows skipping it. Tenants
     # without TOTP can continue only when Microsoft is not requiring MFA setup.
     _handle_mfa_setup_interrupt(driver, domain, totp_secret, "post-login")
+    _handle_visible_mfa_challenge(driver, domain, totp_secret, "post-login")
 
 
 def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_password, totp_secret=None, cloudflare_service=None, headless=False):
@@ -1287,6 +1328,8 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     # ===== STEP 3: ADD DOMAIN =====
     logger.info(f"[{domain}] Step 3: Add domain")
     try:
+        if _handle_visible_mfa_challenge(driver, domain, totp_secret, "before Add domain"):
+            _navigate_to_domains_page(driver, domain, totp_secret)
         add_btn = WebDriverWait(driver, 10).until(
             EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'Add domain')]"))
         )
@@ -1295,14 +1338,23 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
         logger.info(f"[{domain}] Add domain button not found, navigating to wizard directly")
         # Dismiss MFA setup interrupt if it intercepted the page
         _handle_mfa_setup_interrupt(driver, domain, totp_secret, "before domain wizard navigation")
+        _handle_visible_mfa_challenge(driver, domain, totp_secret, "before domain wizard navigation")
         driver.get("https://admin.cloud.microsoft/#/Domains/Wizard")
         wait_for_page_load(driver, timeout=30)
+        time.sleep(3)
+        if _handle_visible_mfa_challenge(driver, domain, totp_secret, "after domain wizard navigation"):
+            driver.get("https://admin.cloud.microsoft/#/Domains/Wizard")
+            wait_for_page_load(driver, timeout=30)
     time.sleep(5)  # Increased from 3
     
     # ===== STEP 4: ENTER DOMAIN =====
     try:
         logger.info(f"[{domain}] Step 4: Enter domain name")
         update_status_file(domain, "add_domain", "in_progress", "Adding domain to M365")
+        if _handle_visible_mfa_challenge(driver, domain, totp_secret, "before domain entry"):
+            driver.get("https://admin.cloud.microsoft/#/Domains/Wizard")
+            wait_for_page_load(driver, timeout=30)
+            time.sleep(5)
         
         domain_input = WebDriverWait(driver, 15).until(
             EC.presence_of_element_located((By.XPATH, "//input[@type='text']"))
