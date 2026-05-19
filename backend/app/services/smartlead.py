@@ -15,15 +15,16 @@ import asyncio
 import logging
 import os
 import random
+import shutil
+import subprocess
+import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 
 import httpx
 from pydantic import BaseModel, Field
 from sqlalchemy import select, update
-from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger("smartlead")
 
@@ -31,6 +32,19 @@ logger = logging.getLogger("smartlead")
 # Constants
 # ---------------------------------------------------------------------------
 SMARTLEAD_API_BASE = "https://server.smartlead.ai/api/v1"
+DEFAULT_SMARTLEAD_WORKERS = 1
+DEFAULT_SMARTLEAD_MAX_RETRIES = 1
+DEFAULT_SMARTLEAD_COOLDOWN_SECONDS = 2.0
+DEFAULT_SMARTLEAD_RESOURCE_FAILURE_LIMIT = 2
+RESOURCE_FAILURE_MARKERS = (
+    "resource temporarily unavailable",
+    "failed to start a thread",
+    "unable to obtain driver",
+    "session not created",
+    "chrome failed to start",
+    "devtoolsactiveport file doesn't exist",
+    "unsupported architecture",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -202,36 +216,103 @@ class SmartleadAPI:
 class SmartleadOAuthUploader:
     """
     Uploads M365 accounts to Smartlead via their custom OAuth URL.
-    Uses Selenium — must be run in a thread pool executor from async code.
+    Uses Selenium — must be run outside the async event loop.
     """
 
     def __init__(self, headless: bool = True, worker_id: int = 0):
         self.headless = headless
         self.worker_id = worker_id
+        self.last_error: Optional[str] = None
+
+    def _build_driver(self):
+        """Create a Chrome driver and isolated temp profile for one OAuth attempt."""
+        from selenium import webdriver
+        from selenium.webdriver.chrome.service import Service
+
+        chrome_options = webdriver.ChromeOptions()
+        chrome_binary = os.getenv("CHROME_PATH")
+        if chrome_binary:
+            chrome_options.binary_location = chrome_binary
+
+        profile_dir = tempfile.mkdtemp(prefix=f"smartlead-w{self.worker_id}-")
+        chrome_options.add_argument(f"--user-data-dir={profile_dir}")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--disable-software-rasterizer")
+        chrome_options.add_argument("--window-size=1920,1080")
+        chrome_options.add_argument("--disable-extensions")
+        chrome_options.add_argument("--disable-infobars")
+        chrome_options.add_argument("--disable-notifications")
+        chrome_options.add_argument("--disable-popup-blocking")
+        chrome_options.add_argument("--no-first-run")
+        chrome_options.add_argument("--no-default-browser-check")
+        chrome_options.add_argument("--disable-background-networking")
+        chrome_options.add_argument("--disable-sync")
+        chrome_options.add_argument("--disable-default-apps")
+        chrome_options.add_argument("--disable-component-update")
+        chrome_options.add_argument("--disable-crash-reporter")
+        chrome_options.add_argument("--disable-crashpad")
+        chrome_options.add_argument("--disable-breakpad")
+        chrome_options.add_argument("--no-zygote")
+        chrome_options.add_argument("--remote-debugging-port=0")
+        chrome_options.add_argument("--disable-features=ThirdPartyCookieBlocking")
+        chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        chrome_options.add_experimental_option("useAutomationExtension", False)
+        chrome_options.add_experimental_option(
+            "prefs",
+            {
+                "credentials_enable_service": False,
+                "profile.password_manager_enabled": False,
+                "profile.password_manager_leak_detection": False,
+                "profile.cookie_controls_mode": 0,
+                "profile.block_third_party_cookies": False,
+            },
+        )
+
+        if self.headless:
+            chrome_options.add_argument("--headless=new")
+
+        chromedriver_path = os.getenv("CHROMEDRIVER_PATH")
+        if chromedriver_path and os.path.exists(chromedriver_path):
+            driver = webdriver.Chrome(
+                service=Service(executable_path=chromedriver_path),
+                options=chrome_options,
+            )
+        else:
+            logger.warning(
+                "CHROMEDRIVER_PATH missing/unusable (%s); falling back to Selenium Manager",
+                chromedriver_path,
+            )
+            driver = webdriver.Chrome(options=chrome_options)
+
+        return driver, profile_dir
+
+    def chrome_preflight(self) -> tuple[bool, Optional[str]]:
+        """Start Chrome once before a large upload so infrastructure failures fail fast."""
+        driver = None
+        profile_dir = None
+        try:
+            driver, profile_dir = self._build_driver()
+            driver.set_page_load_timeout(10)
+            driver.get("data:text/html,<html><title>smartlead-preflight</title><body>ok</body></html>")
+            return True, None
+        except Exception as e:
+            return False, str(e)
+        finally:
+            self._cleanup_driver(driver, profile_dir)
 
     def upload_account(self, email: str, password: str, oauth_url: str) -> bool:
         """Upload a single M365 account via OAuth. Returns True on success."""
-        from selenium import webdriver
         from selenium.webdriver.common.by import By
         from selenium.webdriver.support.ui import WebDriverWait
-        from selenium.webdriver.support import expected_conditions as EC
-        from selenium.common.exceptions import TimeoutException
 
         driver = None
+        profile_dir = None
+        self.last_error = None
         try:
-            chrome_options = webdriver.ChromeOptions()
-            chrome_options.add_argument("--no-sandbox")
-            chrome_options.add_argument("--disable-dev-shm-usage")
-            chrome_options.add_argument("--disable-gpu")
-            chrome_options.add_argument("--window-size=1920,1080")
-            chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-            chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-            chrome_options.add_experimental_option("useAutomationExtension", False)
-
-            if self.headless:
-                chrome_options.add_argument("--headless=new")
-
-            driver = webdriver.Chrome(options=chrome_options)
+            driver, profile_dir = self._build_driver()
             driver.execute_script(
                 "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
             )
@@ -249,6 +330,7 @@ class SmartleadOAuthUploader:
             )
             if not email_field:
                 self._screenshot(driver, f"no_email_{email.split('@')[0]}")
+                self.last_error = f"Email field not found; {self._page_context(driver)}"
                 raise Exception("Email field not found")
 
             self._human_type(email_field, email)
@@ -267,6 +349,7 @@ class SmartleadOAuthUploader:
             )
             if not pass_field:
                 self._screenshot(driver, f"no_pass_{email.split('@')[0]}")
+                self.last_error = f"Password field not found; {self._page_context(driver)}"
                 raise Exception("Password field not found")
 
             self._human_type(pass_field, password)
@@ -294,24 +377,24 @@ class SmartleadOAuthUploader:
             elif "login.microsoftonline.com" in current_url:
                 logger.warning(f"[Worker {self.worker_id}] OAuth incomplete for {email}, URL: {driver.current_url}")
                 self._screenshot(driver, f"incomplete_{email.split('@')[0]}")
+                self.last_error = f"OAuth incomplete; {self._page_context(driver)}"
                 return False
             else:
                 logger.warning(f"[Worker {self.worker_id}] Unclear result for {email}, URL: {driver.current_url}")
                 self._screenshot(driver, f"unclear_{email.split('@')[0]}")
-                return True  # Completed all steps without error
+                self.last_error = f"OAuth ended on unexpected page; {self._page_context(driver)}"
+                return False
 
         except Exception as e:
             logger.error(f"[Worker {self.worker_id}] OAuth failed for {email}: {e}")
+            if not self.last_error:
+                self.last_error = f"{e}; {self._page_context(driver)}" if driver else str(e)
             if driver:
                 self._screenshot(driver, f"error_{email.split('@')[0]}")
             return False
 
         finally:
-            if driver:
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
+            self._cleanup_driver(driver, profile_dir)
 
     def _find_element(self, wait, locators):
         """Try multiple locator strategies."""
@@ -401,11 +484,85 @@ class SmartleadOAuthUploader:
         except Exception:
             pass
 
+    def _page_context(self, driver) -> str:
+        if not driver:
+            return "browser_not_started"
+
+        parts = []
+        try:
+            parts.append(f"url={driver.current_url}")
+        except Exception:
+            pass
+        try:
+            parts.append(f"title={driver.title}")
+        except Exception:
+            pass
+        try:
+            from selenium.webdriver.common.by import By
+
+            body = driver.find_element(By.TAG_NAME, "body").text
+            body = " ".join(body.split())[:500]
+            if body:
+                parts.append(f"body={body}")
+        except Exception:
+            pass
+        return "; ".join(parts) if parts else "page_context_unavailable"
+
+    def _cleanup_driver(self, driver, profile_dir: Optional[str]) -> None:
+        if driver:
+            driver_pid = None
+            try:
+                service = getattr(driver, "service", None)
+                process = getattr(service, "process", None)
+                driver_pid = getattr(process, "pid", None)
+            except Exception:
+                driver_pid = None
+
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+            if driver_pid:
+                self._kill_child_processes(driver_pid)
+
+        if profile_dir:
+            shutil.rmtree(profile_dir, ignore_errors=True)
+
+    def _kill_child_processes(self, parent_pid: int) -> None:
+        if os.name == "nt":
+            return
+
+        try:
+            child_result = subprocess.run(
+                ["pgrep", "-P", str(parent_pid)],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            child_pids = [
+                pid.strip()
+                for pid in child_result.stdout.splitlines()
+                if pid.strip().isdigit()
+            ]
+            for pid in child_pids:
+                subprocess.run(["kill", "-TERM", pid], capture_output=True, timeout=2)
+            time.sleep(0.2)
+            for pid in child_pids:
+                subprocess.run(["kill", "-KILL", pid], capture_output=True, timeout=2)
+        except Exception:
+            pass
+
     def _screenshot(self, driver, label):
         try:
-            os.makedirs("screenshots", exist_ok=True)
+            screenshot_dir = os.getenv("SCREENSHOT_DIR", "screenshots")
+            os.makedirs(screenshot_dir, exist_ok=True)
+            safe_label = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in label)
             driver.save_screenshot(
-                f"screenshots/sl_{self.worker_id}_{label}_{datetime.now().strftime('%H%M%S')}.png"
+                os.path.join(
+                    screenshot_dir,
+                    f"sl_{self.worker_id}_{safe_label}_{datetime.now().strftime('%H%M%S')}.png",
+                )
             )
         except Exception:
             pass
@@ -418,15 +575,16 @@ def process_smartlead_mailbox_sync(
     uploader: SmartleadOAuthUploader,
     mailbox_data: Dict[str, Any],
     oauth_url: str,
-    max_retries: int = 2
+    max_retries: int = DEFAULT_SMARTLEAD_MAX_RETRIES
 ) -> Dict[str, Any]:
     """
     Synchronous function to process a single mailbox upload to Smartlead.
-    Runs in ThreadPoolExecutor.
+    Runs in a worker thread.
     """
     mailbox_id = mailbox_data["id"]
     email = mailbox_data["email"]
     password = mailbox_data["password"]
+    last_error = None
 
     for attempt in range(max_retries + 1):
         try:
@@ -439,17 +597,21 @@ def process_smartlead_mailbox_sync(
                     "retries": attempt
                 }
             else:
+                last_error = uploader.last_error or "OAuth upload returned false"
                 if attempt < max_retries:
-                    logger.warning(f"[Worker {uploader.worker_id}] Attempt {attempt + 1} failed for {email}, retrying...")
+                    logger.warning(
+                        f"[Worker {uploader.worker_id}] Attempt {attempt + 1} failed for {email}: {last_error}; retrying..."
+                    )
                     time.sleep(3)
                 else:
                     return {
                         "mailbox_id": mailbox_id,
                         "success": False,
-                        "error": "OAuth upload failed after retries",
+                        "error": last_error or "OAuth upload failed after retries",
                         "retries": attempt
                     }
         except Exception as e:
+            last_error = str(e)
             if attempt < max_retries:
                 time.sleep(3)
             else:
@@ -460,7 +622,48 @@ def process_smartlead_mailbox_sync(
                     "retries": attempt
                 }
     
-    return {"mailbox_id": mailbox_id, "success": False, "error": "Unknown error", "retries": max_retries}
+    return {
+        "mailbox_id": mailbox_id,
+        "success": False,
+        "error": last_error or "Unknown error",
+        "retries": max_retries,
+    }
+
+
+def _is_resource_failure(error: Optional[str]) -> bool:
+    if not error:
+        return False
+    normalized = error.lower()
+    return any(marker in normalized for marker in RESOURCE_FAILURE_MARKERS)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _mailbox_not_ready_reasons(mailbox) -> list[str]:
+    reasons = []
+    if not mailbox.created_in_exchange:
+        reasons.append("created_in_exchange=false")
+    if not mailbox.delegated:
+        reasons.append("delegated=false")
+    if not mailbox.password_set:
+        reasons.append("password_set=false")
+    if not mailbox.account_enabled:
+        reasons.append("account_enabled=false")
+    if not (mailbox.initial_password or mailbox.password):
+        reasons.append("missing_password")
+    return reasons
 
 
 async def run_smartlead_upload_for_batch(
@@ -497,7 +700,34 @@ async def run_smartlead_upload_for_batch(
     from app.models.batch import SetupBatch
     from app.db.session import async_session_factory
 
-    logger.info(f"Starting Smartlead upload for batch {batch_id} with {num_workers} workers")
+    requested_workers = num_workers
+    configured_max_workers = _env_int("SMARTLEAD_MAX_WORKERS", DEFAULT_SMARTLEAD_WORKERS)
+    num_workers = max(1, min(num_workers, configured_max_workers))
+    max_retries = max(0, _env_int("SMARTLEAD_MAX_RETRIES", DEFAULT_SMARTLEAD_MAX_RETRIES))
+    cooldown_seconds = max(
+        0.0,
+        _env_float("SMARTLEAD_ACCOUNT_COOLDOWN_SECONDS", DEFAULT_SMARTLEAD_COOLDOWN_SECONDS),
+    )
+    resource_failure_limit = max(
+        1,
+        _env_int("SMARTLEAD_RESOURCE_FAILURE_LIMIT", DEFAULT_SMARTLEAD_RESOURCE_FAILURE_LIMIT),
+    )
+
+    if requested_workers != num_workers:
+        logger.warning(
+            "Smartlead workers capped from %s to %s (SMARTLEAD_MAX_WORKERS=%s)",
+            requested_workers,
+            num_workers,
+            configured_max_workers,
+        )
+
+    logger.info(
+        "Starting Smartlead upload for batch %s with %s worker(s), max_retries=%s, cooldown=%ss",
+        batch_id,
+        num_workers,
+        max_retries,
+        cooldown_seconds,
+    )
     
     # Default settings
     sending = sending_settings or {"max_per_day": 6, "wait_mins": 60, "tracking_url": ""}
@@ -513,7 +743,7 @@ async def run_smartlead_upload_for_batch(
         if not batch:
             return {"error": "Batch not found", "total": 0, "uploaded": 0, "failed": 0, "skipped": 0}
         
-        # Get all mailboxes for tenants in this batch
+        # Get all candidate mailboxes for tenants in this batch.
         query = (
             select(Mailbox)
             .join(Tenant, Mailbox.tenant_id == Tenant.id)
@@ -524,11 +754,40 @@ async def run_smartlead_upload_for_batch(
             query = query.where(Mailbox.smartlead_uploaded == False)
             
         result = await session.execute(query)
-        mailboxes = result.scalars().all()
+        candidate_mailboxes = result.scalars().all()
         
-        if not mailboxes:
+        if not candidate_mailboxes:
             logger.info(f"No mailboxes to upload for batch {batch_id}")
             return {"total": 0, "uploaded": 0, "failed": 0, "skipped": 0, "errors": []}
+
+        mailboxes = []
+        ineligible_count = 0
+        ineligible_errors = []
+        for mb in candidate_mailboxes:
+            not_ready_reasons = _mailbox_not_ready_reasons(mb)
+            if not_ready_reasons:
+                ineligible_count += 1
+                error = f"Skipped - mailbox not upload-ready ({', '.join(not_ready_reasons)})"
+                ineligible_errors.append(error)
+                await session.execute(
+                    update(Mailbox)
+                    .where(Mailbox.id == mb.id)
+                    .values(
+                        smartlead_uploaded=False,
+                        smartlead_upload_error=error,
+                        uploaded_to_sequencer=False,
+                        upload_error=error,
+                    )
+                )
+            else:
+                mailboxes.append(mb)
+
+        if ineligible_count:
+            await session.commit()
+            logger.warning(
+                "Skipped %s Smartlead candidate mailbox(es) because they were not upload-ready",
+                ineligible_count,
+            )
         
         # Prepare mailbox data for workers
         mailbox_list = [
@@ -541,6 +800,7 @@ async def run_smartlead_upload_for_batch(
         ]
     
     logger.info(f"Found {len(mailbox_list)} mailboxes to upload to Smartlead")
+    total_count = len(mailbox_list) + ineligible_count
     
     # Check for existing accounts in Smartlead (deduplication)
     api = SmartleadAPI(api_key)
@@ -566,7 +826,11 @@ async def run_smartlead_upload_for_batch(
                     .values(
                         smartlead_uploaded=True,
                         smartlead_uploaded_at=datetime.utcnow(),
-                        smartlead_upload_error="Skipped - already exists"
+                        smartlead_upload_error=None,
+                        uploaded_to_sequencer=True,
+                        uploaded_at=datetime.utcnow(),
+                        sequencer_name="smartlead",
+                        upload_error=None,
                     )
                 )
                 await session.commit()
@@ -576,103 +840,128 @@ async def run_smartlead_upload_for_batch(
     if not to_upload:
         await api.close()
         return {
-            "total": len(mailbox_list),
+            "total": total_count,
             "uploaded": 0,
-            "failed": 0,
+            "failed": ineligible_count,
             "skipped": skipped_count,
-            "errors": []
+            "ineligible": ineligible_count,
+            "errors": ineligible_errors[:10],
         }
     
-    # Run parallel upload using ThreadPoolExecutor
+    # Run uploads serially. Chrome/OAuth sessions are too expensive to fan out in Railway.
     uploaded_count = 0
     failed_count = 0
     errors = []
     settings_configured = 0
     warmup_configured = 0
-    
-    with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        # Create one uploader per worker
-        uploaders = []
-        for i in range(num_workers):
-            uploader = SmartleadOAuthUploader(headless=headless, worker_id=i)
-            uploaders.append(uploader)
-        
-        try:
-            # Submit tasks to executor
-            futures = []
-            for i, mailbox_data in enumerate(to_upload):
-                uploader = uploaders[i % len(uploaders)]
-                future = executor.submit(
-                    process_smartlead_mailbox_sync,
-                    uploader,
-                    mailbox_data,
-                    oauth_url
+
+    preflight_uploader = SmartleadOAuthUploader(headless=headless, worker_id="preflight")
+    preflight_ok, preflight_error = preflight_uploader.chrome_preflight()
+    if not preflight_ok:
+        await api.close()
+        raise RuntimeError(f"Smartlead Chrome preflight failed: {preflight_error}")
+
+    uploader = SmartleadOAuthUploader(headless=headless, worker_id=0)
+    consecutive_resource_failures = 0
+
+    for mailbox_data in to_upload:
+        result = await asyncio.to_thread(
+            process_smartlead_mailbox_sync,
+            uploader,
+            mailbox_data,
+            oauth_url,
+            max_retries,
+        )
+
+        error = result.get("error")
+        if result["success"]:
+            consecutive_resource_failures = 0
+        elif _is_resource_failure(error):
+            consecutive_resource_failures += 1
+            errors.append(error)
+            logger.error(
+                "Smartlead browser resource failure %s/%s for %s: %s",
+                consecutive_resource_failures,
+                resource_failure_limit,
+                mailbox_data["email"],
+                error,
+            )
+            if consecutive_resource_failures >= resource_failure_limit:
+                await api.close()
+                raise RuntimeError(
+                    "Stopping Smartlead upload after "
+                    f"{consecutive_resource_failures} browser resource failure(s): {error}"
                 )
-                futures.append(future)
-            
-            # Process results as they complete
-            for future in as_completed(futures):
-                result = future.result()
+            await asyncio.sleep(max(cooldown_seconds, 5.0))
+            continue
+        else:
+            consecutive_resource_failures = 0
+
+        # Update database
+        async with async_session_factory() as session:
+            if result["success"]:
+                await session.execute(
+                    update(Mailbox)
+                    .where(Mailbox.id == result["mailbox_id"])
+                    .values(
+                        smartlead_uploaded=True,
+                        smartlead_uploaded_at=datetime.utcnow(),
+                        smartlead_upload_error=None,
+                        uploaded_to_sequencer=True,
+                        uploaded_at=datetime.utcnow(),
+                        sequencer_name="smartlead",
+                        upload_error=None,
+                    )
+                )
+                uploaded_count += 1
                 
-                # Update database
-                async with async_session_factory() as session:
-                    if result["success"]:
-                        await session.execute(
-                            update(Mailbox)
-                            .where(Mailbox.id == result["mailbox_id"])
-                            .values(
-                                smartlead_uploaded=True,
-                                smartlead_uploaded_at=datetime.utcnow(),
-                                smartlead_upload_error=None
-                            )
-                        )
-                        uploaded_count += 1
-                        
-                        # Configure settings if enabled
-                        if configure_settings:
-                            mb_result = await session.execute(
-                                select(Mailbox).where(Mailbox.id == result["mailbox_id"])
-                            )
-                            mb = mb_result.scalar_one_or_none()
-                            if mb:
-                                await asyncio.sleep(3)  # Wait for Smartlead to register
-                                account_id = await api.find_account_id(mb.email)
-                                if account_id:
-                                    if await api.update_sending_settings(account_id, **sending):
-                                        settings_configured += 1
-                                    if await api.update_warmup_settings(account_id, **warmup):
-                                        warmup_configured += 1
-                    else:
-                        await session.execute(
-                            update(Mailbox)
-                            .where(Mailbox.id == result["mailbox_id"])
-                            .values(
-                                smartlead_uploaded=False,
-                                smartlead_upload_error=result["error"]
-                            )
-                        )
-                        failed_count += 1
-                        errors.append(result["error"])
-                    
-                    await session.commit()
-                
-                logger.info(f"Progress: {uploaded_count + failed_count}/{len(to_upload)} processed")
-        
-        finally:
-            pass  # Uploaders clean up automatically (no login state to maintain)
+                # Configure settings if enabled
+                if configure_settings:
+                    mb_result = await session.execute(
+                        select(Mailbox).where(Mailbox.id == result["mailbox_id"])
+                    )
+                    mb = mb_result.scalar_one_or_none()
+                    if mb:
+                        await asyncio.sleep(3)  # Wait for Smartlead to register
+                        account_id = await api.find_account_id(mb.email)
+                        if account_id:
+                            if await api.update_sending_settings(account_id, **sending):
+                                settings_configured += 1
+                            if await api.update_warmup_settings(account_id, **warmup):
+                                warmup_configured += 1
+            else:
+                await session.execute(
+                    update(Mailbox)
+                    .where(Mailbox.id == result["mailbox_id"])
+                    .values(
+                        smartlead_uploaded=False,
+                        smartlead_upload_error=error,
+                        uploaded_to_sequencer=False,
+                        upload_error=error,
+                    )
+                )
+                failed_count += 1
+                errors.append(error)
+
+            await session.commit()
+
+        logger.info(f"Progress: {uploaded_count + failed_count}/{len(to_upload)} processed")
+        if cooldown_seconds:
+            await asyncio.sleep(cooldown_seconds)
     
     await api.close()
     
     logger.info(f"Smartlead upload complete: {uploaded_count} uploaded, {failed_count} failed, {skipped_count} skipped")
     
     return {
-        "total": len(mailbox_list),
+        "total": total_count,
         "uploaded": uploaded_count,
-        "failed": failed_count,
+        "failed": failed_count + ineligible_count,
         "skipped": skipped_count,
+        "ineligible": ineligible_count,
         "settings_configured": settings_configured,
         "warmup_configured": warmup_configured,
-        "errors": errors[:10]  # Limit to first 10 errors
+        "errors": (ineligible_errors + errors)[:10]  # Limit to first 10 errors
     }
 
 

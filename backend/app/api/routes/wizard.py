@@ -9,7 +9,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, BackgroundTasks, Response
 from fastapi.responses import StreamingResponse, PlainTextResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, update, text
+from sqlalchemy import or_, select, func, update, text
 from sqlalchemy.orm import selectinload
 from typing import Optional, List
 from pydantic import BaseModel
@@ -6968,6 +6968,18 @@ async def get_step8_smartlead_status(
             Mailbox.smartlead_upload_error.isnot(None)
         )
     ) or 0
+
+    mailboxes_upload_ready = await db.scalar(
+        select(func.count(Mailbox.id)).where(
+            Mailbox.batch_id == batch_id,
+            Mailbox.smartlead_uploaded == False,
+            Mailbox.created_in_exchange == True,
+            Mailbox.delegated == True,
+            Mailbox.password_set == True,
+            Mailbox.account_enabled == True,
+            or_(Mailbox.initial_password.isnot(None), Mailbox.password.isnot(None)),
+        )
+    ) or 0
     
     mailboxes_pending = mailboxes_total - mailboxes_uploaded - mailboxes_failed
     
@@ -6984,6 +6996,7 @@ async def get_step8_smartlead_status(
             "uploaded": mailboxes_uploaded,
             "failed": mailboxes_failed,
             "pending": mailboxes_pending,
+            "upload_ready": mailboxes_upload_ready,
         },
         "job": job_status if job_status else None,
     }
@@ -7015,8 +7028,22 @@ async def start_step8_smartlead_upload(
             "started_at": step8_jobs[job_id].get("started_at")
         }
     
-    # Count eligible mailboxes
-    mailboxes_query = select(func.count(Mailbox.id)).where(Mailbox.batch_id == batch_id)
+    smartlead_max_workers = 1
+    try:
+        smartlead_max_workers = int(os.getenv("SMARTLEAD_MAX_WORKERS", "1"))
+    except ValueError:
+        smartlead_max_workers = 1
+    actual_num_workers = max(1, min(request.num_workers, smartlead_max_workers))
+
+    # Count mailboxes that are actually ready for OAuth upload.
+    mailboxes_query = select(func.count(Mailbox.id)).where(
+        Mailbox.batch_id == batch_id,
+        Mailbox.created_in_exchange == True,
+        Mailbox.delegated == True,
+        Mailbox.password_set == True,
+        Mailbox.account_enabled == True,
+        or_(Mailbox.initial_password.isnot(None), Mailbox.password.isnot(None)),
+    )
     if request.skip_uploaded:
         mailboxes_query = mailboxes_query.where(Mailbox.smartlead_uploaded == False)
     
@@ -7045,7 +7072,8 @@ async def start_step8_smartlead_upload(
         "warmup_configured": 0,
         "current_mailbox": None,
         "error": None,
-        "num_workers": request.num_workers,
+        "num_workers": actual_num_workers,
+        "requested_num_workers": request.num_workers,
         "errors": []
     }
     
@@ -7058,7 +7086,7 @@ async def start_step8_smartlead_upload(
                 batch_id=str(batch_id),
                 api_key=request.api_key,
                 oauth_url=request.oauth_url,
-                num_workers=request.num_workers,
+                num_workers=actual_num_workers,
                 skip_uploaded=request.skip_uploaded,
                 configure_settings=request.configure_settings,
                 sending_settings={
@@ -7094,16 +7122,17 @@ async def start_step8_smartlead_upload(
     
     background_tasks.add_task(run_upload)
     
-    logger.info(f"Smartlead Step 8 upload started for batch {batch_id}: {eligible_count} mailboxes, {request.num_workers} workers")
+    logger.info(f"Smartlead Step 8 upload started for batch {batch_id}: {eligible_count} mailboxes, {actual_num_workers} workers")
     
     return {
         "success": True,
         "message": f"Started Smartlead upload for {eligible_count} mailbox(es)",
         "job_id": job_id,
         "eligible_count": eligible_count,
-        "num_workers": request.num_workers,
+        "num_workers": actual_num_workers,
+        "requested_num_workers": request.num_workers,
         "skip_uploaded": request.skip_uploaded,
-        "estimated_minutes": round(eligible_count / request.num_workers * 0.5)  # ~30s per mailbox
+        "estimated_minutes": round(eligible_count / actual_num_workers * 0.5)  # ~30s per mailbox
     }
 
 

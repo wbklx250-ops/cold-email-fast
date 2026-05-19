@@ -12,7 +12,6 @@ import asyncio
 import logging
 import os
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
@@ -33,6 +32,7 @@ from app.models.tenant import Tenant  # noqa: E402
 from app.services.smartlead import (  # noqa: E402
     SmartleadAPI,
     SmartleadOAuthUploader,
+    _is_resource_failure,
     process_smartlead_mailbox_sync,
 )
 
@@ -106,6 +106,10 @@ async def load_target_mailboxes(
                 Mailbox.email,
                 Mailbox.initial_password,
                 Mailbox.password,
+                Mailbox.created_in_exchange,
+                Mailbox.delegated,
+                Mailbox.password_set,
+                Mailbox.account_enabled,
                 Mailbox.smartlead_uploaded,
                 Mailbox.smartlead_upload_error,
                 Tenant.admin_email,
@@ -126,11 +130,14 @@ async def load_target_mailboxes(
             "db_uploaded": 0,
             "db_failed": 0,
             "with_password": 0,
+            "upload_ready": 0,
+            "not_ready": 0,
         }
         for domain in sorted(domains)
     }
     mailboxes: list[dict] = []
     missing_passwords: list[str] = []
+    not_ready: list[str] = []
 
     for row in rows:
         domain = domain_for_email(row.email, domains)
@@ -147,6 +154,25 @@ async def load_target_mailboxes(
         else:
             missing_passwords.append(row.email)
 
+        ready = (
+            row.created_in_exchange
+            and row.delegated
+            and row.password_set
+            and row.account_enabled
+            and bool(password)
+        )
+        if ready:
+            stats[domain]["upload_ready"] += 1
+        else:
+            stats[domain]["not_ready"] += 1
+            not_ready.append(
+                f"{row.email} "
+                f"(created={row.created_in_exchange}, delegated={row.delegated}, "
+                f"password_set={row.password_set}, enabled={row.account_enabled}, "
+                f"password_present={bool(password)})"
+            )
+            continue
+
         mailboxes.append(
             {
                 "id": str(row.id),
@@ -161,6 +187,9 @@ async def load_target_mailboxes(
     if missing_passwords:
         preview = ", ".join(missing_passwords[:10])
         raise RuntimeError(f"{len(missing_passwords)} target mailbox(es) are missing passwords: {preview}")
+    if not_ready:
+        preview = "; ".join(not_ready[:10])
+        print({"skipped_not_upload_ready": len(not_ready), "preview": preview}, flush=True)
 
     return batch.name, mailboxes, stats
 
@@ -301,78 +330,86 @@ async def upload_targets(args: argparse.Namespace) -> dict:
         uploaded = 0
         failed = 0
         errors: list[str] = []
-        worker_count = max(1, min(args.workers, len(to_upload)))
+        configured_max_workers = 1
+        try:
+            configured_max_workers = int(os.getenv("SMARTLEAD_MAX_WORKERS", "1"))
+        except ValueError:
+            configured_max_workers = 1
+        worker_count = max(1, min(args.workers, configured_max_workers, len(to_upload)))
         print(
             {
                 "starting_upload": len(to_upload),
                 "workers": worker_count,
+                "requested_workers": args.workers,
                 "headless": args.headless,
                 "configure_settings": args.configure_settings,
             },
             flush=True,
         )
 
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            uploaders = [
-                SmartleadOAuthUploader(headless=args.headless, worker_id=i)
-                for i in range(worker_count)
-            ]
-            futures = {
-                executor.submit(
-                    process_smartlead_mailbox_sync,
-                    uploaders[index % worker_count],
-                    mailbox,
-                    oauth_url,
-                    args.max_retries,
-                ): mailbox
-                for index, mailbox in enumerate(to_upload)
-            }
+        preflight = SmartleadOAuthUploader(headless=args.headless, worker_id="preflight")
+        preflight_ok, preflight_error = preflight.chrome_preflight()
+        if not preflight_ok:
+            raise RuntimeError(f"Smartlead Chrome preflight failed: {preflight_error}")
 
-            for future in as_completed(futures):
-                mailbox = futures[future]
-                try:
-                    result = future.result()
-                except Exception as exc:  # Defensive; process function should catch its own errors.
-                    result = {
-                        "mailbox_id": mailbox["id"],
-                        "success": False,
-                        "error": str(exc),
-                        "retries": args.max_retries,
-                    }
+        uploader = SmartleadOAuthUploader(headless=args.headless, worker_id=0)
+        consecutive_resource_failures = 0
+        resource_failure_limit = 2
 
-                if result["success"]:
-                    uploaded += 1
-                    await mark_result(mailbox["id"], True, None)
-                    if args.configure_settings:
-                        await asyncio.sleep(args.post_upload_settings_delay)
-                        sending_ok, warmup_ok = await configure_account(
-                            api,
-                            mailbox["email"],
-                            sending,
-                            warmup,
+        for mailbox in to_upload:
+            result = await asyncio.to_thread(
+                process_smartlead_mailbox_sync,
+                uploader,
+                mailbox,
+                oauth_url,
+                args.max_retries,
+            )
+
+            if result["success"]:
+                consecutive_resource_failures = 0
+                uploaded += 1
+                await mark_result(mailbox["id"], True, None)
+                if args.configure_settings:
+                    await asyncio.sleep(args.post_upload_settings_delay)
+                    sending_ok, warmup_ok = await configure_account(
+                        api,
+                        mailbox["email"],
+                        sending,
+                        warmup,
+                    )
+                    settings_configured += int(sending_ok)
+                    warmup_configured += int(warmup_ok)
+                status = "uploaded"
+            else:
+                error = result.get("error") or "OAuth upload failed"
+                if _is_resource_failure(error):
+                    consecutive_resource_failures += 1
+                    errors.append(f"{mailbox['email']}: {error}")
+                    if consecutive_resource_failures >= resource_failure_limit:
+                        raise RuntimeError(
+                            "Stopping targeted Smartlead upload after "
+                            f"{consecutive_resource_failures} browser resource failure(s): {error}"
                         )
-                        settings_configured += int(sending_ok)
-                        warmup_configured += int(warmup_ok)
-                    status = "uploaded"
+                    status = "resource_retry_later"
                 else:
+                    consecutive_resource_failures = 0
                     failed += 1
-                    error = result.get("error") or "OAuth upload failed"
                     errors.append(f"{mailbox['email']}: {error}")
                     await mark_result(mailbox["id"], False, error)
                     status = "failed"
 
-                print(
-                    {
-                        "status": status,
-                        "email": mailbox["email"],
-                        "processed": uploaded + failed,
-                        "to_upload": len(to_upload),
-                        "uploaded": uploaded,
-                        "failed": failed,
-                        "skipped": skipped,
-                    },
-                    flush=True,
-                )
+            print(
+                {
+                    "status": status,
+                    "email": mailbox["email"],
+                    "processed": uploaded + failed,
+                    "to_upload": len(to_upload),
+                    "uploaded": uploaded,
+                    "failed": failed,
+                    "skipped": skipped,
+                },
+                flush=True,
+            )
 
         return {
             "total": len(mailboxes),

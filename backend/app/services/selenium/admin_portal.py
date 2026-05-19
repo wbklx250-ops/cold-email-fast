@@ -2,6 +2,7 @@ import time
 import re
 import os
 import json
+import asyncio
 import pyotp
 import tempfile
 import uuid
@@ -122,6 +123,61 @@ CONNECT_CONTINUE_SELECTORS = (
     (By.XPATH, "//button[contains(normalize-space(), 'Continue')]"),
     (By.CSS_SELECTOR, "button.ms-Button--primary"),
     (By.CSS_SELECTOR, "button[type='submit']"),
+)
+
+DOMAIN_NAME_INPUT_SELECTORS = (
+    (By.XPATH, "//input[contains(@aria-label, 'Domain name')]"),
+    (By.XPATH, "//input[contains(@placeholder, 'contoso')]"),
+    (By.XPATH, "//input[@type='text']"),
+)
+
+DOMAIN_USE_BUTTON_SELECTORS = (
+    (By.XPATH, "//button[contains(normalize-space(), 'Use this domain')]"),
+    (By.XPATH, "//button[contains(normalize-space(), 'Continue')]"),
+    (By.CSS_SELECTOR, "button.ms-Button--primary"),
+)
+
+FEEDBACK_PROMPT_TEXT_MARKERS = (
+    "submit feedback to microsoft",
+    "rate your experience with the admin center",
+    "may we contact you about your feedback",
+)
+
+FEEDBACK_DISMISS_SELECTORS = (
+    (By.XPATH, "//*[contains(normalize-space(), 'Submit feedback to Microsoft')]/ancestor::*[@role='dialog'][1]//button[contains(@aria-label, 'Close') or contains(@title, 'Close')]"),
+    (By.XPATH, "//*[contains(normalize-space(), 'Submit feedback to Microsoft')]/ancestor::*[contains(@class, 'ms-Panel')][1]//button[contains(@aria-label, 'Close') or contains(@title, 'Close')]"),
+    (By.XPATH, "//button[(contains(@aria-label, 'Close') or contains(@title, 'Close')) and ancestor::*[contains(., 'Submit feedback to Microsoft')]]"),
+    (By.XPATH, "//*[@role='button' and (contains(@aria-label, 'Close') or contains(@title, 'Close')) and ancestor::*[contains(., 'Submit feedback to Microsoft')]]"),
+    (By.XPATH, "//*[contains(normalize-space(), 'Submit feedback to Microsoft')]/following::button[normalize-space()='Cancel'][1]"),
+)
+
+ADMIN_CENTER_ERROR_MARKERS = (
+    "something went wrong",
+    "try refreshing the page",
+    "error code",
+)
+
+ADMIN_CENTER_RETRY_SELECTORS = (
+    (By.XPATH, "//button[normalize-space()='Try again']"),
+    (By.XPATH, "//button[contains(normalize-space(), 'Try again')]"),
+    (By.XPATH, "//*[@role='button' and contains(normalize-space(), 'Try again')]"),
+)
+
+DNS_RECORD_PAGE_STRONG_MARKERS = (
+    "mail.protection.outlook.com",
+    "v=spf1",
+    "points to address",
+    "points to value",
+    "selector1",
+    "selector2",
+)
+
+DNS_RECORD_PAGE_SECTION_MARKERS = (
+    "mx records",
+    "cname records",
+    "txt records",
+    "exchange online",
+    "mail protection",
 )
 
 
@@ -249,6 +305,632 @@ def _click_first_visible(driver, domain: str, selectors, description: str, timeo
     except Exception as e:
         logger.debug(f"[{domain}] JavaScript click failed for {description}: {e}")
         return False
+
+
+def _is_domain_entry_page_text(page_text: str) -> bool:
+    text = (page_text or "").lower()
+    return (
+        "add a domain" in text
+        and "domain name" in text
+        and ("use this domain" in text or "example: contoso.com" in text)
+    )
+
+
+def _is_connect_domain_page_text(page_text: str) -> bool:
+    text = (page_text or "").lower()
+    return "how do you want to connect" in text
+
+
+def _is_dns_records_page_text(page_text: str) -> bool:
+    text = (page_text or "").lower()
+    if not text or _is_connect_domain_page_text(text) or _is_domain_entry_page_text(text):
+        return False
+    if any(marker in text for marker in DNS_RECORD_PAGE_STRONG_MARKERS):
+        return True
+    return (
+        ("add dns records" in text or "dns records" in text)
+        and sum(1 for marker in DNS_RECORD_PAGE_SECTION_MARKERS if marker in text) >= 1
+    )
+
+
+def _enter_domain_if_wizard_reset(driver, domain: str, context: str) -> bool:
+    """
+    Microsoft's admin-center error recovery can refresh the wizard back to the
+    blank "Add a domain" form. Re-enter the domain so later DNS steps do not
+    accidentally scrape the reset page.
+    """
+    page_text = _safe_page_text(driver)
+    if not _is_domain_entry_page_text(page_text):
+        return False
+
+    logger.warning(f"[{domain}] Domain wizard reset to blank Add domain page during {context}; re-entering domain")
+    screenshot(driver, f"wizard_reset_{context.replace(' ', '_')}", domain)
+
+    domain_input, input_selector = _find_first_visible(driver, DOMAIN_NAME_INPUT_SELECTORS, timeout=8)
+    if not domain_input:
+        logger.error(f"[{domain}] Could not find domain input after wizard reset during {context}")
+        return False
+
+    try:
+        domain_input.clear()
+        domain_input.send_keys(domain)
+        logger.info(f"[{domain}] Re-entered domain after wizard reset: {input_selector}")
+        time.sleep(1)
+    except Exception as e:
+        logger.error(f"[{domain}] Failed to re-enter domain after wizard reset: {e}")
+        return False
+
+    if not _click_first_visible(
+        driver,
+        domain,
+        DOMAIN_USE_BUTTON_SELECTORS,
+        "Use this domain after wizard reset",
+        timeout=8,
+    ):
+        logger.error(f"[{domain}] Could not click Use this domain after wizard reset")
+        return False
+
+    time.sleep(6)
+    screenshot(driver, f"wizard_reset_reentered_{context.replace(' ', '_')}", domain)
+    _clear_admin_center_interrupts(driver, domain, f"after wizard reset re-entry in {context}", recover_errors=True)
+    return True
+
+
+def _select_own_dns_on_connect_page(driver, domain: str, max_attempts: int = 5) -> bool:
+    """Select "Add your own DNS records" and continue, retrying if Microsoft resets the wizard."""
+    for attempt in range(max_attempts):
+        logger.info(f"[{domain}] Connect-domain DNS selection attempt {attempt + 1}/{max_attempts}")
+        _clear_admin_center_interrupts(driver, domain, "connect domain DNS selection", recover_errors=True)
+        if _enter_domain_if_wizard_reset(driver, domain, "connect domain DNS selection"):
+            continue
+
+        page_text = _safe_page_text(driver).lower()
+        if _is_dns_records_page_text(page_text):
+            logger.info(f"[{domain}] Already on DNS records page before connect-domain selection")
+            return True
+        if not _is_connect_domain_page_text(page_text):
+            logger.warning(f"[{domain}] Not on connect-domain page during DNS selection attempt {attempt + 1}")
+            screenshot(driver, f"connect_dns_selection_unexpected_{attempt + 1}", domain)
+            time.sleep(3)
+            continue
+
+        logger.info(f"[{domain}] Step 7a: On 'Connect domain' page - clicking 'More options'")
+        more_clicked = _click_first_visible(
+            driver,
+            domain,
+            CONNECT_MORE_OPTIONS_SELECTORS,
+            "Connect page More options",
+            timeout=6,
+        )
+        if not more_clicked:
+            logger.warning(f"[{domain}] Could not click 'More options' - may already be expanded")
+
+        time.sleep(2)
+        screenshot(driver, f"09_more_options_expanded_{attempt + 1}", domain)
+        if _clear_admin_center_interrupts(driver, domain, "connect page More options", recover_errors=True):
+            time.sleep(2)
+        if _enter_domain_if_wizard_reset(driver, domain, "connect page More options"):
+            continue
+
+        logger.info(f"[{domain}] Step 7b: Selecting 'Add your own DNS records'")
+        dns_selected = _click_first_visible(
+            driver,
+            domain,
+            CONNECT_OWN_DNS_SELECTORS,
+            "Add your own DNS records option",
+            timeout=8,
+        )
+
+        if not dns_selected:
+            try:
+                dns_selected = bool(driver.execute_script(
+                    """
+                    const phrase = 'add your own dns records';
+                    const isVisible = (node) => {
+                      const style = window.getComputedStyle(node);
+                      const rect = node.getBoundingClientRect();
+                      return style.display !== 'none' &&
+                             style.visibility !== 'hidden' &&
+                             rect.width > 0 &&
+                             rect.height > 0;
+                    };
+                    const nodes = Array.from(document.querySelectorAll('input,label,button,[role="radio"],span,div'))
+                      .filter(node => isVisible(node) && ((node.innerText || node.textContent || node.value || '').toLowerCase()).includes(phrase));
+                    for (const node of nodes) {
+                      const clickable = node.closest('[role="radio"], label, button') || node;
+                      clickable.scrollIntoView({block: 'center'});
+                      clickable.click();
+                      return true;
+                    }
+                    return false;
+                    """
+                ))
+                if dns_selected:
+                    logger.info(f"[{domain}] Selected 'Add your own DNS records' via DOM fallback")
+            except Exception as e:
+                logger.warning(f"[{domain}] DOM fallback could not select 'Add your own DNS records': {e}")
+
+        time.sleep(1)
+        screenshot(driver, f"10_dns_option_selected_{attempt + 1}", domain)
+        if _clear_admin_center_interrupts(driver, domain, "connect page DNS option", recover_errors=True):
+            time.sleep(2)
+        if _enter_domain_if_wizard_reset(driver, domain, "connect page DNS option"):
+            continue
+
+        if not dns_selected:
+            logger.warning(f"[{domain}] Could not select 'Add your own DNS records'; retrying connect-domain page")
+            continue
+
+        logger.info(f"[{domain}] Step 7c: Clicking Continue")
+        continue_clicked = _click_first_visible(
+            driver,
+            domain,
+            CONNECT_CONTINUE_SELECTORS,
+            "Connect page Continue",
+            timeout=8,
+        )
+
+        if not continue_clicked:
+            try:
+                continue_clicked = bool(driver.execute_script(
+                    """
+                    const buttons = Array.from(document.querySelectorAll('button,input[type="submit"]'));
+                    const target = buttons.find(btn => ((btn.innerText || btn.value || '').toLowerCase()).includes('continue'));
+                    if (!target) return false;
+                    target.scrollIntoView({block: 'center'});
+                    target.click();
+                    return true;
+                    """
+                ))
+                if continue_clicked:
+                    logger.info(f"[{domain}] Clicked Continue via DOM fallback")
+            except Exception as e:
+                logger.warning(f"[{domain}] DOM fallback could not click Continue: {e}")
+
+        if not continue_clicked:
+            logger.warning(f"[{domain}] Could not click Continue on connect page; retrying")
+            continue
+
+        logger.info(f"[{domain}] Waiting for DNS records page after connect Continue...")
+        time.sleep(5)
+        if _clear_admin_center_interrupts(driver, domain, "after connect Continue", recover_errors=True):
+            time.sleep(2)
+        if _enter_domain_if_wizard_reset(driver, domain, "after connect Continue"):
+            continue
+
+        return True
+
+    logger.warning(
+        f"[{domain}] Manual own-DNS option did not survive Microsoft admin-center resets; "
+        "trying the visible Microsoft-managed connect flow through the UI"
+    )
+    _clear_admin_center_interrupts(driver, domain, "before Microsoft-managed connect fallback", recover_errors=True)
+    if _enter_domain_if_wizard_reset(driver, domain, "before Microsoft-managed connect fallback"):
+        return False
+
+    page_text = _safe_page_text(driver).lower()
+    if not _is_connect_domain_page_text(page_text):
+        return False
+
+    continue_clicked = _click_first_visible(
+        driver,
+        domain,
+        CONNECT_CONTINUE_SELECTORS,
+        "Microsoft-managed connect Continue",
+        timeout=8,
+    )
+    if not continue_clicked:
+        return False
+
+    time.sleep(8)
+    screenshot(driver, "10_microsoft_managed_connect_continue", domain)
+    _clear_admin_center_interrupts(driver, domain, "after Microsoft-managed connect Continue", recover_errors=True)
+    if _enter_domain_if_wizard_reset(driver, domain, "after Microsoft-managed connect Continue"):
+        return False
+
+    logger.info(f"[{domain}] Continued through Microsoft-managed connect UI; waiting for resulting wizard page")
+    return True
+
+
+def _run_async_blocking(coro):
+    """Run an async helper from the synchronous Selenium worker thread."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    result = {}
+    error = {}
+
+    def _runner():
+        try:
+            result["value"] = asyncio.run(coro)
+        except Exception as exc:
+            error["value"] = exc
+
+    worker = threading.Thread(target=_runner, daemon=True)
+    worker.start()
+    worker.join()
+    if "value" in error:
+        raise error["value"]
+    return result.get("value")
+
+
+def _read_dkim_config_for_fallback(admin_email: str, admin_password: str, domain: str) -> dict:
+    """
+    Read/create the Exchange Online DKIM signing config for a fallback DNS flow.
+
+    The admin-center DNS wizard normally displays these CNAME targets. When that
+    wizard crashes before the records page, Exchange is the source of truth.
+    """
+    from app.services.objective_reconciliation import (
+        _attach_dkim_selectors_from_error,
+        _read_dkim_truth,
+    )
+
+    domain_data = {
+        "name": domain,
+        "tenant": {
+            "admin_email": admin_email,
+            "admin_password": admin_password,
+        },
+    }
+
+    attempts = (
+        ("read", {"create": False, "enable": False}),
+        ("create", {"create": True, "enable": False}),
+        ("enable_probe", {"create": True, "enable": True}),
+    )
+    last_dkim = {}
+
+    for label, kwargs in attempts:
+        dkim = _attach_dkim_selectors_from_error(
+            _run_async_blocking(_read_dkim_truth(domain_data, **kwargs))
+        )
+        last_dkim = dkim
+        selector1 = (dkim.get("selector1") or "").rstrip(".")
+        selector2 = (dkim.get("selector2") or "").rstrip(".")
+        if selector1 and selector2:
+            dkim = dict(dkim)
+            dkim["selector1"] = selector1
+            dkim["selector2"] = selector2
+            logger.info(f"[{domain}] Fallback DKIM selectors resolved via Exchange {label}")
+            return dkim
+
+        logger.warning(
+            "[%s] Exchange DKIM %s did not return selectors "
+            "(success=%s exists=%s accepted_domain_exists=%s enabled=%s error=%s)",
+            domain,
+            label,
+            dkim.get("success"),
+            dkim.get("exists"),
+            dkim.get("accepted_domain_exists"),
+            dkim.get("enabled"),
+            dkim.get("error"),
+        )
+
+    return last_dkim
+
+
+def _enable_dkim_for_fallback(admin_email: str, admin_password: str, domain: str) -> tuple[bool, Optional[str]]:
+    from app.services.objective_reconciliation import (
+        _attach_dkim_selectors_from_error,
+        _read_dkim_truth,
+    )
+
+    domain_data = {
+        "name": domain,
+        "tenant": {
+            "admin_email": admin_email,
+            "admin_password": admin_password,
+        },
+    }
+    dkim = _attach_dkim_selectors_from_error(
+        _run_async_blocking(_read_dkim_truth(domain_data, create=True, enable=True))
+    )
+    enabled = bool(dkim.get("enabled") or dkim.get("ok"))
+    return enabled, dkim.get("error")
+
+
+def _configure_m365_dns_without_admin_center(
+    domain: str,
+    zone_id: str,
+    admin_email: str,
+    admin_password: str,
+    reason: str,
+    result: dict,
+) -> bool:
+    """
+    Fallback when the admin-center wizard keeps crashing/resetting.
+
+    Microsoft's required MX/SPF/autodiscover values are deterministic. DKIM
+    selectors come from Exchange Online, so use PowerShell for those instead of
+    scraping a broken admin-center page.
+    """
+    logger.warning(f"[{domain}] Falling back to direct M365 DNS configuration: {reason}")
+
+    try:
+        from app.services.cloudflare_sync import (
+            add_mx,
+            add_spf,
+            add_cname,
+            cleanup_before_dns_setup,
+        )
+    except Exception as e:
+        logger.error(f"[{domain}] Could not import Cloudflare DNS helpers for fallback: {e}")
+        result["error"] = f"Fallback DNS helper import failed: {e}"
+        return False
+
+    mx_target = f"{domain.replace('.', '-')}.mail.protection.outlook.com"
+    spf_value = "v=spf1 include:spf.protection.outlook.com -all"
+
+    cleanup_before_dns_setup(zone_id)
+    mx_ok = bool(add_mx(zone_id, mx_target, 0))
+    spf_ok = bool(add_spf(zone_id, spf_value))
+    autodiscover_ok = bool(add_cname(zone_id, "autodiscover", "autodiscover.outlook.com"))
+
+    result["mx_value"] = mx_target
+    result["spf_value"] = spf_value
+
+    dkim_ok = False
+    selector1 = None
+    selector2 = None
+    try:
+        dkim = _read_dkim_config_for_fallback(admin_email, admin_password, domain)
+        selector1 = (dkim.get("selector1") or "").rstrip(".")
+        selector2 = (dkim.get("selector2") or "").rstrip(".")
+        if selector1 and selector2:
+            logger.info(f"[{domain}] Fallback DKIM selector1: {selector1}")
+            logger.info(f"[{domain}] Fallback DKIM selector2: {selector2}")
+            dkim1_ok = bool(add_cname(zone_id, "selector1._domainkey", selector1))
+            dkim2_ok = bool(add_cname(zone_id, "selector2._domainkey", selector2))
+            dkim_ok = dkim1_ok and dkim2_ok
+            if dkim_ok:
+                result["dkim_selector1_cname"] = selector1
+                result["dkim_selector2_cname"] = selector2
+        else:
+            logger.error(f"[{domain}] Exchange did not return DKIM selectors during fallback: {dkim.get('error')}")
+    except Exception as e:
+        logger.error(f"[{domain}] Fallback DKIM selector lookup failed: {e}")
+
+    enable_ok = False
+    if dkim_ok:
+        for enable_attempt in range(3):
+            try:
+                if enable_attempt:
+                    logger.info(f"[{domain}] Waiting before fallback DKIM enable retry {enable_attempt + 1}/3")
+                    time.sleep(45)
+                enable_ok, enable_error = _enable_dkim_for_fallback(admin_email, admin_password, domain)
+                if enable_ok:
+                    logger.info(f"[{domain}] Fallback DKIM enabled")
+                    break
+                logger.warning(f"[{domain}] Fallback DKIM enable failed: {enable_error}")
+            except Exception as e:
+                logger.warning(f"[{domain}] Fallback DKIM enable attempt failed: {e}")
+
+    result["verified"] = True
+    result["dns_configured"] = bool(mx_ok and spf_ok and autodiscover_ok and dkim_ok)
+    result["success"] = bool(result["dns_configured"] and enable_ok)
+
+    if result["success"]:
+        result["error"] = None
+        logger.info(f"[{domain}] Fallback M365 DNS configuration completed successfully")
+        return True
+
+    missing = []
+    if not mx_ok:
+        missing.append("MX")
+    if not spf_ok:
+        missing.append("SPF")
+    if not autodiscover_ok:
+        missing.append("autodiscover")
+    if not dkim_ok:
+        missing.append("DKIM selectors")
+    if dkim_ok and not enable_ok:
+        missing.append("DKIM enable")
+    result["error"] = f"Fallback DNS configuration incomplete: {', '.join(missing)}"
+    logger.error(f"[{domain}] {result['error']}")
+    return False
+
+
+def _run_or_defer_direct_dns_fallback(
+    domain: str,
+    zone_id: str,
+    admin_email: str,
+    admin_password: str,
+    reason: str,
+    result: dict,
+    allow_direct_dns_fallback: bool,
+) -> bool:
+    result["error"] = (
+        f"Selenium DNS flow did not reach the Microsoft DNS records page ({reason}); "
+        "retrying the browser flow instead of using direct DNS fallback"
+    )
+    logger.warning(f"[{domain}] {result['error']}")
+    return False
+
+
+def _feedback_prompt_present(driver) -> bool:
+    page_text = _safe_page_text(driver).lower()
+    return any(marker in page_text for marker in FEEDBACK_PROMPT_TEXT_MARKERS)
+
+
+def _dismiss_microsoft_feedback_prompt(
+    driver,
+    domain: str = "unknown",
+    context: str = "admin center interaction",
+    max_attempts: int = 3,
+) -> bool:
+    """
+    Close Microsoft 365 Admin Center's feedback side panel.
+
+    The panel can appear after an admin-center client error and blocks the
+    underlying DNS/DKIM wizard. If left open, Selenium reads the feedback form
+    instead of the DNS records page and all DNS value extraction fails.
+    """
+    dismissed = False
+
+    try:
+        driver.implicitly_wait(1)
+    except Exception:
+        pass
+
+    try:
+        for attempt in range(max_attempts):
+            if not _feedback_prompt_present(driver):
+                return dismissed
+
+            logger.warning(
+                f"[{domain}] Microsoft feedback prompt detected during {context}; dismissing it"
+            )
+            screenshot(driver, f"feedback_prompt_{context.replace(' ', '_')}_{attempt + 1}", domain)
+
+            if _click_first_visible(
+                driver,
+                domain,
+                FEEDBACK_DISMISS_SELECTORS,
+                "Microsoft feedback prompt dismiss",
+                timeout=2,
+            ):
+                dismissed = True
+                time.sleep(1)
+                if not _feedback_prompt_present(driver):
+                    return True
+
+            try:
+                clicked = bool(driver.execute_script(
+                    """
+                    const bodyText = (document.body && document.body.innerText || '').toLowerCase();
+                    if (!bodyText.includes('submit feedback to microsoft') &&
+                        !bodyText.includes('rate your experience with the admin center')) {
+                      return false;
+                    }
+
+                    const isVisible = (node) => {
+                      const style = window.getComputedStyle(node);
+                      const rect = node.getBoundingClientRect();
+                      return style.display !== 'none' &&
+                             style.visibility !== 'hidden' &&
+                             rect.width > 0 &&
+                             rect.height > 0;
+                    };
+
+                    const containers = Array.from(document.querySelectorAll(
+                      '[role="dialog"], .ms-Panel, .ms-Panel-main, div'
+                    )).filter((node) => {
+                      const text = (node.innerText || node.textContent || '').toLowerCase();
+                      return isVisible(node) &&
+                             (text.includes('submit feedback to microsoft') ||
+                              text.includes('rate your experience with the admin center'));
+                    });
+
+                    for (const container of containers) {
+                      const controls = Array.from(container.querySelectorAll('button,[role="button"],a'));
+                      const target = controls.find((node) => {
+                        if (!isVisible(node)) return false;
+                        const label = (
+                          node.getAttribute('aria-label') ||
+                          node.getAttribute('title') ||
+                          node.innerText ||
+                          node.textContent ||
+                          ''
+                        ).trim().toLowerCase();
+                        return label.includes('close') || label === 'cancel';
+                      });
+                      if (target) {
+                        target.click();
+                        return true;
+                      }
+                    }
+                    return false;
+                    """
+                ))
+                if clicked:
+                    dismissed = True
+                    logger.info(f"[{domain}] Dismissed Microsoft feedback prompt via DOM fallback")
+                    time.sleep(1)
+                    if not _feedback_prompt_present(driver):
+                        return True
+            except Exception as e:
+                logger.debug(f"[{domain}] Feedback prompt DOM dismiss failed: {e}")
+
+            try:
+                ActionChains(driver).send_keys(Keys.ESCAPE).perform()
+                dismissed = True
+                logger.info(f"[{domain}] Sent Escape to dismiss Microsoft feedback prompt")
+                time.sleep(1)
+                if not _feedback_prompt_present(driver):
+                    return True
+            except Exception as e:
+                logger.debug(f"[{domain}] Escape did not dismiss feedback prompt: {e}")
+
+        if _feedback_prompt_present(driver):
+            logger.warning(f"[{domain}] Microsoft feedback prompt is still visible after dismiss attempts")
+
+        return dismissed
+    finally:
+        try:
+            driver.implicitly_wait(15)
+        except Exception:
+            pass
+
+
+def _admin_center_error_reason(driver) -> Optional[str]:
+    page_text = _safe_page_text(driver).lower()
+    if not page_text:
+        return None
+
+    has_error = any(marker in page_text for marker in ADMIN_CENTER_ERROR_MARKERS)
+    if not has_error:
+        return None
+
+    if "something went wrong" in page_text:
+        return "Microsoft admin center shows 'Something went wrong'"
+    if "try refreshing the page" in page_text:
+        return "Microsoft admin center asks to refresh the page"
+    if "error code" in page_text:
+        return "Microsoft admin center shows an error code"
+    return "Microsoft admin center error page"
+
+
+def _recover_from_admin_center_error(driver, domain: str, context: str) -> bool:
+    """Recover from transient Microsoft admin-center error pages."""
+    _dismiss_microsoft_feedback_prompt(driver, domain, context)
+    reason = _admin_center_error_reason(driver)
+    if not reason:
+        return False
+
+    logger.warning(f"[{domain}] {reason} during {context}; attempting recovery")
+    screenshot(driver, f"admin_center_error_{context.replace(' ', '_')}", domain)
+
+    if _click_first_visible(
+        driver,
+        domain,
+        ADMIN_CENTER_RETRY_SELECTORS,
+        "admin center Try again",
+        timeout=2,
+    ):
+        time.sleep(8)
+        _dismiss_microsoft_feedback_prompt(driver, domain, f"after Try again in {context}")
+        return True
+
+    try:
+        driver.refresh()
+        wait_for_page_load(driver, timeout=30)
+        time.sleep(8)
+        logger.info(f"[{domain}] Refreshed admin center page during {context}")
+        _dismiss_microsoft_feedback_prompt(driver, domain, f"after refresh in {context}")
+        return True
+    except Exception as e:
+        logger.warning(f"[{domain}] Admin center error-page refresh failed during {context}: {e}")
+        return False
+
+
+def _clear_admin_center_interrupts(driver, domain: str, context: str, recover_errors: bool = False) -> bool:
+    changed = _dismiss_microsoft_feedback_prompt(driver, domain, context)
+    if recover_errors:
+        changed = _recover_from_admin_center_error(driver, domain, context) or changed
+    return changed
 
 
 def _submit_visible_totp_code(driver, domain: str, totp_secret: Optional[str], context: str, timeout: int = 3) -> bool:
@@ -911,6 +1593,7 @@ def setup_domain_with_retry(
                 admin_password=admin_password,
                 totp_secret=totp_secret,
                 headless=headless,
+                allow_direct_dns_fallback=False,
             )
             
             if result.get("success"):
@@ -1229,7 +1912,16 @@ def _login_with_mfa(driver, admin_email: str, admin_password: str, totp_secret: 
     _handle_visible_mfa_challenge(driver, domain, totp_secret, "post-login")
 
 
-def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_password, totp_secret=None, cloudflare_service=None, headless=False):
+def setup_domain_complete_via_admin_portal(
+    domain,
+    zone_id,
+    admin_email,
+    admin_password,
+    totp_secret=None,
+    cloudflare_service=None,
+    headless=False,
+    allow_direct_dns_fallback=False,
+):
     """Complete M365 domain setup following EXACT wizard flow.
     
     IMPORTANT: Each step has individual error handling for better resilience.
@@ -1316,6 +2008,7 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     )
     
     screenshot(driver, "01_login", domain)
+    _clear_admin_center_interrupts(driver, domain, "after login", recover_errors=True)
     update_status_file(domain, "login", "complete", "Successfully logged in")
     time.sleep(5)  # Extra wait after login
     
@@ -1324,12 +2017,14 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     _navigate_to_domains_page(driver, domain, totp_secret)
     
     screenshot(driver, "02_domains", domain)
+    _clear_admin_center_interrupts(driver, domain, "domains page", recover_errors=True)
     
     # ===== STEP 3: ADD DOMAIN =====
     logger.info(f"[{domain}] Step 3: Add domain")
     try:
         if _handle_visible_mfa_challenge(driver, domain, totp_secret, "before Add domain"):
             _navigate_to_domains_page(driver, domain, totp_secret)
+        _clear_admin_center_interrupts(driver, domain, "before Add domain", recover_errors=True)
         add_btn = WebDriverWait(driver, 10).until(
             EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'Add domain')]"))
         )
@@ -1342,6 +2037,7 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
         driver.get("https://admin.cloud.microsoft/#/Domains/Wizard")
         wait_for_page_load(driver, timeout=30)
         time.sleep(3)
+        _clear_admin_center_interrupts(driver, domain, "domain wizard navigation", recover_errors=True)
         if _handle_visible_mfa_challenge(driver, domain, totp_secret, "after domain wizard navigation"):
             driver.get("https://admin.cloud.microsoft/#/Domains/Wizard")
             wait_for_page_load(driver, timeout=30)
@@ -1355,6 +2051,7 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
             driver.get("https://admin.cloud.microsoft/#/Domains/Wizard")
             wait_for_page_load(driver, timeout=30)
             time.sleep(5)
+        _clear_admin_center_interrupts(driver, domain, "before domain entry", recover_errors=True)
         
         domain_input = WebDriverWait(driver, 15).until(
             EC.presence_of_element_located((By.XPATH, "//input[@type='text']"))
@@ -1388,9 +2085,12 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     
     # Take screenshot FIRST to see what we're dealing with
     screenshot(driver, "04_after_domain_entry", domain)
+    _clear_admin_center_interrupts(driver, domain, "after domain entry", recover_errors=True)
     
     # Wait for page to fully load - check for any loading indicators
     page_text = wait_for_page_settle(driver, domain, max_wait=10)
+    _clear_admin_center_interrupts(driver, domain, "after domain entry settle", recover_errors=True)
+    page_text = _safe_page_text(driver).lower() or page_text
     
     # Log extensive page state info for debugging
     logger.info(f"[{domain}] Page text length: {len(page_text)}")
@@ -1418,11 +2118,11 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     # ===== CHECK IF ALREADY VERIFIED =====
     
     # If domain already verified, will go straight to connect page
-    if "how do you want to connect" in page_text:
+    if _is_connect_domain_page_text(page_text):
         logger.info(f"[{domain}] Domain already verified - skipping verification")
         result["verified"] = True
         # Will continue to Step 7 (connect page handling)
-    elif "add dns records" in page_text:
+    elif _is_dns_records_page_text(page_text):
         logger.info(f"[{domain}] Domain already verified and connected - on DNS page")
         result["verified"] = True
         # Will continue to Step 8 (DNS records page)
@@ -1434,7 +2134,8 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
         # Continue to end of function for proper cleanup
     
     # ===== STEP 5: VERIFICATION PAGE =====
-    page_text = driver.find_element(By.TAG_NAME, "body").text.lower()
+    _clear_admin_center_interrupts(driver, domain, "before verification-page check", recover_errors=True)
+    page_text = _safe_page_text(driver).lower()
     
     if "verify" in page_text and "own" in page_text:
         logger.info(f"[{domain}] Step 5: On verification page")
@@ -1446,6 +2147,7 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
         click_element(driver, "//a[contains(text(), 'More options')] | //span[contains(text(), 'More options')] | //*[contains(text(), 'More options')]", "More options link")
         time.sleep(2)
         screenshot(driver, "05_more_options_clicked", domain)
+        _clear_admin_center_interrupts(driver, domain, "after verification More options", recover_errors=True)
         
         # 5b: Select "Add a TXT record" RADIO BUTTON
         logger.info(f"[{domain}] Step 5b: Selecting TXT record option")
@@ -1463,16 +2165,18 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
                 break
         time.sleep(1)
         screenshot(driver, "06_txt_selected", domain)
+        _clear_admin_center_interrupts(driver, domain, "after TXT option selection", recover_errors=True)
         
         # 5c: Click Continue
         logger.info(f"[{domain}] Step 5c: Clicking Continue")
         click_element(driver, "//button[contains(., 'Continue')]", "Continue button")
         time.sleep(3)
         screenshot(driver, "07_txt_value_page", domain)
+        _clear_admin_center_interrupts(driver, domain, "TXT value page", recover_errors=True)
         
         # ===== STEP 6: TXT VALUE PAGE =====
         logger.info(f"[{domain}] Step 6: Extract TXT value")
-        page_text = driver.find_element(By.TAG_NAME, "body").text
+        page_text = _safe_page_text(driver)
         txt_match = re.search(r'MS=ms\d+', page_text)
         
         if not txt_match:
@@ -1603,8 +2307,9 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
             verification_done = False
             for wait_sec in range(90):
                 time.sleep(1)
+                _clear_admin_center_interrupts(driver, domain, "domain verification wait", recover_errors=True)
                 try:
-                    page_text = driver.find_element(By.TAG_NAME, "body").text.lower()
+                    page_text = _safe_page_text(driver).lower()
                 except:
                     continue
                 
@@ -1621,12 +2326,11 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
             if not verification_done:
                 logger.warning(f"[{domain}] Verification spinner still showing after 90s")
                 # Get page text anyway
-                try:
-                    page_text = driver.find_element(By.TAG_NAME, "body").text.lower()
-                except:
-                    page_text = ""
+                page_text = _safe_page_text(driver).lower()
             
             screenshot(driver, f"09_after_verify_{verify_attempt}", domain)
+            _clear_admin_center_interrupts(driver, domain, "after verification result", recover_errors=True)
+            page_text = _safe_page_text(driver).lower()
             logger.info(f"[{domain}] Post-verify page text (first 500 chars): {page_text[:500]}")
             
             # ===== CHECK FOR POSITIVE SUCCESS INDICATORS =====
@@ -1698,17 +2402,21 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     connect_page_found = False
     for attempt in range(15):  # 15 attempts x 2 seconds = 30 seconds
         time.sleep(2)
-        page_text = driver.find_element(By.TAG_NAME, "body").text.lower()
+        _clear_admin_center_interrupts(driver, domain, "connect page wait", recover_errors=True)
+        page_text = _safe_page_text(driver).lower()
         screenshot(driver, f"07_waiting_connect_{attempt}", domain)
         
-        if "how do you want to connect" in page_text:
+        if _is_connect_domain_page_text(page_text):
             connect_page_found = True
             logger.info(f"[{domain}] Found 'Connect domain' page after {(attempt+1)*2} seconds")
             break
-        elif "add dns records" in page_text:
+        elif _is_dns_records_page_text(page_text):
             # Already past connect page - that's fine
             logger.info(f"[{domain}] Already on DNS records page")
             break
+        elif _enter_domain_if_wizard_reset(driver, domain, "connect page wait"):
+            logger.info(f"[{domain}] Re-entered domain after wizard reset while waiting for connect page")
+            continue
         elif "domain setup is complete" in page_text:
             # Already complete!
             logger.info(f"[{domain}] Domain already complete!")
@@ -1722,128 +2430,53 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     
     # Take screenshot of current state
     screenshot(driver, "08_connect_page", domain)
-    page_text = driver.find_element(By.TAG_NAME, "body").text.lower()
+    _clear_admin_center_interrupts(driver, domain, "connect page", recover_errors=True)
+    page_text = _safe_page_text(driver).lower()
     
     # Handle "How do you want to connect your domain" page
-    if "how do you want to connect" in page_text:
-        logger.info(f"[{domain}] Step 7a: On 'Connect domain' page - clicking 'More options'")
-        
-        # Click "More options" link
-        more_clicked = _click_first_visible(
-            driver,
-            domain,
-            CONNECT_MORE_OPTIONS_SELECTORS,
-            "Connect page More options",
-            timeout=6,
-        )
-        
-        if not more_clicked:
-            logger.warning(f"[{domain}] Could not click 'More options' - may already be expanded")
-        
-        time.sleep(2)
-        screenshot(driver, "09_more_options_expanded", domain)
-        
-        # Select "Add your own DNS records" radio button
-        logger.info(f"[{domain}] Step 7b: Selecting 'Add your own DNS records'")
-        dns_selected = _click_first_visible(
-            driver,
-            domain,
-            CONNECT_OWN_DNS_SELECTORS,
-            "Add your own DNS records option",
-            timeout=8,
-        )
-
-        if not dns_selected:
-            try:
-                dns_selected = bool(driver.execute_script(
-                    """
-                    const phrase = 'add your own dns records';
-                    const nodes = Array.from(document.querySelectorAll('input,label,button,[role="radio"],span,div'))
-                      .filter(node => ((node.innerText || node.textContent || node.value || '').toLowerCase()).includes(phrase));
-                    for (const node of nodes) {
-                      const clickable = node.closest('[role="radio"], label, button') || node;
-                      clickable.scrollIntoView({block: 'center'});
-                      clickable.click();
-                      return true;
-                    }
-                    return false;
-                    """
-                ))
-                if dns_selected:
-                    logger.info(f"[{domain}] Selected 'Add your own DNS records' via DOM fallback")
-            except Exception as e:
-                logger.warning(f"[{domain}] DOM fallback could not select 'Add your own DNS records': {e}")
-        
-        if not dns_selected:
-            logger.warning(f"[{domain}] Could not select 'Add your own DNS records'")
-        
-        time.sleep(1)
-        screenshot(driver, "10_dns_option_selected", domain)
-        
-        # Click Continue
-        logger.info(f"[{domain}] Step 7c: Clicking Continue")
-        continue_clicked = _click_first_visible(
-            driver,
-            domain,
-            CONNECT_CONTINUE_SELECTORS,
-            "Connect page Continue",
-            timeout=8,
-        )
-
-        if not continue_clicked:
-            try:
-                continue_clicked = bool(driver.execute_script(
-                    """
-                    const buttons = Array.from(document.querySelectorAll('button,input[type="submit"]'));
-                    const target = buttons.find(btn => ((btn.innerText || btn.value || '').toLowerCase()).includes('continue'));
-                    if (!target) return false;
-                    target.scrollIntoView({block: 'center'});
-                    target.click();
-                    return true;
-                    """
-                ))
-                if continue_clicked:
-                    logger.info(f"[{domain}] Clicked Continue via DOM fallback")
-            except Exception as e:
-                logger.warning(f"[{domain}] DOM fallback could not click Continue: {e}")
-        
-        if not continue_clicked:
-            logger.error(f"[{domain}] Could not click Continue on connect page!")
-            result["error"] = "Could not click Continue on connect page"
+    if _is_connect_domain_page_text(page_text):
+        if not _select_own_dns_on_connect_page(driver, domain):
+            logger.error(f"[{domain}] Could not select own DNS flow on connect page")
+            if _run_or_defer_direct_dns_fallback(
+                domain,
+                zone_id,
+                admin_email,
+                admin_password,
+                "connect-domain own-DNS selection failed",
+                result,
+                allow_direct_dns_fallback,
+            ):
+                _cleanup_driver(driver)
+                _clear_active_driver(driver)
+                return result
+            result["error"] = result.get("error") or "Could not select own DNS flow on connect page"
             logger.error(f"[{domain}] FAILED - cleaning up browser")
             _cleanup_driver(driver)
             _clear_active_driver(driver)
             return result
-        
-        # Wait for DNS records page to load
-        logger.info(f"[{domain}] Waiting for DNS records page...")
-        time.sleep(5)
     
     # ===== STEP 8: WAIT FOR DNS RECORDS PAGE =====
     logger.info(f"[{domain}] Step 8: Waiting for DNS records page to load...")
-    
-    # DNS page indicators - check for any of these
-    dns_indicators = [
-        "add dns records",
-        "mx records", 
-        "exchange and exchange online",
-        "dns hosting provider",
-        "cname records",
-        "txt records",
-        "mail protection",
-        "exchange online",
-        "points to address"
-    ]
     
     # Wait up to 30 seconds for DNS records page
     dns_page_found = False
     for attempt in range(15):
         time.sleep(2)
-        page_text = driver.find_element(By.TAG_NAME, "body").text.lower()
+        if _clear_admin_center_interrupts(driver, domain, "DNS records page wait", recover_errors=True):
+            time.sleep(2)
+        if _enter_domain_if_wizard_reset(driver, domain, "DNS records page wait"):
+            continue
+        page_text = _safe_page_text(driver).lower()
         screenshot(driver, f"08_dns_page_wait_{attempt}", domain)
         
-        # Check if any DNS indicator is present
-        if any(indicator in page_text for indicator in dns_indicators):
+        if _is_connect_domain_page_text(page_text):
+            logger.warning(f"[{domain}] Landed back on connect-domain page while waiting for DNS records; retrying own DNS selection")
+            _select_own_dns_on_connect_page(driver, domain)
+            continue
+
+        # Check if the real DNS records page is present. The connect page also
+        # contains the words "DNS records", so avoid loose substring matches.
+        if _is_dns_records_page_text(page_text):
             dns_page_found = True
             logger.info(f"[{domain}] Found DNS records page after {(attempt+1)*2} seconds")
             break
@@ -1857,12 +2490,39 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
         else:
             logger.info(f"[{domain}] Waiting for DNS page... attempt {attempt+1}/15")
     
+    if not dns_page_found and result["success"] and result["dns_configured"]:
+        logger.info(f"[{domain}] Setup already complete before DNS-record extraction")
+        _cleanup_driver(driver)
+        _clear_active_driver(driver)
+        return result
+
     if not dns_page_found:
-        # Take screenshot and continue anyway - maybe we can still find DNS values
-        logger.warning(f"[{domain}] DNS page not detected, but continuing anyway...")
+        logger.error(f"[{domain}] DNS page not detected; refusing to extract DNS from the wrong wizard page")
         screenshot(driver, "warning_dns_page_not_detected", domain)
+        if _run_or_defer_direct_dns_fallback(
+            domain,
+            zone_id,
+            admin_email,
+            admin_password,
+            "DNS records page did not load",
+            result,
+            allow_direct_dns_fallback,
+        ):
+            _cleanup_driver(driver)
+            _clear_active_driver(driver)
+            return result
+        result["error"] = result.get("error") or "DNS records page did not load"
+        _cleanup_driver(driver)
+        _clear_active_driver(driver)
+        return result
     
     screenshot(driver, "09_dns_records_page", domain)
+    _clear_admin_center_interrupts(driver, domain, "DNS records page", recover_errors=True)
+    if _enter_domain_if_wizard_reset(driver, domain, "DNS records page"):
+        result["error"] = "DNS records page reset to Add domain form"
+        _cleanup_driver(driver)
+        _clear_active_driver(driver)
+        return result
     update_status_file(domain, "dns_setup", "in_progress", "Configuring DNS records")
     logger.info(f"[{domain}] Step 8: Now on DNS records page - expanding all sections")
     
@@ -1881,6 +2541,7 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     ]
     
     for section_name, aria_label in sections_to_expand:
+        _clear_admin_center_interrupts(driver, domain, f"before expanding {section_name}", recover_errors=True)
         logger.info(f"[{domain}] Expanding {section_name} section...")
         try:
             # Find button by aria-label (contains to handle special chars)
@@ -1894,6 +2555,7 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
             logger.warning(f"[{domain}] Could not expand {section_name}: {e}")
     
     screenshot(driver, "10_sections_expanded", domain)
+    _clear_admin_center_interrupts(driver, domain, "after expanding DNS sections", recover_errors=True)
     
     # ===== STEP 8b: EXPAND ADVANCED OPTIONS =====
     logger.info(f"[{domain}] Step 8b: Expanding Advanced options")
@@ -1912,6 +2574,7 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
         logger.warning(f"[{domain}] Could not expand Advanced options: {e}")
     
     screenshot(driver, "11_advanced_expanded", domain)
+    _clear_admin_center_interrupts(driver, domain, "after Advanced options", recover_errors=True)
     
     # ===== STEP 8c: CHECK DKIM CHECKBOX =====
     logger.info(f"[{domain}] Step 8c: Checking DKIM checkbox")
@@ -1935,6 +2598,7 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
             logger.warning(f"[{domain}] Could not check DKIM: {e}")
     
     screenshot(driver, "12_dkim_checked", domain)
+    _clear_admin_center_interrupts(driver, domain, "after DKIM checkbox", recover_errors=True)
     
     # ===== STEP 8d: EXPAND DKIM CNAME RECORDS (appears after checking DKIM) =====
     logger.info(f"[{domain}] Step 8d: Expanding DKIM CNAME Records")
@@ -1952,6 +2616,7 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
         logger.warning(f"[{domain}] Could not expand DKIM CNAME: {e}")
     
     screenshot(driver, "13_all_expanded", domain)
+    _clear_admin_center_interrupts(driver, domain, "after expanding DKIM CNAME", recover_errors=True)
     
     # ===== STEP 8e: EXTRACT DNS VALUES =====
     logger.info(f"[{domain}] Step 8e: Extracting DNS values")
@@ -1964,8 +2629,28 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     driver.execute_script("window.scrollTo(0, 0);")
     time.sleep(0.5)
     
-    page_text = driver.find_element(By.TAG_NAME, "body").text
+    _clear_admin_center_interrupts(driver, domain, "before DNS value extraction", recover_errors=True)
+    page_text = _safe_page_text(driver)
     logger.info(f"[{domain}] Page text length: {len(page_text)}")
+    if not _is_dns_records_page_text(page_text):
+        logger.error(f"[{domain}] Current page is not the DNS records page; aborting DNS extraction")
+        screenshot(driver, "error_not_dns_records_page", domain)
+        if _run_or_defer_direct_dns_fallback(
+            domain,
+            zone_id,
+            admin_email,
+            admin_password,
+            "DNS extraction attempted on wrong page",
+            result,
+            allow_direct_dns_fallback,
+        ):
+            _cleanup_driver(driver)
+            _clear_active_driver(driver)
+            return result
+        result["error"] = result.get("error") or "DNS extraction attempted on wrong page"
+        _cleanup_driver(driver)
+        _clear_active_driver(driver)
+        return result
     
     # Extract MX and SPF values
     mx_match = re.search(r'([a-zA-Z0-9-]+\.mail\.protection\.outlook\.com)', page_text)
@@ -2000,6 +2685,21 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
         logger.info(f"[{domain}] DKIM selector2 target: {sel2_match.group(1)}")
     else:
         logger.warning(f"[{domain}] DKIM selector2 NOT FOUND")
+
+    if not (mx_match and spf_match and sel1_match and sel2_match):
+        logger.warning(f"[{domain}] DNS values are incomplete on the admin-center page; retrying Selenium flow")
+        _run_or_defer_direct_dns_fallback(
+            domain,
+            zone_id,
+            admin_email,
+            admin_password,
+            "admin-center DNS page did not expose all required values",
+            result,
+            allow_direct_dns_fallback,
+        )
+        _cleanup_driver(driver)
+        _clear_active_driver(driver)
+        return result
     
     # ===== STEP 8i: ADD ALL RECORDS TO CLOUDFLARE =====
     logger.info(f"[{domain}] Step 8i: Cleaning up conflicting DNS records before adding M365 records")
@@ -2073,6 +2773,7 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     
     for attempt in range(MAX_CONTINUE_ATTEMPTS):
         logger.info(f"[{domain}] Continue attempt {attempt + 1}/{MAX_CONTINUE_ATTEMPTS}")
+        _clear_admin_center_interrupts(driver, domain, "before final Continue", recover_errors=True)
         
         try:
             # Scroll to bottom where Continue button is
@@ -2119,8 +2820,9 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
         # Wait for page to process (45 seconds for DNS verification)
         time.sleep(45)
         screenshot(driver, f"15_after_continue_{attempt}", domain)
+        _clear_admin_center_interrupts(driver, domain, "after final Continue", recover_errors=True)
         
-        page_text = driver.find_element(By.TAG_NAME, "body").text.lower()
+        page_text = _safe_page_text(driver).lower()
         
         # Check if we're done
         if "complete" in page_text or "domain setup is complete" in page_text:
@@ -2152,7 +2854,8 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     
     # ===== STEP 10: CLICK DONE =====
     screenshot(driver, "15_final", domain)
-    page_text = driver.find_element(By.TAG_NAME, "body").text.lower()
+    _clear_admin_center_interrupts(driver, domain, "final setup result", recover_errors=True)
+    page_text = _safe_page_text(driver).lower()
     
     if "complete" in page_text or "domain setup is complete" in page_text:
         logger.info(f"[{domain}] Clicking Done button")
