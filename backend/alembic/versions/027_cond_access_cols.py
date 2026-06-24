@@ -9,8 +9,8 @@ report when the Microsoft-managed MFA Conditional Access policies have been
 disabled (the alternative path to "disable Security Defaults" for tenants
 where Microsoft hides the SD link entirely).
 
-Uses op.add_column (NOT "ADD COLUMN IF NOT EXISTS") so type/drift errors on
-Neon surface loudly instead of silently no-opping.
+Uses ADD COLUMN IF NOT EXISTS so the stale-revision recovery path can safely
+replay this migration against databases where the columns already exist.
 
 NOTE: Revision id is intentionally kept ≤ 32 chars because Alembic's default
 ``alembic_version.version_num`` column is ``VARCHAR(32)``. A previous version
@@ -22,7 +22,6 @@ when Alembic tried to record the new head. Do NOT rename this id back.
 from typing import Sequence, Union
 
 from alembic import op
-import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
@@ -33,39 +32,29 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.add_column(
-        "tenants",
-        sa.Column(
-            "conditional_access_disabled",
-            sa.Boolean(),
-            server_default=sa.text("false"),
-            nullable=False,
-        ),
+    op.execute(
+        """
+        ALTER TABLE tenants
+        ADD COLUMN IF NOT EXISTS conditional_access_disabled BOOLEAN NOT NULL DEFAULT FALSE;
+        """
     )
-    op.add_column(
-        "tenants",
-        sa.Column(
-            "conditional_access_disabled_at",
-            sa.DateTime(timezone=True),
-            nullable=True,
-        ),
+    op.execute(
+        """
+        ALTER TABLE tenants
+        ADD COLUMN IF NOT EXISTS conditional_access_disabled_at TIMESTAMP WITH TIME ZONE;
+        """
     )
-    op.add_column(
-        "tenants",
-        sa.Column(
-            "conditional_access_error",
-            sa.Text(),
-            nullable=True,
-        ),
+    op.execute(
+        """
+        ALTER TABLE tenants
+        ADD COLUMN IF NOT EXISTS conditional_access_error TEXT;
+        """
     )
-    op.add_column(
-        "tenants",
-        sa.Column(
-            "conditional_access_policies_disabled_count",
-            sa.Integer(),
-            server_default=sa.text("0"),
-            nullable=False,
-        ),
+    op.execute(
+        """
+        ALTER TABLE tenants
+        ADD COLUMN IF NOT EXISTS conditional_access_policies_disabled_count INTEGER NOT NULL DEFAULT 0;
+        """
     )
 
 

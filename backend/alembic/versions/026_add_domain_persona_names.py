@@ -9,13 +9,12 @@ domain can carry its own persona (for multi-client batches). Batch-level
 persona_first_name / persona_last_name on setup_batches remain the fallback
 default when the per-domain values are NULL.
 
-Uses op.add_column (NOT "ADD COLUMN IF NOT EXISTS") so type/drift errors on
-Neon surface loudly instead of silently no-opping.
+Uses ADD COLUMN IF NOT EXISTS so the stale-revision recovery path can safely
+replay this migration against databases where the columns already exist.
 """
 from typing import Sequence, Union
 
 from alembic import op
-import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
@@ -26,14 +25,8 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.add_column(
-        "domains",
-        sa.Column("persona_first_name", sa.String(100), server_default=None, nullable=True),
-    )
-    op.add_column(
-        "domains",
-        sa.Column("persona_last_name", sa.String(100), server_default=None, nullable=True),
-    )
+    op.execute("ALTER TABLE domains ADD COLUMN IF NOT EXISTS persona_first_name VARCHAR(100);")
+    op.execute("ALTER TABLE domains ADD COLUMN IF NOT EXISTS persona_last_name VARCHAR(100);")
 
 
 def downgrade() -> None:
