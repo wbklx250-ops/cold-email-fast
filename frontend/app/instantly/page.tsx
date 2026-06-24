@@ -3,6 +3,7 @@
 import React, { useState, useEffect } from "react";
 import Step8SequencerUpload from "@/components/wizard/Step8SequencerUpload";
 import CsvSequencerUpload from "@/components/wizard/CsvSequencerUpload";
+import DomainMailboxExport from "@/components/mailboxes/DomainMailboxExport";
 
 interface Batch {
   id: string;
@@ -144,8 +145,11 @@ export default function SequencerUploaderPage() {
 
         {/* CSV Mode */}
         {mode === "csv" && (
-          <div className="bg-white rounded-lg border border-gray-200 p-6">
-            <CsvSequencerUpload />
+          <div className="space-y-6">
+            <DomainMailboxExport />
+            <div className="bg-white rounded-lg border border-gray-200 p-6">
+              <CsvSequencerUpload />
+            </div>
           </div>
         )}
       </div>

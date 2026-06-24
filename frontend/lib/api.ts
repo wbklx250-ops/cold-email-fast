@@ -524,6 +524,66 @@ export const exportMailboxCredentials = async (tenantId?: string): Promise<void>
   window.URL.revokeObjectURL(url);
 };
 
+export interface DomainMailboxExportResult {
+  filename: string;
+  mailboxCount: number;
+  domainCount: number;
+  missingDomains: string[];
+}
+
+const filenameFromContentDisposition = (contentDisposition: string | null, fallback: string): string => {
+  if (!contentDisposition) {
+    return fallback;
+  }
+
+  const match = contentDisposition.match(/filename="?([^";]+)"?/i);
+  return match?.[1] || fallback;
+};
+
+export const exportMailboxCredentialsByDomains = async (
+  domains: string[],
+): Promise<DomainMailboxExportResult> => {
+  const response = await fetch(`${API_BASE}/api/v1/mailboxes/export-by-domains`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ domains }),
+  });
+
+  if (!response.ok) {
+    let details: unknown;
+    try {
+      details = await response.json();
+    } catch {
+      details = await response.text();
+    }
+    throw new HttpError("Failed to export domain mailbox credentials", response.status, details);
+  }
+
+  const filename = filenameFromContentDisposition(
+    response.headers.get("Content-Disposition"),
+    "mailboxes_by_domain.csv",
+  );
+  const blob = await response.blob();
+  const url = window.URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  window.URL.revokeObjectURL(url);
+
+  return {
+    filename,
+    mailboxCount: Number(response.headers.get("X-Mailbox-Count") || 0),
+    domainCount: Number(response.headers.get("X-Domain-Count") || domains.length),
+    missingDomains: (response.headers.get("X-Missing-Domains") || "")
+      .split(",")
+      .map((domain) => domain.trim())
+      .filter(Boolean),
+  };
+};
+
 export const generateMailboxes = async (
   tenantId: string,
   persona: GenerateMailboxesPersona

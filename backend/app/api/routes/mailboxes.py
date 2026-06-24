@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import re
 from io import StringIO
 from typing import List, Optional
 from uuid import UUID
@@ -8,7 +10,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db
@@ -50,6 +52,150 @@ class ResetPasswordsStatus(BaseModel):
     failed: int
     current_tenant: str | None
     errors: list[str]
+
+
+class DomainMailboxExportRequest(BaseModel):
+    domains: list[str] | str
+
+
+_DOMAIN_TOKEN_SPLIT_RE = re.compile(r"[\s,;]+")
+_DOMAIN_VALUE_RE = re.compile(
+    r"^(?=.{1,253}$)(?!-)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9][a-z0-9-]{1,62}$"
+)
+
+
+def _normalize_export_domain_token(token: str) -> str | None:
+    domain = token.strip().lower()
+    if not domain:
+        return None
+
+    domain = re.sub(r"^[a-z][a-z0-9+.-]*://", "", domain)
+    domain = domain.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    domain = domain.rsplit("@", 1)[-1].strip().strip(".")
+    if domain.startswith("*."):
+        domain = domain[2:]
+
+    return domain or None
+
+
+def _parse_export_domains(raw_domains: list[str] | str) -> tuple[list[str], list[str]]:
+    raw_values = raw_domains if isinstance(raw_domains, list) else [raw_domains]
+    domains: list[str] = []
+    invalid_tokens: list[str] = []
+    seen: set[str] = set()
+
+    for value in raw_values:
+        for token in _DOMAIN_TOKEN_SPLIT_RE.split(str(value)):
+            if not token.strip():
+                continue
+
+            domain = _normalize_export_domain_token(token)
+            if not domain:
+                continue
+
+            if not _DOMAIN_VALUE_RE.match(domain):
+                invalid_tokens.append(token.strip())
+                continue
+
+            if domain not in seen:
+                domains.append(domain)
+                seen.add(domain)
+
+    return domains, invalid_tokens
+
+
+def _mailbox_domain(email: str) -> str:
+    if "@" not in email:
+        return ""
+    return email.rsplit("@", 1)[1].lower()
+
+
+def _export_filename_for_domains(domains: list[str]) -> str:
+    if len(domains) == 1:
+        safe_domain = re.sub(r"[^a-z0-9.-]+", "_", domains[0]).replace(".", "_")
+        return f"mailboxes_{safe_domain}.csv"
+    return f"mailboxes_{len(domains)}_domains.csv"
+
+
+def _build_domain_mailbox_csv(rows: list[tuple[Mailbox, Tenant]]) -> str:
+    output = StringIO()
+    writer = csv.writer(output, lineterminator="\n")
+    writer.writerow(["DisplayName", "EmailAddress", "Password", "Domain", "TenantName"])
+
+    for mailbox, tenant in rows:
+        domain = _mailbox_domain(mailbox.email) or (tenant.custom_domain or "")
+        writer.writerow(
+            [
+                mailbox.display_name,
+                mailbox.email,
+                mailbox.initial_password or mailbox.password or MAILBOX_PASSWORD,
+                domain,
+                tenant.name if tenant else "",
+            ]
+        )
+
+    return output.getvalue()
+
+
+async def _export_mailbox_credentials_for_domains(
+    raw_domains: list[str] | str,
+    db: AsyncSession,
+) -> StreamingResponse:
+    domains, invalid_tokens = _parse_export_domains(raw_domains)
+
+    if invalid_tokens:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Invalid domain values",
+                "invalid_domains": invalid_tokens,
+            },
+        )
+
+    if not domains:
+        raise HTTPException(status_code=400, detail="Provide at least one domain")
+
+    domain_filters = [Mailbox.email.ilike(f"%@{domain}") for domain in domains]
+    result = await db.execute(
+        select(Mailbox, Tenant)
+        .join(Tenant, Mailbox.tenant_id == Tenant.id)
+        .where(or_(*domain_filters))
+    )
+    rows = [(mailbox, tenant) for mailbox, tenant in result.all()]
+
+    requested_order = {domain: index for index, domain in enumerate(domains)}
+    rows.sort(
+        key=lambda row: (
+            requested_order.get(_mailbox_domain(row[0].email), len(requested_order)),
+            _mailbox_domain(row[0].email),
+            row[0].email.lower(),
+        )
+    )
+
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "No mailboxes found for the requested domains",
+                "domains": domains,
+            },
+        )
+
+    found_domains = {_mailbox_domain(mailbox.email) for mailbox, _tenant in rows}
+    missing_domains = [domain for domain in domains if domain not in found_domains]
+    csv_content = _build_domain_mailbox_csv(rows)
+
+    return StreamingResponse(
+        iter([csv_content]),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": f"attachment; filename={_export_filename_for_domains(domains)}",
+            "Access-Control-Expose-Headers": "Content-Disposition, X-Mailbox-Count, X-Domain-Count, X-Missing-Domains",
+            "X-Mailbox-Count": str(len(rows)),
+            "X-Domain-Count": str(len(domains)),
+            "X-Missing-Domains": ",".join(missing_domains),
+        },
+    )
 
 
 def _reset_progress_snapshot() -> dict:
@@ -624,6 +770,24 @@ async def export_mailbox_credentials(
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=mailbox_credentials.csv"},
     )
+
+
+@router.post("/export-by-domains")
+async def export_mailbox_credentials_by_domains(
+    request: DomainMailboxExportRequest,
+    db: AsyncSession = Depends(get_db),
+) -> StreamingResponse:
+    """Export upload-ready mailbox credentials for one or more email domains."""
+    return await _export_mailbox_credentials_for_domains(request.domains, db)
+
+
+@router.get("/export-by-domains")
+async def export_mailbox_credentials_by_domains_get(
+    domains: list[str] = Query(..., description="Domain, repeated domains, or comma/newline separated domains"),
+    db: AsyncSession = Depends(get_db),
+) -> StreamingResponse:
+    """GET variant for direct downloads and simple API clients."""
+    return await _export_mailbox_credentials_for_domains(domains, db)
 
 
 @router.get("/{mailbox_id}", response_model=MailboxRead)

@@ -199,7 +199,7 @@ export default function CsvSequencerUpload() {
     <div className="space-y-6">
       <div>
         <h2 className="text-xl font-semibold text-gray-900">CSV Upload to Sequencer</h2>
-        <p className="mt-1 text-sm text-gray-500">Upload mailboxes from CSV files directly to your sequencer. CSV must have <code className="bg-gray-100 px-1 rounded">email</code> and <code className="bg-gray-100 px-1 rounded">password</code> columns.</p>
+        <p className="mt-1 text-sm text-gray-500">Upload mailboxes from CSV files directly to your sequencer. CSV must have <code className="bg-gray-100 px-1 rounded">email</code> or <code className="bg-gray-100 px-1 rounded">EmailAddress</code>, plus <code className="bg-gray-100 px-1 rounded">password</code>.</p>
       </div>
 
       {/* File Drop Zone */}
@@ -214,7 +214,7 @@ export default function CsvSequencerUpload() {
           <input ref={fileInputRef} type="file" multiple accept=".csv" className="hidden" onChange={(e) => { if (e.target.files) handleFiles(e.target.files); e.target.value = ""; }} />
           <div className="text-4xl mb-2">📁</div>
           <p className="text-sm text-gray-600">Drag & drop CSV files here, or <span className="text-blue-600 font-medium">click to browse</span></p>
-          <p className="text-xs text-gray-400 mt-1">Multiple CSV files supported. Required columns: email, password</p>
+          <p className="text-xs text-gray-400 mt-1">Multiple CSV files supported. Required columns: email or EmailAddress, password</p>
         </div>
       )}
 
