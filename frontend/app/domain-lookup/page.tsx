@@ -31,6 +31,35 @@ interface LookupResponse {
   results: LookupResult[];
 }
 
+interface TenantLoginDetails {
+  tenant_id: string;
+  tenant_name: string;
+  microsoft_tenant_id: string;
+  onmicrosoft_domain: string;
+  provider: string;
+  admin_email: string;
+  admin_password: string;
+  login_url: string;
+  has_totp_secret: boolean;
+  totp_code: string | null;
+  totp_seconds_remaining: number | null;
+  totp_error: string | null;
+}
+
+interface CredentialLookupResult extends LookupResult {
+  credentials: TenantLoginDetails | null;
+  credential_error: string | null;
+}
+
+interface CredentialLookupResponse {
+  total: number;
+  matched: number;
+  credentials_found: number;
+  missing_credentials: number;
+  errors: number;
+  results: CredentialLookupResult[];
+}
+
 interface SyncResponse {
   total_checked: number;
   updated_links: number;
@@ -85,6 +114,10 @@ function matchMethodBadge(method: string | null) {
   );
 }
 
+function maskValue(value: string) {
+  return "•".repeat(Math.min(Math.max(value.length, 8), 18));
+}
+
 // ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
@@ -92,11 +125,15 @@ function matchMethodBadge(method: string | null) {
 export default function DomainLookupPage() {
   const [domainInput, setDomainInput] = useState("");
   const [results, setResults] = useState<LookupResponse | null>(null);
+  const [credentialResults, setCredentialResults] = useState<CredentialLookupResponse | null>(null);
   const [loading, setLoading] = useState(false);
+  const [credentialLoading, setCredentialLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [syncResult, setSyncResult] = useState<SyncResponse | null>(null);
   const [filter, setFilter] = useState<FilterMode>("all");
+  const [visiblePasswords, setVisiblePasswords] = useState<Record<string, boolean>>({});
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
   // Parse domains from textarea
   const parseDomains = useCallback((): string[] => {
@@ -114,6 +151,7 @@ export default function DomainLookupPage() {
     setLoading(true);
     setError(null);
     setResults(null);
+    setCredentialResults(null);
     setSyncResult(null);
 
     try {
@@ -134,6 +172,46 @@ export default function DomainLookupPage() {
       setError("Lookup failed: " + (err as Error).message);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const copyToClipboard = async (key: string, value: string) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopiedKey(key);
+      window.setTimeout(() => setCopiedKey((current) => (current === key ? null : current)), 1200);
+    } catch {
+      setError("Could not copy value to clipboard");
+    }
+  };
+
+  const handleCredentialsLookup = async () => {
+    const domains = parseDomains();
+    if (!domains.length) return;
+
+    setCredentialLoading(true);
+    setError(null);
+    setCredentialResults(null);
+    setSyncResult(null);
+
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/domain-lookup/credentials`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ domains }),
+      });
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.detail || `HTTP ${res.status}`);
+      }
+
+      const data: CredentialLookupResponse = await res.json();
+      setCredentialResults(data);
+    } catch (err) {
+      setError("Credential lookup failed: " + (err as Error).message);
+    } finally {
+      setCredentialLoading(false);
     }
   };
 
@@ -234,6 +312,57 @@ export default function DomainLookupPage() {
     URL.revokeObjectURL(url);
   };
 
+  const handleExportCredentialsCSV = () => {
+    if (!credentialResults) return;
+
+    const headers = [
+      "Domain",
+      "Tenant Name",
+      "Microsoft Tenant ID",
+      "OnMicrosoft Domain",
+      "Provider",
+      "Admin Email",
+      "Admin Password",
+      "TOTP Code",
+      "TOTP Seconds Remaining",
+      "Login URL",
+      "Match Method",
+      "Error",
+    ];
+
+    const rows = credentialResults.results.map((r) => [
+      r.domain,
+      r.credentials?.tenant_name || r.db_tenant_name || "",
+      r.credentials?.microsoft_tenant_id || r.microsoft_tenant_id || "",
+      r.credentials?.onmicrosoft_domain || "",
+      r.credentials?.provider || "",
+      r.credentials?.admin_email || "",
+      r.credentials?.admin_password || "",
+      r.credentials?.totp_code || "",
+      r.credentials?.totp_seconds_remaining?.toString() || "",
+      r.credentials?.login_url || "",
+      r.match_method || "",
+      r.credential_error || r.error || r.credentials?.totp_error || "",
+    ]);
+
+    const csvContent = [
+      headers.join(","),
+      ...rows.map((row) =>
+        row.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(",")
+      ),
+    ].join("\n");
+
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `tenant-login-details-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
   // Filter results
   const filteredResults = results
     ? results.results.filter((r) => {
@@ -261,6 +390,7 @@ export default function DomainLookupPage() {
   const matchedCount = results
     ? results.results.filter((r) => !!r.db_tenant_id).length
     : 0;
+  const credentialRows = credentialResults?.results || [];
 
   return (
     <div className="space-y-6">
@@ -397,7 +527,7 @@ export default function DomainLookupPage() {
         <div className="mt-4 flex gap-3 flex-wrap">
           <button
             onClick={handleCheck}
-            disabled={loading || domainCount === 0 || domainCount > 500}
+            disabled={loading || credentialLoading || domainCount === 0 || domainCount > 500}
             className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-sm font-medium"
           >
             {loading ? (
@@ -407,6 +537,23 @@ export default function DomainLookupPage() {
               </span>
             ) : (
               `🔍 Check ${domainCount} Domain${domainCount !== 1 ? "s" : ""}`
+            )}
+          </button>
+
+          <button
+            onClick={handleCredentialsLookup}
+            disabled={credentialLoading || loading || domainCount === 0 || domainCount > 500}
+            className="px-4 py-2 bg-slate-900 text-white rounded-lg hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed text-sm font-medium"
+          >
+            {credentialLoading ? (
+              <span className="flex items-center gap-2">
+                <span className="animate-spin h-4 w-4 border-2 border-white border-t-transparent rounded-full" />
+                Finding login details...
+              </span>
+            ) : credentialResults ? (
+              "Refresh TOTP Codes"
+            ) : (
+              `Find Login Details`
             )}
           </button>
 
@@ -435,8 +582,210 @@ export default function DomainLookupPage() {
               </button>
             </>
           )}
+
+          {credentialResults && (
+            <button
+              onClick={handleExportCredentialsCSV}
+              className="px-4 py-2 bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 text-sm font-medium"
+            >
+              Export Login CSV
+            </button>
+          )}
         </div>
       </div>
+
+      {/* Login Details Results */}
+      {credentialResults && (
+        <>
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+            <div className="bg-white rounded-lg border border-gray-200 p-4 text-center">
+              <div className="text-2xl font-bold text-gray-900">
+                {credentialResults.total}
+              </div>
+              <div className="text-sm text-gray-500">Total</div>
+            </div>
+            <div className="bg-purple-50 rounded-lg border border-purple-200 p-4 text-center">
+              <div className="text-2xl font-bold text-purple-600">
+                {credentialResults.matched}
+              </div>
+              <div className="text-sm text-gray-500">Tenant Matched</div>
+            </div>
+            <div className="bg-green-50 rounded-lg border border-green-200 p-4 text-center">
+              <div className="text-2xl font-bold text-green-600">
+                {credentialResults.credentials_found}
+              </div>
+              <div className="text-sm text-gray-500">Login Ready</div>
+            </div>
+            <div className="bg-amber-50 rounded-lg border border-amber-200 p-4 text-center">
+              <div className="text-2xl font-bold text-amber-600">
+                {credentialResults.missing_credentials}
+              </div>
+              <div className="text-sm text-gray-500">Missing</div>
+            </div>
+            <div className="bg-yellow-50 rounded-lg border border-yellow-200 p-4 text-center">
+              <div className="text-2xl font-bold text-yellow-600">
+                {credentialResults.errors}
+              </div>
+              <div className="text-sm text-gray-500">Lookup Errors</div>
+            </div>
+          </div>
+
+          <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
+            <div className="px-4 py-3 border-b border-gray-200 flex items-center justify-between gap-3">
+              <div>
+                <h2 className="text-sm font-semibold text-gray-900">Tenant Login Details</h2>
+                <p className="text-xs text-gray-500 mt-0.5">Current TOTP codes refresh from the backend lookup.</p>
+              </div>
+              <button
+                onClick={handleCredentialsLookup}
+                disabled={credentialLoading}
+                className="px-3 py-1.5 bg-gray-100 text-gray-700 rounded-md hover:bg-gray-200 disabled:opacity-50 text-sm font-medium"
+              >
+                Refresh Codes
+              </button>
+            </div>
+
+            <div className="overflow-x-auto">
+              <table className="min-w-full divide-y divide-gray-200">
+                <thead className="bg-gray-50">
+                  <tr>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      Domain
+                    </th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      Tenant
+                    </th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      Admin Email
+                    </th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      Password
+                    </th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      TOTP
+                    </th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      Login
+                    </th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-200">
+                  {credentialRows.map((r, i) => {
+                    const rowKey = `${r.domain}-${r.db_tenant_id || i}`;
+                    const passwordVisible = !!visiblePasswords[rowKey];
+                    const credentials = r.credentials;
+
+                    return (
+                      <tr
+                        key={rowKey}
+                        className={credentials ? "bg-green-50/40" : "bg-amber-50/40"}
+                      >
+                        <td className="px-4 py-3 text-sm font-mono text-gray-900 whitespace-nowrap">
+                          {r.domain}
+                          <div className="mt-1">{matchMethodBadge(r.match_method)}</div>
+                        </td>
+                        <td className="px-4 py-3 text-sm text-gray-700 min-w-[180px]">
+                          {credentials ? (
+                            <>
+                              <div className="font-medium text-gray-900">{credentials.tenant_name}</div>
+                              <div className="text-xs text-gray-500 font-mono">{credentials.onmicrosoft_domain}</div>
+                            </>
+                          ) : (
+                            <span className="text-amber-700 text-xs">{r.credential_error || r.error || "No credentials found"}</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-3 text-sm whitespace-nowrap">
+                          {credentials ? (
+                            <div className="flex items-center gap-2">
+                              <span className="font-mono text-gray-800">{credentials.admin_email}</span>
+                              <button
+                                onClick={() => copyToClipboard(`${rowKey}-email`, credentials.admin_email)}
+                                className="text-xs text-blue-600 hover:text-blue-800 font-medium"
+                              >
+                                {copiedKey === `${rowKey}-email` ? "Copied" : "Copy"}
+                              </button>
+                            </div>
+                          ) : (
+                            <span className="text-gray-400">—</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-3 text-sm whitespace-nowrap">
+                          {credentials ? (
+                            <div className="flex items-center gap-2">
+                              <span className="font-mono text-gray-800">
+                                {passwordVisible
+                                  ? credentials.admin_password
+                                  : maskValue(credentials.admin_password)}
+                              </span>
+                              <button
+                                onClick={() =>
+                                  setVisiblePasswords((current) => ({
+                                    ...current,
+                                    [rowKey]: !current[rowKey],
+                                  }))
+                                }
+                                className="text-xs text-gray-600 hover:text-gray-900 font-medium"
+                              >
+                                {passwordVisible ? "Hide" : "Show"}
+                              </button>
+                              <button
+                                onClick={() => copyToClipboard(`${rowKey}-password`, credentials.admin_password)}
+                                className="text-xs text-blue-600 hover:text-blue-800 font-medium"
+                              >
+                                {copiedKey === `${rowKey}-password` ? "Copied" : "Copy"}
+                              </button>
+                            </div>
+                          ) : (
+                            <span className="text-gray-400">—</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-3 text-sm whitespace-nowrap">
+                          {credentials?.totp_code ? (
+                            <div className="flex items-center gap-2">
+                              <span className="font-mono text-lg font-semibold text-gray-900 tracking-wider">
+                                {credentials.totp_code}
+                              </span>
+                              <span className="text-xs text-gray-500">
+                                {credentials.totp_seconds_remaining ?? 0}s
+                              </span>
+                              <button
+                                onClick={() => copyToClipboard(`${rowKey}-totp`, credentials.totp_code!)}
+                                className="text-xs text-blue-600 hover:text-blue-800 font-medium"
+                              >
+                                {copiedKey === `${rowKey}-totp` ? "Copied" : "Copy"}
+                              </button>
+                            </div>
+                          ) : credentials?.totp_error ? (
+                            <span className="text-xs text-red-600">{credentials.totp_error}</span>
+                          ) : credentials ? (
+                            <span className="text-xs text-gray-500">No TOTP secret</span>
+                          ) : (
+                            <span className="text-gray-400">—</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-3 text-sm whitespace-nowrap">
+                          {credentials ? (
+                            <a
+                              href={credentials.login_url}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="text-blue-600 hover:text-blue-800 hover:underline font-medium"
+                            >
+                              Admin Center
+                            </a>
+                          ) : (
+                            <span className="text-gray-400">—</span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </>
+      )}
 
       {/* Summary Stats */}
       {results && (
