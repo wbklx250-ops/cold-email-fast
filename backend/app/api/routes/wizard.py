@@ -6927,7 +6927,7 @@ async def get_upload_status(job_id: str):
 
 class SmartleadStartRequest(BaseModel):
     """Request for starting Smartlead upload."""
-    api_key: str
+    api_key: Optional[str] = None
     oauth_url: str
     num_workers: int = 2  # 1-3 parallel browsers
     skip_uploaded: bool = True
@@ -7010,6 +7010,14 @@ async def start_step8_smartlead_upload(
     db: AsyncSession = Depends(get_db),
 ):
     """Start Step 8: Upload mailboxes to Smartlead via OAuth."""
+    request.api_key = (request.api_key or "").strip() or None
+    request.oauth_url = (request.oauth_url or "").strip()
+
+    if not request.oauth_url:
+        raise HTTPException(400, "Smartlead OAuth URL is required")
+
+    effective_configure_settings = request.configure_settings and bool(request.api_key)
+
     # Validate num_workers
     if request.num_workers < 1 or request.num_workers > 5:
         raise HTTPException(400, "num_workers must be between 1 and 5")
@@ -7074,6 +7082,8 @@ async def start_step8_smartlead_upload(
         "error": None,
         "num_workers": actual_num_workers,
         "requested_num_workers": request.num_workers,
+        "api_key_provided": bool(request.api_key),
+        "configure_settings": effective_configure_settings,
         "errors": []
     }
     
@@ -7088,7 +7098,7 @@ async def start_step8_smartlead_upload(
                 oauth_url=request.oauth_url,
                 num_workers=actual_num_workers,
                 skip_uploaded=request.skip_uploaded,
-                configure_settings=request.configure_settings,
+                configure_settings=effective_configure_settings,
                 sending_settings={
                     "max_per_day": request.max_email_per_day,
                     "wait_mins": request.time_to_wait_in_mins,
@@ -7234,8 +7244,11 @@ async def csv_sequencer_upload(
         elif not instantly_email or not instantly_password:
             raise HTTPException(400, "Instantly email and password are required")
     elif sequencer == "smartlead":
-        if not smartlead_api_key or not smartlead_oauth_url:
-            raise HTTPException(400, "Smartlead API key and OAuth URL are required")
+        smartlead_api_key = (smartlead_api_key or "").strip() or None
+        smartlead_oauth_url = (smartlead_oauth_url or "").strip()
+        if not smartlead_oauth_url:
+            raise HTTPException(400, "Smartlead OAuth URL is required")
+        configure_settings = configure_settings and bool(smartlead_api_key)
     else:
         raise HTTPException(400, "Invalid sequencer. Must be 'instantly' or 'smartlead'")
     
@@ -7479,18 +7492,26 @@ async def csv_sequencer_upload(
     else:  # smartlead
         async def run_csv_smartlead_upload():
             try:
-                from app.services.smartlead import SmartleadOAuthUploader, SmartleadAPI, process_smartlead_mailbox_sync
+                from app.services.smartlead import (
+                    SmartleadAPI,
+                    SmartleadOAuthUploader,
+                    ensure_smartlead_app_consent_for_mailboxes,
+                    process_smartlead_mailbox_sync,
+                )
                 from concurrent.futures import ThreadPoolExecutor, as_completed
                 import uuid
                 
-                # Check existing accounts
-                api = SmartleadAPI(smartlead_api_key)
+                # Check existing accounts when an API key is available.
+                api = SmartleadAPI(smartlead_api_key) if smartlead_api_key else None
                 existing_emails = set()
-                try:
-                    existing_emails = await api.get_existing_emails()
-                    logger.info(f"[CSV Upload] Found {len(existing_emails)} existing Smartlead accounts")
-                except Exception as e:
-                    logger.warning(f"[CSV Upload] Could not fetch existing Smartlead accounts: {e}")
+                if api:
+                    try:
+                        existing_emails = await api.get_existing_emails()
+                        logger.info(f"[CSV Upload] Found {len(existing_emails)} existing Smartlead accounts")
+                    except Exception as e:
+                        logger.warning(f"[CSV Upload] Could not fetch existing Smartlead accounts: {e}")
+                else:
+                    logger.info("[CSV Upload] No Smartlead API key provided; using OAuth-only mode")
                 
                 # Filter out existing
                 mailbox_list = []
@@ -7509,8 +7530,36 @@ async def csv_sequencer_upload(
                 if not mailbox_list:
                     csv_upload_jobs[job_id]["status"] = "completed"
                     csv_upload_jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
-                    await api.close()
+                    if api:
+                        await api.close()
                     return
+
+                consent_failures = await ensure_smartlead_app_consent_for_mailboxes(mailbox_list)
+                if consent_failures:
+                    uploadable = []
+                    for mb_data in mailbox_list:
+                        domain = mb_data["email"].rsplit("@", 1)[-1].lower()
+                        failure_key = str(mb_data.get("tenant_id") or domain)
+                        consent_error = consent_failures.get(failure_key)
+                        if consent_error:
+                            csv_upload_jobs[job_id]["failed"] += 1
+                            csv_upload_jobs[job_id]["errors"].append(f"{mb_data['email']}: {consent_error}")
+                            csv_upload_jobs[job_id]["results"].append({
+                                "email": mb_data["email"],
+                                "status": "failed",
+                                "error": consent_error,
+                            })
+                        else:
+                            uploadable.append(mb_data)
+
+                    mailbox_list = uploadable
+                    if not mailbox_list:
+                        csv_upload_jobs[job_id]["status"] = "completed"
+                        csv_upload_jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
+                        csv_upload_jobs[job_id]["current_email"] = None
+                        if api:
+                            await api.close()
+                        return
                 
                 actual_workers = min(num_workers, len(mailbox_list))
                 
@@ -7537,7 +7586,7 @@ async def csv_sequencer_upload(
                             })
                             
                             # Configure settings if enabled
-                            if configure_settings:
+                            if configure_settings and api:
                                 import asyncio
                                 await asyncio.sleep(3)
                                 account_api_id = await api.find_account_id(mb_data["email"])
@@ -7562,7 +7611,8 @@ async def csv_sequencer_upload(
                                 "error": result["error"],
                             })
                 
-                await api.close()
+                if api:
+                    await api.close()
                 csv_upload_jobs[job_id]["status"] = "completed"
                 csv_upload_jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
                 csv_upload_jobs[job_id]["current_email"] = None

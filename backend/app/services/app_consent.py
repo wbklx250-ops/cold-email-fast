@@ -68,7 +68,13 @@ FULL_GRAPH_SCOPES = (
     "IMAP.AccessAsUser.All SMTP.Send offline_access openid profile email"
 )
 
-FULL_EXCHANGE_SCOPES = "Mail.ReadWrite IMAP.AccessAsUser.All SMTP.Send"
+FULL_EXCHANGE_SCOPES = "IMAP.AccessAsUser.All SMTP.SendAsUser"
+
+ROPC_CLIENT_IDS = (
+    "1950a258-227b-4e31-a9cf-717495945fc2",  # Azure PowerShell
+    "04b07795-8ddb-461a-bbee-02f9e1bf7b46",  # Azure CLI
+    "14d82eec-204b-4c2f-b7e8-296a70dab67e",  # Microsoft Graph PowerShell
+)
 
 
 def normalize_sequencer_key(app_key: Optional[str], *, strict: bool = False) -> str:
@@ -94,6 +100,221 @@ def get_sequencer_config(app_key: Optional[str], *, strict: bool = False) -> Dic
             config["client_id"] = env_value
 
     return config
+
+
+def _extract_graph_error(resp: requests.Response) -> str:
+    try:
+        payload = resp.json()
+        error = payload.get("error")
+        if isinstance(error, dict):
+            return error.get("message") or str(error)
+        if isinstance(error, str):
+            desc = payload.get("error_description")
+            return f"{error}: {desc}" if desc else error
+        return str(payload)
+    except Exception:
+        return resp.text[:500]
+
+
+def _get_ropc_graph_token(admin_email: str, admin_password: str) -> tuple[Optional[str], Optional[str]]:
+    tenant_domain = admin_email.split("@", 1)[1]
+    token_url = f"https://login.microsoftonline.com/{tenant_domain}/oauth2/v2.0/token"
+
+    last_error = None
+    for client_id in ROPC_CLIENT_IDS:
+        try:
+            resp = requests.post(
+                token_url,
+                data={
+                    "client_id": client_id,
+                    "scope": "https://graph.microsoft.com/.default offline_access",
+                    "grant_type": "password",
+                    "username": admin_email,
+                    "password": admin_password,
+                },
+                timeout=45,
+            )
+            if resp.status_code == 200:
+                return resp.json().get("access_token"), None
+
+            last_error = _extract_graph_error(resp)
+            if any(marker in last_error for marker in ("AADSTS50076", "AADSTS50079", "interaction_required")):
+                return None, f"ROPC token failed; MFA still required: {last_error}"
+            if "AADSTS50126" in last_error:
+                return None, "ROPC token failed; invalid credentials"
+        except Exception as exc:
+            last_error = str(exc)
+
+    return None, f"ROPC token failed for all client IDs: {last_error or 'unknown error'}"
+
+
+def _graph_request(
+    method: str,
+    path_or_url: str,
+    token: str,
+    *,
+    json_body: Optional[dict] = None,
+) -> dict:
+    url = path_or_url if path_or_url.startswith("https://") else f"https://graph.microsoft.com/v1.0{path_or_url}"
+    resp = requests.request(
+        method,
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        json=json_body,
+        timeout=45,
+    )
+    if resp.status_code not in (200, 201, 204):
+        raise RuntimeError(f"Graph {method} {url} failed ({resp.status_code}): {_extract_graph_error(resp)}")
+    if resp.status_code == 204 or not resp.content:
+        return {}
+    return resp.json()
+
+
+def _find_service_principal(token: str, app_id: str) -> Optional[dict]:
+    data = _graph_request(
+        "GET",
+        f"/servicePrincipals?$filter=appId eq '{app_id}'",
+        token,
+    )
+    values = data.get("value") or []
+    return values[0] if values else None
+
+
+def _ensure_service_principal(token: str, app_client_id: str) -> dict:
+    existing = _find_service_principal(token, app_client_id)
+    if existing:
+        return existing
+    return _graph_request(
+        "POST",
+        "/servicePrincipals",
+        token,
+        json_body={"appId": app_client_id},
+    )
+
+
+def _ensure_permission_grant(
+    token: str,
+    *,
+    app_sp_id: str,
+    resource_sp_id: str,
+    scopes: str,
+    resource_name: str,
+) -> str:
+    data = _graph_request(
+        "GET",
+        f"/oauth2PermissionGrants?$filter=clientId eq '{app_sp_id}'",
+        token,
+    )
+    existing = None
+    for grant in data.get("value") or []:
+        if grant.get("consentType") == "AllPrincipals" and grant.get("resourceId") == resource_sp_id:
+            existing = grant
+            break
+
+    required_scopes = set(scopes.split())
+    if existing:
+        current_scopes = set((existing.get("scope") or "").split())
+        if required_scopes.issubset(current_scopes):
+            return f"{resource_name}: already_ok"
+        _graph_request(
+            "PATCH",
+            f"/oauth2PermissionGrants/{existing['id']}",
+            token,
+            json_body={"scope": scopes},
+        )
+        return f"{resource_name}: updated"
+
+    _graph_request(
+        "POST",
+        "/oauth2PermissionGrants",
+        token,
+        json_body={
+            "clientId": app_sp_id,
+            "consentType": "AllPrincipals",
+            "resourceId": resource_sp_id,
+            "scope": scopes,
+        },
+    )
+    return f"{resource_name}: created"
+
+
+def grant_app_consent_via_ropc(
+    *,
+    admin_email: str,
+    admin_password: str,
+    app_client_id: str,
+    app_name: str = "Smartlead",
+    graph_scopes: str = FULL_GRAPH_SCOPES,
+    exchange_scopes: str = FULL_EXCHANGE_SCOPES,
+) -> Dict:
+    """
+    Fully automated admin-consent grant matching enable_apps.ps1.
+
+    This uses ROPC to obtain a Graph token, ensures the app service principal
+    exists in the tenant, then creates or patches AllPrincipals grants for
+    Microsoft Graph and Exchange. It is idempotent and browser-free.
+    """
+    tenant_domain = admin_email.split("@", 1)[1]
+    tenant_label = tenant_domain.replace(".onmicrosoft.com", "")
+    result = {
+        "success": False,
+        "tenant": tenant_label,
+        "tenant_domain": tenant_domain,
+        "app_name": app_name,
+        "app_client_id": app_client_id,
+        "actions": [],
+        "warnings": [],
+        "error": None,
+    }
+
+    token, token_error = _get_ropc_graph_token(admin_email, admin_password)
+    if not token:
+        result["error"] = token_error or "ROPC token failed"
+        return result
+
+    try:
+        app_sp = _ensure_service_principal(token, app_client_id)
+        result["app_service_principal_id"] = app_sp.get("id")
+
+        graph_sp = _find_service_principal(token, GRAPH_RESOURCE_APP_ID)
+        if not graph_sp:
+            raise RuntimeError("Microsoft Graph service principal not found")
+
+        result["actions"].append(
+            _ensure_permission_grant(
+                token,
+                app_sp_id=app_sp["id"],
+                resource_sp_id=graph_sp["id"],
+                scopes=graph_scopes,
+                resource_name="Graph",
+            )
+        )
+
+        exchange_sp = _find_service_principal(token, EXCHANGE_RESOURCE_APP_ID)
+        if exchange_sp:
+            try:
+                result["actions"].append(
+                    _ensure_permission_grant(
+                        token,
+                        app_sp_id=app_sp["id"],
+                        resource_sp_id=exchange_sp["id"],
+                        scopes=exchange_scopes,
+                        resource_name="Exchange",
+                    )
+                )
+            except Exception as exc:
+                result["warnings"].append(f"Exchange consent failed: {exc}")
+        else:
+            result["warnings"].append("Exchange service principal not found")
+
+        result["success"] = True
+        return result
+    except Exception as exc:
+        result["error"] = str(exc)
+        return result
 
 
 class AppConsentGranter:

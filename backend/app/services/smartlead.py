@@ -21,10 +21,11 @@ import tempfile
 import time
 from datetime import datetime
 from typing import Optional, Dict, Any
+from uuid import UUID
 
 import httpx
 from pydantic import BaseModel, Field
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 
 logger = logging.getLogger("smartlead")
 
@@ -33,7 +34,7 @@ logger = logging.getLogger("smartlead")
 # ---------------------------------------------------------------------------
 SMARTLEAD_API_BASE = "https://server.smartlead.ai/api/v1"
 DEFAULT_SMARTLEAD_WORKERS = 1
-DEFAULT_SMARTLEAD_MAX_RETRIES = 1
+DEFAULT_SMARTLEAD_MAX_RETRIES = 2
 DEFAULT_SMARTLEAD_COOLDOWN_SECONDS = 2.0
 DEFAULT_SMARTLEAD_RESOURCE_FAILURE_LIMIT = 2
 RESOURCE_FAILURE_MARKERS = (
@@ -52,7 +53,7 @@ RESOURCE_FAILURE_MARKERS = (
 # ---------------------------------------------------------------------------
 class SmartleadUploadRequest(BaseModel):
     """Request to upload accounts to Smartlead via OAuth."""
-    api_key: str
+    api_key: Optional[str] = None
     oauth_url: str = Field(..., description="Smartlead's custom Microsoft OAuth login URL")
     accounts: list[dict] = Field(..., description="List of {email, password} dicts")
     headless: bool = True
@@ -368,22 +369,31 @@ class SmartleadOAuthUploader:
             # Accept permissions consent
             self._handle_consent(driver)
 
-            # Verify
-            time.sleep(3)
+            # Verify. Smartlead/Microsoft redirects can lag in headless Chrome,
+            # so poll before declaring the OAuth incomplete.
+            deadline = time.time() + 25
+            while time.time() < deadline:
+                self._handle_post_login(driver)
+                self._handle_consent(driver)
+
+                current_url = driver.current_url.lower()
+                if "smartlead" in current_url:
+                    logger.info(f"[Worker {self.worker_id}] OAuth success for {email}")
+                    return True
+
+                time.sleep(2)
+
             current_url = driver.current_url.lower()
-            if "smartlead" in current_url:
-                logger.info(f"[Worker {self.worker_id}] OAuth success for {email}")
-                return True
-            elif "login.microsoftonline.com" in current_url:
+            if "login.microsoftonline.com" in current_url:
                 logger.warning(f"[Worker {self.worker_id}] OAuth incomplete for {email}, URL: {driver.current_url}")
                 self._screenshot(driver, f"incomplete_{email.split('@')[0]}")
                 self.last_error = f"OAuth incomplete; {self._page_context(driver)}"
                 return False
-            else:
-                logger.warning(f"[Worker {self.worker_id}] Unclear result for {email}, URL: {driver.current_url}")
-                self._screenshot(driver, f"unclear_{email.split('@')[0]}")
-                self.last_error = f"OAuth ended on unexpected page; {self._page_context(driver)}"
-                return False
+
+            logger.warning(f"[Worker {self.worker_id}] Unclear result for {email}, URL: {driver.current_url}")
+            self._screenshot(driver, f"unclear_{email.split('@')[0]}")
+            self.last_error = f"OAuth ended on unexpected page; {self._page_context(driver)}"
+            return False
 
         except Exception as e:
             logger.error(f"[Worker {self.worker_id}] OAuth failed for {email}: {e}")
@@ -637,6 +647,32 @@ def _is_resource_failure(error: Optional[str]) -> bool:
     return any(marker in normalized for marker in RESOURCE_FAILURE_MARKERS)
 
 
+async def _smartlead_account_exists_after_oauth(
+    api: SmartleadAPI,
+    email: str,
+    attempts: int = 3,
+    delay_seconds: float = 5.0,
+) -> bool:
+    """Confirm whether Smartlead accepted an account despite a slow redirect."""
+    for attempt in range(attempts):
+        try:
+            if await api.find_account_id(email):
+                return True
+        except Exception as e:
+            logger.warning(
+                "Smartlead API recovery lookup failed for %s on attempt %s/%s: %s",
+                email,
+                attempt + 1,
+                attempts,
+                e,
+            )
+
+        if attempt < attempts - 1:
+            await asyncio.sleep(delay_seconds)
+
+    return False
+
+
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, str(default)))
@@ -666,9 +702,150 @@ def _mailbox_not_ready_reasons(mailbox) -> list[str]:
     return reasons
 
 
+def _mailbox_domain(mailbox: dict) -> Optional[str]:
+    email = (mailbox.get("email") or "").strip().lower()
+    if "@" not in email:
+        return None
+    return email.rsplit("@", 1)[1]
+
+
+async def ensure_smartlead_app_consent_for_mailboxes(
+    mailbox_list: list[dict],
+    batch_id: Optional[str] = None,
+) -> dict[str, str]:
+    """
+    Grant Smartlead admin consent for every tenant represented in this upload.
+
+    This intentionally runs at Smartlead upload time, because that is when the
+    consent is required. The Graph operation is idempotent, so reruns are safe.
+    """
+    if os.getenv("SMARTLEAD_AUTO_APP_CONSENT", "1") != "1":
+        logger.warning("Skipping Smartlead app consent because SMARTLEAD_AUTO_APP_CONSENT != 1")
+        return {}
+
+    from app.db.session import async_session_factory
+    from app.models.tenant import Tenant
+    from app.services.app_consent import get_sequencer_config, grant_app_consent_via_ropc
+
+    tenant_ids = {str(mb["tenant_id"]) for mb in mailbox_list if mb.get("tenant_id")}
+    domains = sorted({
+        domain
+        for mb in mailbox_list
+        if not mb.get("tenant_id")
+        for domain in [_mailbox_domain(mb)]
+        if domain
+    })
+    failures: dict[str, str] = {}
+
+    if domains:
+        async with async_session_factory() as session:
+            result = await session.execute(
+                select(Tenant).where(
+                    (func.lower(Tenant.custom_domain).in_(domains))
+                    | (func.lower(Tenant.name).in_(domains))
+                    | (func.lower(Tenant.onmicrosoft_domain).in_(domains))
+                )
+            )
+            tenants_by_domain: dict[str, Tenant] = {}
+            for tenant in result.scalars().all():
+                for candidate in (tenant.custom_domain, tenant.name, tenant.onmicrosoft_domain):
+                    key = (candidate or "").strip().lower()
+                    if key in domains and key not in tenants_by_domain:
+                        tenants_by_domain[key] = tenant
+
+        for mb in mailbox_list:
+            if mb.get("tenant_id"):
+                continue
+            domain = _mailbox_domain(mb)
+            tenant = tenants_by_domain.get(domain or "")
+            if tenant:
+                mb["tenant_id"] = str(tenant.id)
+                tenant_ids.add(str(tenant.id))
+            elif domain:
+                failures[domain] = "Tenant not found for Smartlead app consent"
+
+    if not tenant_ids:
+        return failures
+
+    config = get_sequencer_config("smartlead", strict=True)
+    app_client_id = config["client_id"]
+    app_name = config["name"]
+
+    logger.info(
+        "Granting %s admin consent for %s tenant(s) before Smartlead upload",
+        app_name,
+        len(tenant_ids),
+    )
+
+    for tenant_id in sorted(tenant_ids):
+        tenant_pk = UUID(str(tenant_id))
+        async with async_session_factory() as session:
+            tenant = await session.get(Tenant, tenant_pk)
+            if not tenant or (batch_id is not None and str(tenant.batch_id) != str(batch_id)):
+                failures[tenant_id] = "Tenant not found for batch"
+                continue
+            admin_email = tenant.admin_email
+            admin_password = tenant.admin_password
+            domain = tenant.custom_domain or tenant.name
+
+        if not admin_email or not admin_password:
+            error = "Missing admin credentials for Smartlead app consent"
+            failures[tenant_id] = error
+            async with async_session_factory() as session:
+                tenant = await session.get(Tenant, tenant_pk)
+                if tenant:
+                    tenant.step7_app_consent_granted = False
+                    tenant.step7_app_consent_granted_at = None
+                    tenant.step7_app_consent_error = error
+                    await session.commit()
+            continue
+
+        logger.info("[%s] Granting Smartlead admin consent", domain)
+        result = await asyncio.to_thread(
+            grant_app_consent_via_ropc,
+            admin_email=admin_email,
+            admin_password=admin_password,
+            app_client_id=app_client_id,
+            app_name=app_name,
+        )
+
+        async with async_session_factory() as session:
+            tenant = await session.get(Tenant, tenant_pk)
+            if tenant:
+                if result.get("success"):
+                    tenant.step7_app_consent_granted = True
+                    tenant.step7_app_consent_granted_at = datetime.utcnow()
+                    tenant.step7_app_consent_error = None
+                    logger.info(
+                        "[%s] Smartlead app consent ready: %s",
+                        domain,
+                        ", ".join(result.get("actions") or []),
+                    )
+                    if result.get("warnings"):
+                        logger.warning(
+                            "[%s] Smartlead consent warnings: %s",
+                            domain,
+                            "; ".join(result["warnings"]),
+                        )
+                else:
+                    error = result.get("error") or "Smartlead app consent failed"
+                    tenant.step7_app_consent_granted = False
+                    tenant.step7_app_consent_granted_at = None
+                    tenant.step7_app_consent_error = error
+                    failures[tenant_id] = error
+                    logger.error("[%s] Smartlead app consent failed: %s", domain, error)
+                await session.commit()
+
+    return failures
+
+
+async def _ensure_smartlead_app_consent_for_upload(batch_id: str, mailbox_list: list[dict]) -> dict[str, str]:
+    return await ensure_smartlead_app_consent_for_mailboxes(mailbox_list, batch_id=batch_id)
+
+
 async def run_smartlead_upload_for_batch(
     batch_id: str,
-    api_key: str,
+    api_key: Optional[str],
     oauth_url: str,
     num_workers: int = 3,
     headless: bool = True,
@@ -683,7 +860,7 @@ async def run_smartlead_upload_for_batch(
     
     Args:
         batch_id: SetupBatch UUID
-        api_key: Smartlead API key
+        api_key: Optional Smartlead API key for duplicate checks and settings
         oauth_url: Smartlead's custom Microsoft OAuth URL
         num_workers: Number of parallel browser workers (1-5)
         headless: Run browsers in headless mode
@@ -732,6 +909,7 @@ async def run_smartlead_upload_for_batch(
     # Default settings
     sending = sending_settings or {"max_per_day": 6, "wait_mins": 60, "tracking_url": ""}
     warmup = warmup_settings or {"per_day": 40, "rampup": 5, "reply_rate": 79}
+    api_key = (api_key or "").strip() or None
 
     # Fetch mailboxes from database
     async with async_session_factory() as session:
@@ -794,22 +972,31 @@ async def run_smartlead_upload_for_batch(
             {
                 "id": str(mb.id),
                 "email": mb.email,
-                "password": mb.initial_password or mb.password or "#Sendemails1"
+                "password": mb.initial_password or mb.password or "#Sendemails1",
+                "tenant_id": str(mb.tenant_id),
             }
             for mb in mailboxes
         ]
     
     logger.info(f"Found {len(mailbox_list)} mailboxes to upload to Smartlead")
     total_count = len(mailbox_list) + ineligible_count
+    api: Optional[SmartleadAPI] = SmartleadAPI(api_key) if api_key else None
+    effective_configure_settings = configure_settings and api is not None
+
+    if not api:
+        logger.info(
+            "No Smartlead API key provided; using OAuth-only upload mode. "
+            "Duplicate checks, recovery lookups, and settings configuration will be skipped."
+        )
     
-    # Check for existing accounts in Smartlead (deduplication)
-    api = SmartleadAPI(api_key)
+    # Check for existing accounts in Smartlead (deduplication) when an API key is available.
     existing_emails = set()
-    try:
-        existing_emails = await api.get_existing_emails()
-        logger.info(f"Found {len(existing_emails)} existing accounts in Smartlead")
-    except Exception as e:
-        logger.warning(f"Could not fetch existing Smartlead accounts: {e}")
+    if api:
+        try:
+            existing_emails = await api.get_existing_emails()
+            logger.info(f"Found {len(existing_emails)} existing accounts in Smartlead")
+        except Exception as e:
+            logger.warning(f"Could not fetch existing Smartlead accounts: {e}")
     
     # Filter out already existing accounts
     to_upload = []
@@ -838,7 +1025,8 @@ async def run_smartlead_upload_for_batch(
             to_upload.append(mb)
     
     if not to_upload:
-        await api.close()
+        if api:
+            await api.close()
         return {
             "total": total_count,
             "uploaded": 0,
@@ -855,10 +1043,47 @@ async def run_smartlead_upload_for_batch(
     settings_configured = 0
     warmup_configured = 0
 
+    consent_failures = await _ensure_smartlead_app_consent_for_upload(batch_id, to_upload)
+    if consent_failures:
+        consent_failed_mailboxes = [mb for mb in to_upload if mb.get("tenant_id") in consent_failures]
+        to_upload = [mb for mb in to_upload if mb.get("tenant_id") not in consent_failures]
+        async with async_session_factory() as session:
+            for mb in consent_failed_mailboxes:
+                error = f"Smartlead app consent failed: {consent_failures[mb['tenant_id']]}"
+                await session.execute(
+                    update(Mailbox)
+                    .where(Mailbox.id == mb["id"])
+                    .values(
+                        smartlead_uploaded=False,
+                        smartlead_upload_error=error,
+                        uploaded_to_sequencer=False,
+                        upload_error=error,
+                    )
+                )
+                failed_count += 1
+                errors.append(error)
+            await session.commit()
+
+        if not to_upload:
+            if api:
+                await api.close()
+            logger.error("Smartlead upload aborted: app consent failed for all upload tenants")
+            return {
+                "total": total_count,
+                "uploaded": uploaded_count,
+                "failed": failed_count + ineligible_count,
+                "skipped": skipped_count,
+                "ineligible": ineligible_count,
+                "settings_configured": settings_configured,
+                "warmup_configured": warmup_configured,
+                "errors": (ineligible_errors + errors)[:10],
+            }
+
     preflight_uploader = SmartleadOAuthUploader(headless=headless, worker_id="preflight")
     preflight_ok, preflight_error = preflight_uploader.chrome_preflight()
     if not preflight_ok:
-        await api.close()
+        if api:
+            await api.close()
         raise RuntimeError(f"Smartlead Chrome preflight failed: {preflight_error}")
 
     uploader = SmartleadOAuthUploader(headless=headless, worker_id=0)
@@ -887,13 +1112,22 @@ async def run_smartlead_upload_for_batch(
                 error,
             )
             if consecutive_resource_failures >= resource_failure_limit:
-                await api.close()
+                if api:
+                    await api.close()
                 raise RuntimeError(
                     "Stopping Smartlead upload after "
                     f"{consecutive_resource_failures} browser resource failure(s): {error}"
                 )
             await asyncio.sleep(max(cooldown_seconds, 5.0))
-            continue
+        elif api and await _smartlead_account_exists_after_oauth(api, mailbox_data["email"]):
+            logger.warning(
+                "Smartlead OAuth verification failed for %s, but API lookup found the account; marking uploaded",
+                mailbox_data["email"],
+            )
+            result["success"] = True
+            result["error"] = None
+            error = None
+            consecutive_resource_failures = 0
         else:
             consecutive_resource_failures = 0
 
@@ -916,7 +1150,7 @@ async def run_smartlead_upload_for_batch(
                 uploaded_count += 1
                 
                 # Configure settings if enabled
-                if configure_settings:
+                if effective_configure_settings and api:
                     mb_result = await session.execute(
                         select(Mailbox).where(Mailbox.id == result["mailbox_id"])
                     )
@@ -949,7 +1183,8 @@ async def run_smartlead_upload_for_batch(
         if cooldown_seconds:
             await asyncio.sleep(cooldown_seconds)
     
-    await api.close()
+    if api:
+        await api.close()
     
     logger.info(f"Smartlead upload complete: {uploaded_count} uploaded, {failed_count} failed, {skipped_count} skipped")
     
