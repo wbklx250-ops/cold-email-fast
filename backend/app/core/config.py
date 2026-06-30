@@ -41,9 +41,12 @@ class Settings(BaseSettings):
     # Railway has upgraded memory to support this
     max_parallel_browsers: int = 20
 
-    # Step 7 fast mode uses Exchange Online PowerShell sessions, not browsers.
-    # Keep this low to avoid EXO throttling/hanging many concurrent mailbox jobs.
-    step7_fast_parallel: int = 2
+    # Exchange Online + Graph PowerShell can consume most of a 1 GB container.
+    # The worker also enforces serial execution when the cgroup limit is below 2 GB.
+    step7_fast_parallel: int = 1
+    step7_fast_powershell_timeout_seconds: int = 3600
+    step7_license_timeout_seconds: int = 300
+    step7_license_max_attempts: int = 3
     
     # Step 5 Browser Display Mode
     # False = visible browsers (useful for debugging/testing)

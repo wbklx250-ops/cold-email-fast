@@ -13,6 +13,7 @@ import logging
 import json
 import os
 import re
+import signal
 import time
 from typing import Dict, Any, List
 from uuid import UUID
@@ -33,11 +34,126 @@ from app.core.config import get_settings
 logger = logging.getLogger(__name__)
 
 
+def _cgroup_memory_limit_bytes() -> int | None:
+    """Return the container memory limit when running under cgroup v1/v2."""
+    for path in (
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ):
+        try:
+            raw_value = open(path, encoding="ascii").read().strip()
+            if raw_value and raw_value != "max":
+                return int(raw_value)
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _powershell_exit_error(
+    returncode: int | None,
+    stderr: str = "",
+    stdout: str = "",
+) -> str:
+    """Build an actionable error when PowerShell exits without its JSON result."""
+    if returncode is not None and returncode < 0:
+        signal_number = -returncode
+        if signal_number == 9:
+            signal_name = "SIGKILL"
+        else:
+            try:
+                signal_name = signal.Signals(signal_number).name
+            except ValueError:
+                signal_name = f"signal {signal_number}"
+        message = f"PowerShell terminated by {signal_name}"
+        if signal_number == 9:
+            message += " (likely container OOM kill)"
+    elif returncode not in (None, 0):
+        message = f"PowerShell exited with code {returncode}"
+    else:
+        message = "PowerShell completed without a JSON result"
+
+    detail = (stderr or stdout).strip()
+    if detail:
+        message += f": {detail[-2000:]}"
+    return message
+
+
+def _powershell_result_error(result: Dict[str, Any]) -> str:
+    """Extract the most useful error detail from a PowerShell result."""
+    details: List[str] = []
+
+    if result.get("error"):
+        details.append(str(result["error"]))
+
+    result_errors = _as_list(result.get("errors"))
+    if result_errors:
+        details.append("; ".join(result_errors[:10]))
+
+    if not details and result.get("stderr"):
+        details.append(str(result["stderr"]).strip()[-2000:])
+    if not details and result.get("stdout"):
+        details.append(str(result["stdout"]).strip()[-2000:])
+
+    return " | ".join(detail for detail in details if detail) or "Unknown PowerShell error"
+
+
+def _mailbox_objective_complete(expected: int, ready: int) -> bool:
+    """A domain is complete only when every expected mailbox is objectively ready."""
+    return expected > 0 and ready == expected
+
+
+def _effective_step7_parallel(configured: int, memory_limit: int | None) -> int:
+    """Cap Exchange session concurrency according to the container memory limit."""
+    parallel = max(1, min(int(configured or 1), 5))
+    if memory_limit and memory_limit < 2 * 1024**3:
+        return 1
+    return parallel
+
+
+def _is_transient_license_error(error: str) -> bool:
+    """Return whether Microsoft is likely to succeed after propagation/backoff."""
+    normalized = (error or "").lower()
+    transient_markers = (
+        "resource_notfound",
+        "resource '",
+        "queried reference-property",
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "service unavailable",
+        "internal server error",
+        "too many requests",
+        "throttl",
+        "connection",
+        "invalid usage location",
+    )
+    return any(marker in normalized for marker in transient_markers)
+
+
 def _ps_escape(value: str) -> str:
     """Escape string for PowerShell double-quoted strings."""
     if value is None:
         return ""
     return value.replace("`", "``").replace('"', '`"').replace("'", "''")
+
+
+def _mailbox_password_for_local_part(local_part: str, default_password: str) -> str:
+    """
+    Microsoft rejects passwords containing the username. Single-letter aliases
+    make the shared default unsafe, so choose a deterministic alternate.
+    """
+    default_password = default_password or MAILBOX_PASSWORD
+    local = (local_part or "").strip().lower()
+    if not local or local not in default_password.lower():
+        return default_password
+
+    fixed = "#QwXz9874!"
+    if local not in fixed.lower():
+        return fixed
+
+    available = [ch for ch in "QwZyVkTbPrLs" if ch.lower() not in set(local)]
+    letters = "".join(available[:6]) or "QwZyVk"
+    return f"#{letters}9874!"
 
 
 async def _run_powershell(script: str, timeout: int = 300) -> Dict[str, Any]:
@@ -55,32 +171,62 @@ async def _run_powershell(script: str, timeout: int = 300) -> Dict[str, Any]:
         _f.write(script)
         _script_path = _f.name
     try:
+        process_kwargs = {}
+        if os.name != "nt":
+            process_kwargs["start_new_session"] = True
         proc = await asyncio.create_subprocess_exec(
             "pwsh", "-NoProfile", "-NonInteractive", "-File", _script_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
+            **process_kwargs,
         )
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except asyncio.TimeoutError:
-            proc.kill()
+            if os.name != "nt":
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            else:
+                proc.kill()
             await proc.communicate()
-            return {"success": False, "error": "PowerShell script timed out"}
+            return {
+                "success": False,
+                "error": f"PowerShell script timed out after {timeout} seconds",
+                "returncode": proc.returncode,
+            }
         stdout_text = stdout.decode("utf-8", errors="replace").strip()
         stderr_text = stderr.decode("utf-8", errors="replace").strip()
         if stderr_text:
-            logger.debug("PS stderr: %s", stderr_text[:500])
+            logger.warning("PS stderr (exit %s): %s", proc.returncode, stderr_text[-2000:])
         # Try to parse JSON from stdout (last JSON object wins)
-        try:
-            for line in reversed(stdout_text.split("\n")):
-                line = line.strip()
-                if line.startswith("{"):
-                    return json.loads(line)
-        except (json.JSONDecodeError, ValueError):
-            pass
+        for line in reversed(stdout_text.split("\n")):
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                result = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+            result.setdefault("returncode", proc.returncode)
+            if proc.returncode not in (None, 0):
+                result["success"] = False
+                result.setdefault(
+                    "error",
+                    _powershell_exit_error(proc.returncode, stderr_text, stdout_text),
+                )
+            else:
+                result.setdefault("success", True)
+            return result
+
+        error = _powershell_exit_error(proc.returncode, stderr_text, stdout_text)
+        logger.error("%s", error)
         return {
-            "success": proc.returncode == 0,
+            "success": False,
+            "error": error,
             "stdout": stdout_text,
             "stderr": stderr_text,
             "returncode": proc.returncode,
@@ -280,14 +426,38 @@ async def ensure_licensed_user_for_domain(
         domain=domain,
         mailbox_password=mailbox_password,
     )
-    result = await _run_powershell(script, timeout=120)
+    settings = get_settings()
+    max_attempts = max(1, int(settings.step7_license_max_attempts or 3))
+    timeout = max(120, int(settings.step7_license_timeout_seconds or 300))
+    result: Dict[str, Any] = {}
+
+    for attempt in range(1, max_attempts + 1):
+        result = await _run_powershell(script, timeout=timeout)
+        if result.get("success"):
+            break
+
+        error = _powershell_result_error(result)
+        if attempt >= max_attempts or not _is_transient_license_error(error):
+            break
+
+        delay = 15 * attempt
+        logger.warning(
+            "[%s] Licensed user provisioning attempt %s/%s failed transiently: %s. "
+            "Retrying in %ss",
+            domain,
+            attempt,
+            max_attempts,
+            error,
+            delay,
+        )
+        await asyncio.sleep(delay)
 
     if not result.get("success"):
         return {
             "success": False,
             "domain": domain,
             "email": f"me1@{domain}",
-            "error": result.get("error") or result.get("stderr") or "Unknown licensed user error",
+            "error": _powershell_result_error(result),
         }
 
     result["domain"] = domain
@@ -337,7 +507,10 @@ def build_expected_mailbox_data(
                     "email": email,
                     "local_part": local_part,
                     "display_name": (entry.get("display_name") or "").strip() or display_name,
-                    "password": (entry.get("password") or "").strip() or mailbox_password,
+                    "password": _mailbox_password_for_local_part(
+                        local_part,
+                        (entry.get("password") or "").strip() or mailbox_password,
+                    ),
                 }
             )
     else:
@@ -354,9 +527,10 @@ def build_expected_mailbox_data(
         if not email or email in seen:
             continue
         local_part = mb.get("local_part") or email.split("@", 1)[0]
-        password = mb.get("password") or mailbox_password
-        if local_part.strip().lower() == "m" and password == mailbox_password:
-            password = "#S3ndPost1!"
+        password = _mailbox_password_for_local_part(
+            local_part,
+            mb.get("password") or mailbox_password,
+        )
         seen.add(email)
         deduped.append(
             {
@@ -568,12 +742,16 @@ async def process_domain_fast(
             mailbox_array=mailbox_array,
         )
 
-        ps_timeout = int(os.getenv("STEP7_FAST_POWERSHELL_TIMEOUT_SECONDS", "1800") or "1800")
+        settings = get_settings()
+        ps_timeout = max(
+            300,
+            int(settings.step7_fast_powershell_timeout_seconds or 3600),
+        )
         ps_result = await _run_powershell(master_script, timeout=ps_timeout)
 
-        if ps_result.get("success") is False and "created" not in ps_result:
+        if not ps_result.get("success"):
             raise Exception(
-                f"Mailbox PowerShell failed: {ps_result.get('error') or ps_result.get('stderr') or 'Unknown error'}"
+                f"Mailbox PowerShell failed: {_powershell_result_error(ps_result)}"
             )
 
         created = ps_result.get("created", 0)
@@ -599,10 +777,12 @@ async def process_domain_fast(
         # PHASE 4: Save results + completion check
         # ================================================================
         step6_complete = False
+        ready_count = 0
+        completion_error = None
         _domain_id = domain_id  # capture for closure
 
         async def _save_results(db):
-            nonlocal step6_complete
+            nonlocal step6_complete, ready_count, completion_error
 
             # Update mailbox records
             if created_emails:
@@ -653,38 +833,74 @@ async def process_domain_fast(
                 )
             )
 
-            # Update tenant counters
+            await db.flush()
+
+            total = len(desired_emails)
+            ready_count = await db.scalar(
+                select(func.count(Mailbox.id)).where(
+                    Mailbox.tenant_id == tenant_id,
+                    Mailbox.email.in_(desired_emails),
+                    Mailbox.created_in_exchange == True,
+                    Mailbox.account_enabled == True,
+                    Mailbox.password_set == True,
+                    Mailbox.upn_fixed == True,
+                    Mailbox.delegated == True,
+                    Mailbox.setup_complete == True,
+                )
+            ) or 0
+            step6_complete = _mailbox_objective_complete(total, ready_count)
+
+            if not step6_complete:
+                metrics = (
+                    f"ready({ready_count}/{total}), "
+                    f"created({created}/{total}), "
+                    f"delegated({delegated}/{total}), "
+                    f"passwords({passwords_set}/{total}), "
+                    f"upns({upns_fixed}/{total})"
+                )
+                ps_detail = "; ".join(str(error) for error in ps_errors[:5])
+                completion_error = f"Incomplete mailbox objective: {metrics}"
+                if ps_detail:
+                    completion_error += f". PowerShell: {ps_detail}"
+
+            # Update domain record
+            d = await db.get(Domain, _domain_id)
+            if d:
+                d.step6_complete = step6_complete
+                d.step6_skipped = False
+                d.step6_mailboxes_created = ready_count
+                d.error_message = None if step6_complete else completion_error
+
+            await db.flush()
+
+            # Tenant readiness is derived from all of its linked domains.
+            incomplete_tenant_domains = await db.scalar(
+                select(func.count(Domain.id)).where(
+                    Domain.tenant_id == tenant_id,
+                    Domain.domain_verified_in_m365 == True,
+                    Domain.dkim_enabled == True,
+                    Domain.step6_complete.is_not(True),
+                    Domain.step6_skipped.is_not(True),
+                )
+            ) or 0
+
             t = await db.get(Tenant, tenant_id)
             if t:
                 t.step6_mailboxes_created = created
                 t.step6_delegations_done = delegated
                 t.step6_passwords_set = passwords_set
                 t.step6_upns_fixed = upns_fixed
-
-                # Completion check (90% threshold — same as existing code)
-                total = len(mailbox_list)
-                threshold = total * 0.9
-                if created >= threshold and delegated >= threshold and passwords_set >= threshold:
-                    t.step6_complete = True
+                t.step6_complete = incomplete_tenant_domains == 0
+                if t.step6_complete:
                     t.step6_completed_at = datetime.utcnow()
                     t.status = TenantStatus.READY
                     t.step6_error = None
-                    step6_complete = True
                 else:
-                    missing = []
-                    if created < threshold:
-                        missing.append(f"mailboxes({created}/{total})")
-                    if delegated < threshold:
-                        missing.append(f"delegation({delegated}/{total})")
-                    if passwords_set < threshold:
-                        missing.append(f"passwords({passwords_set}/{total})")
-                    t.step6_error = f"Incomplete - missing: {', '.join(missing)}"
-
-            # Update domain record
-            d = await db.get(Domain, _domain_id)
-            if d:
-                d.step6_complete = step6_complete
-                d.step6_mailboxes_created = created
+                    t.step6_completed_at = None
+                    t.step6_error = completion_error or (
+                        f"{incomplete_tenant_domains} linked domain(s) still "
+                        "require mailbox completion"
+                    )
 
         await save_to_db_with_retry(_save_results, description=f"{domain} results save")
 
@@ -702,6 +918,10 @@ async def process_domain_fast(
             "created": created,
             "delegated": delegated,
             "passwords_set": passwords_set,
+            "upns_fixed": upns_fixed,
+            "ready": ready_count,
+            "expected": len(desired_emails),
+            "error": completion_error,
             "elapsed_seconds": elapsed,
         }
 
@@ -715,6 +935,12 @@ async def process_domain_fast(
                 t = await db.get(Tenant, tenant_id)
                 if t:
                     t.step6_error = error_msg
+                    t.step6_complete = False
+                d = await db.get(Domain, domain_id)
+                if d:
+                    d.step6_complete = False
+                    d.step6_skipped = False
+                    d.error_message = error_msg
 
             await save_to_db_with_retry(_save_error, description=f"{domain} error save")
         except Exception:
@@ -918,10 +1144,12 @@ foreach ($mb in $readyMailboxes) {{
 Write-Host "STEP4_UPNS"
 foreach ($mb in $readyMailboxes) {{
     try {{
-        Set-Mailbox -Identity $mb.Email -MicrosoftOnlineServicesID $mb.Email -ErrorAction SilentlyContinue
+        Set-Mailbox -Identity $mb.Email -MicrosoftOnlineServicesID $mb.Email -ErrorAction Stop
         $results.upns_fixed++
         $results.upn_emails += $mb.Email
-    }} catch {{}}
+    }} catch {{
+        $results.errors += "UPN fix failed: $($mb.Email): $($_.Exception.Message)"
+    }}
     Start-Sleep -Milliseconds 100
 }}
 
@@ -1057,8 +1285,18 @@ async def run_step7_fast(batch_id: UUID, display_name: str) -> Dict[str, Any]:
     # Process with semaphore. Fast mode avoids Chrome, but Phase 3 opens
     # Exchange Online PowerShell sessions, so keep concurrency conservative.
     settings = get_settings()
-    max_parallel = int(getattr(settings, "step7_fast_parallel", 2) or 2)
-    max_parallel = max(1, min(max_parallel, 5))
+    memory_limit = _cgroup_memory_limit_bytes()
+    configured_parallel = int(getattr(settings, "step7_fast_parallel", 1) or 1)
+    max_parallel = _effective_step7_parallel(configured_parallel, memory_limit)
+    if (
+        memory_limit
+        and memory_limit < 2 * 1024**3
+        and configured_parallel > 1
+    ):
+        logger.warning(
+            "Step 7 Fast: forcing max_parallel=1 because container memory limit is %.2f GB",
+            memory_limit / 1024**3,
+        )
     semaphore = asyncio.Semaphore(max_parallel)
 
     logger.info(

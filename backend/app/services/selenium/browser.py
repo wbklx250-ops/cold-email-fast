@@ -131,7 +131,7 @@ def kill_all_browsers() -> None:
     import glob
     import shutil
 
-    logger.info("BROWSER CLEANUP: Killing all Chrome/ChromeDriver processes...")
+    logger.info("BROWSER CLEANUP: Killing all Chrome/Chromium/ChromeDriver processes...")
 
     if platform.system() == "Windows":
         for proc_name in ["chromedriver.exe", "chrome.exe"]:
@@ -140,8 +140,9 @@ def kill_all_browsers() -> None:
             except Exception:
                 pass
     else:
-        # Linux — kill everything Chrome-related
-        for pattern in ["chromedriver", "chrome"]:
+        # Linux — kill everything Chrome-related. Debian's package runs as
+        # chromium, so matching only "chrome" misses the real browser.
+        for pattern in ["chromedriver", "chromium", "chrome_crashpad", "chrome"]:
             try:
                 subprocess.run(["pkill", "-9", "-f", pattern], capture_output=True, timeout=5)
             except Exception:
@@ -150,12 +151,19 @@ def kill_all_browsers() -> None:
     # Clean up ALL temp Chrome profile directories
     try:
         cleaned = 0
-        for d in glob.glob("/tmp/chrome_profile_*"):
-            try:
-                shutil.rmtree(d, ignore_errors=True)
-                cleaned += 1
-            except Exception:
-                pass
+        for pattern in [
+            "/tmp/chrome_profile_*",
+            "/tmp/chrome-step8-*",
+            "/tmp/chrome-pageonly-*",
+            "/tmp/org.chromium.Chromium.*",
+            "/tmp/smartlead-*",
+        ]:
+            for d in glob.glob(pattern):
+                try:
+                    shutil.rmtree(d, ignore_errors=True)
+                    cleaned += 1
+                except Exception:
+                    pass
         if cleaned:
             logger.info(f"BROWSER CLEANUP: Removed {cleaned} temp Chrome profiles")
     except Exception:

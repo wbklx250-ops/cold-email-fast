@@ -5,9 +5,9 @@ Defaults and SMTP Auth state for every tenant in a batch.
 ARCHITECTURE
 ------------
 - SD verification:  Microsoft Graph API via ROPC (primary). Sub-3s per tenant.
-                    Selenium (SecurityDefaultsDisabler) ONLY falls back when
-                    ROPC token minting fails — and is imported *inline* in
-                    that branch so a Graph-only run pays zero Selenium cost.
+                    Selenium (SecurityDefaultsDisabler) falls back whenever
+                    Graph cannot establish the policy state, including missing
+                    policy scopes.
 - SMTP verification: ExchangeOnline PowerShell (existing smtp_auth_fix).
 
 In-memory job state lives in reconciliation_jobs (mirrors pipeline_jobs).
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from datetime import datetime
 from typing import Dict, List, Optional
 from uuid import UUID
@@ -85,10 +86,13 @@ def _tenant_token_domain(tenant: Tenant) -> str:
 
 
 async def _load_batch_tenants(batch_id) -> List[Tenant]:
-    """Load all tenants for a batch with credentials needed for reconciliation."""
+    """Load tenants with completed mailbox setup for reconciliation."""
     async with async_session_factory() as db:
         res = await db.execute(
-            select(Tenant).where(Tenant.batch_id == batch_id)
+            select(Tenant).where(
+                Tenant.batch_id == batch_id,
+                Tenant.step6_complete == True,
+            )
         )
         return list(res.scalars().all())
 
@@ -128,11 +132,30 @@ async def _reconcile_sd_for_tenant(
         t_result["sd"]["sd_disabled"] = actual_sd_disabled
         t_result["sd"]["error"] = sd_result.get("error")
 
-        if action == "token_failed":
-            # Graph unavailable — ROPC blocked means SD is probably still enabled.
-            # Fall back to Selenium for this tenant.
+        if actual_sd_disabled is None and os.getenv("PIPELINE_SKIP_SD_SELENIUM", "0") == "1":
+            summary["sd_ok"] += 1
+            t_result["sd"]["action"] = "graph_unreadable_selenium_skipped"
+            t_result["sd"]["error"] = sd_result.get("error")
+            logger.warning(
+                "[%s] Graph SD state unreadable; Selenium fallback skipped by "
+                "PIPELINE_SKIP_SD_SELENIUM=1",
+                domain,
+            )
+            async with async_session_factory() as db:
+                t = await db.get(Tenant, tenant.id)
+                if t:
+                    t.security_defaults_error = (
+                        "Graph SD state unreadable; Selenium fallback skipped for this run"
+                    )
+                    await db.commit()
+
+        elif actual_sd_disabled is None:
+            # Graph could not establish the state. This includes both ROPC
+            # failures and tokens that lack the policy read scope.
             logger.info(
-                "[%s] Graph token failed, falling back to Selenium for SD", domain
+                "[%s] Graph SD state unreadable (action=%s), falling back to Selenium",
+                domain,
+                action,
             )
 
             # Inline imports so a Graph-only happy-path pays zero Selenium cost

@@ -142,6 +142,19 @@ def _sync_setup_domain(tenant_data: dict) -> dict:
 # FRESH DB SAVE — Opens a NEW session per domain
 # ============================================================
 
+TENANT_CONFLICT_ERROR_MARKERS = (
+    "already added to",
+    "different microsoft 365 organization",
+)
+
+
+def _is_tenant_conflict_error(error: str | None) -> bool:
+    if not error:
+        return False
+    error_lower = error.lower()
+    return any(marker in error_lower for marker in TENANT_CONFLICT_ERROR_MARKERS)
+
+
 async def _save_step6_result(domain_data: dict, selenium_result: dict):
     """
     Save Selenium result using a FRESH database session (BackgroundSessionLocal).
@@ -174,6 +187,7 @@ async def _save_step6_result(domain_data: dict, selenium_result: dict):
                         "dns_configured": False,
                         "error": str(selenium_result)
                     }
+                error_msg = selenium_result.get("error", "Unknown error")
                 
                 if selenium_result.get("success"):
                     # Full success — domain verified AND DNS configured
@@ -226,6 +240,21 @@ async def _save_step6_result(domain_data: dict, selenium_result: dict):
                     await session.refresh(domain_obj)
                     logger.info(f"[{domain_name}] ✓ DB SAVED: verified={domain_obj.domain_verified_in_m365}, dkim={domain_obj.dkim_enabled}")
                 
+                elif _is_tenant_conflict_error(error_msg):
+                    # Microsoft confirmed ownership but refused to add this
+                    # domain because it belongs to another M365 tenant. This is
+                    # terminal for the current tenant and must not be stored as
+                    # a generic partial success.
+                    domain_obj.domain_added_to_m365 = False
+                    domain_obj.domain_verified_in_m365 = False
+                    domain_obj.dkim_enabled = False
+                    domain_obj.status = DomainStatus.ERROR
+                    domain_obj.error_message = error_msg
+                    if tenant_obj:
+                        tenant_obj.setup_error = error_msg
+                    await session.commit()
+                    logger.error(f"[{domain_name}] ✗ DB SAVED tenant conflict: {error_msg}")
+
                 elif selenium_result.get("verified"):
                     # Partial success — domain verified but DNS may not be complete
                     domain_obj.domain_added_to_m365 = True
@@ -245,7 +274,6 @@ async def _save_step6_result(domain_data: dict, selenium_result: dict):
                 
                 else:
                     # Complete failure
-                    error_msg = selenium_result.get("error", "Unknown error")
                     domain_obj.error_message = error_msg
                     if tenant_obj:
                         tenant_obj.setup_error = error_msg

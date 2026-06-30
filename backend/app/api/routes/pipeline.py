@@ -360,29 +360,171 @@ async def create_and_start(
 
 
 
-@router.get("/{batch_id}/status")
-async def get_pipeline_status(batch_id: UUID, db: AsyncSession = Depends(get_db)):
-    """Get real-time pipeline status for the progress dashboard."""
-    job_id = str(batch_id)
+def _default_pipeline_steps(batch: SetupBatch) -> dict:
+    """Build dashboard step state from persisted batch counters."""
+    current_step = batch.pipeline_step or 0
+    pipeline_status = batch.pipeline_status or "unknown"
+    steps = {
+        str(i): {"status": "pending", "completed": 0, "failed": 0, "total": 0}
+        for i in range(1, 12)
+    }
 
-    if job_id in pipeline_jobs:
-        return pipeline_jobs[job_id]
+    for step in range(1, min(current_step, 12)):
+        steps[str(step)]["status"] = "completed"
 
-    # Fallback: read from database
-    batch = await db.get(SetupBatch, batch_id)
-    if not batch:
-        raise HTTPException(404, "Batch not found")
+    if 1 <= current_step <= 11:
+        if pipeline_status == "paused" and current_step == 2:
+            current_status = "waiting_for_user"
+        elif pipeline_status in ("running", "paused", "error", "completed"):
+            current_status = pipeline_status
+        else:
+            current_status = "pending"
+        steps[str(current_step)]["status"] = current_status
 
+    total_domains = batch.total_domains or 0
+    total_tenants = batch.total_tenants or 0
+    steps["1"].update(completed=batch.zones_completed or 0, total=total_domains)
+    steps["3"].update(completed=batch.ns_propagated_count or 0, total=total_domains)
+    steps["4"].update(completed=batch.dns_completed or 0, total=total_domains)
+    steps["5"].update(completed=batch.first_login_completed_count or 0, total=total_tenants)
+    steps["6"].update(completed=batch.m365_completed or 0, total=total_domains)
+    steps["7"].update(completed=batch.mailboxes_completed_count or 0, total=total_domains)
+    steps["8"].update(completed=batch.smtp_completed or 0, total=total_tenants)
+    steps["10"].update(completed=batch.sequencer_uploaded_count or 0, total=total_domains)
+
+    if pipeline_status == "error" and 1 <= current_step <= 11:
+        steps[str(current_step)]["failed"] = batch.errors_count or 0
+
+    return steps
+
+
+def _pipeline_message(batch: SetupBatch) -> str:
+    current_step = batch.pipeline_step or 0
+    step_name = batch.pipeline_step_name or STEP_NAMES.get(current_step, "Unknown")
+    status = batch.pipeline_status or "unknown"
+
+    if status == "completed":
+        return "Pipeline complete!"
+    if status == "paused" and current_step == 2:
+        return "Waiting for nameserver update confirmation..."
+    if status == "paused":
+        return f"Pipeline paused at Step {current_step}: {step_name}"
+    if status == "error":
+        return f"Pipeline error at Step {current_step}: {step_name}"
+    if status == "running":
+        return f"{step_name}..."
+    return step_name
+
+
+async def _get_nameserver_groups(db: AsyncSession, batch_id: UUID) -> list[dict]:
+    result = await db.execute(
+        select(Domain.name, Domain.cloudflare_nameservers)
+        .where(Domain.batch_id == batch_id)
+        .order_by(Domain.name)
+    )
+
+    grouped: dict[tuple[str, ...], list[str]] = {}
+    for domain_name, nameservers in result.all():
+        clean_nameservers = tuple(sorted(ns for ns in (nameservers or []) if ns))
+        if not clean_nameservers:
+            continue
+        grouped.setdefault(clean_nameservers, []).append(domain_name)
+
+    return [
+        {"nameservers": list(nameservers), "domains": domains, "count": len(domains)}
+        for nameservers, domains in sorted(
+            grouped.items(),
+            key=lambda item: (-len(item[1]), item[0]),
+        )
+    ]
+
+
+async def _get_pipeline_errors(db: AsyncSession, batch_id: UUID, limit: int = 20) -> list[dict]:
+    result = await db.execute(
+        select(PipelineLog)
+        .where(
+            PipelineLog.batch_id == batch_id,
+            PipelineLog.status.in_(("failed", "error")),
+        )
+        .order_by(PipelineLog.created_at.desc())
+        .limit(limit)
+    )
+    logs = result.scalars().all()
+    return [
+        {
+            "step": log.step,
+            "error": log.error_detail or log.message or f"{log.step_name} failed",
+        }
+        for log in logs
+    ]
+
+
+async def _get_pipeline_activity(db: AsyncSession, batch_id: UUID, limit: int = 50) -> list[dict]:
+    result = await db.execute(
+        select(PipelineLog)
+        .where(PipelineLog.batch_id == batch_id)
+        .order_by(PipelineLog.created_at.desc())
+        .limit(limit)
+    )
+    logs = result.scalars().all()
+    return [
+        {
+            "step": log.step,
+            "step_name": log.step_name,
+            "item_name": log.item_name,
+            "status": log.status,
+            "message": log.message,
+            "timestamp": log.created_at.isoformat(),
+        }
+        for log in logs
+    ]
+
+
+async def _build_db_pipeline_status(
+    db: AsyncSession,
+    batch: SetupBatch,
+    batch_id: UUID,
+) -> dict:
     return {
         "status": batch.pipeline_status or "unknown",
         "batch_id": str(batch_id),
         "batch_name": batch.name,
         "current_step": batch.pipeline_step or 0,
-        "current_step_name": STEP_NAMES.get(batch.pipeline_step, "Unknown"),
+        "current_step_name": batch.pipeline_step_name or STEP_NAMES.get(batch.pipeline_step, "Unknown"),
+        "message": _pipeline_message(batch),
         "total_domains": batch.total_domains or 0,
         "total_tenants": batch.total_tenants or 0,
         "domains_per_tenant": batch.domains_per_tenant or 1,
+        "nameserver_groups": await _get_nameserver_groups(db, batch_id),
+        "steps": _default_pipeline_steps(batch),
+        "errors": await _get_pipeline_errors(db, batch_id),
+        "activity_log": await _get_pipeline_activity(db, batch_id),
+        "completed_at": batch.pipeline_completed_at.isoformat() if batch.pipeline_completed_at else None,
     }
+
+
+@router.get("/{batch_id}/status")
+async def get_pipeline_status(batch_id: UUID, db: AsyncSession = Depends(get_db)):
+    """Get real-time pipeline status for the progress dashboard."""
+    job_id = str(batch_id)
+    batch = await db.get(SetupBatch, batch_id)
+    if not batch:
+        raise HTTPException(404, "Batch not found")
+
+    if job_id in pipeline_jobs:
+        status = pipeline_jobs[job_id]
+        status.setdefault("message", _pipeline_message(batch))
+        status.setdefault("domains_per_tenant", batch.domains_per_tenant or 1)
+        status.setdefault("steps", _default_pipeline_steps(batch))
+        if "errors" not in status:
+            status["errors"] = await _get_pipeline_errors(db, batch_id)
+        if "activity_log" not in status:
+            status["activity_log"] = await _get_pipeline_activity(db, batch_id)
+        if not status.get("nameserver_groups"):
+            status["nameserver_groups"] = await _get_nameserver_groups(db, batch_id)
+        return status
+
+    return await _build_db_pipeline_status(db, batch, batch_id)
 
 
 @router.post("/{batch_id}/confirm-nameservers")
@@ -761,6 +903,11 @@ async def retry_failed(
         )
     if step == 7 or step is None:
         # Reset Domain-level step6 completion (domain-based iteration)
+        failed_tenant_ids = select(Domain.tenant_id).where(
+            Domain.batch_id == batch_id,
+            Domain.tenant_id.isnot(None),
+            Domain.step6_complete.is_not(True),
+        )
         await db.execute(
             sql_update(Domain).where(
                 Domain.batch_id == batch_id,
@@ -771,9 +918,8 @@ async def retry_failed(
         # Also reset Tenant-level for backward compatibility
         await db.execute(
             sql_update(Tenant).where(
-                Tenant.batch_id == batch_id,
-                Tenant.step6_complete.is_not(True),
-            ).values(step6_retry_count=0, step6_error=None)
+                Tenant.id.in_(failed_tenant_ids),
+            ).values(step6_complete=False, step6_retry_count=0, step6_error=None)
         )
     if step == 8 or step is None:
         await db.execute(
@@ -787,6 +933,9 @@ async def retry_failed(
     start_step = step or batch.pipeline_step or 1
 
     batch.pipeline_status = "running"
+    batch.status = BatchStatus.IN_PROGRESS
+    batch.completed_at = None
+    batch.pipeline_completed_at = None
     await db.commit()
 
     job_id = str(batch_id)
@@ -1239,6 +1388,10 @@ async def _update_pipeline(batch_id: UUID, step: int, status: str, message: str)
                 batch.pipeline_step = step
                 batch.pipeline_step_name = STEP_NAMES.get(step, "Unknown")
                 batch.pipeline_status = status
+                if status != "completed":
+                    batch.status = BatchStatus.IN_PROGRESS
+                    batch.completed_at = None
+                    batch.pipeline_completed_at = None
                 await db.commit()
     except Exception as e:
         logger.error(f"Failed to update pipeline status in DB: {e}")
@@ -2130,15 +2283,39 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
 
             async with SessionLocal() as db:
                 sd_tenants = (await db.execute(
-                    select(Tenant).where(
+                    select(Tenant)
+                    .join(Domain, Domain.tenant_id == Tenant.id)
+                    .where(
                         Tenant.batch_id == batch_id,
+                        Domain.batch_id == batch_id,
+                        Domain.domain_verified_in_m365 == True,
+                        Domain.dkim_enabled == True,
                         Tenant.security_defaults_disabled.is_not(True),
                         Tenant.totp_secret.isnot(None),
                     )
+                    .distinct()
                 )).scalars().all()
 
             sd_ok = 0
             sd_fail = 0
+            sd_total = len(sd_tenants)
+            if os.getenv("PIPELINE_SKIP_SD_SELENIUM", "0") == "1" and sd_tenants:
+                logger.warning(
+                    "Step 6.5: Skipping Selenium Security Defaults pass for %s tenants "
+                    "because PIPELINE_SKIP_SD_SELENIUM=1",
+                    sd_total,
+                )
+                async with SessionLocal() as db:
+                    for t in sd_tenants:
+                        tenant = await db.get(Tenant, t.id)
+                        if tenant:
+                            tenant.security_defaults_error = (
+                                "Selenium Security Defaults pass skipped for this run; "
+                                "ROPC auth will be verified by Step 7/8"
+                            )
+                    await db.commit()
+                sd_tenants = []
+
             for t in sd_tenants:
                 if await _check_paused_or_stopped(batch_id):
                     return
@@ -2177,7 +2354,7 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                             tenant.security_defaults_error = str(e)
                             await db.commit()
 
-            logger.info(f"Step 6.5 complete: {sd_ok} disabled, {sd_fail} failed out of {len(sd_tenants)} tenants")
+            logger.info(f"Step 6.5 complete: {sd_ok} disabled, {sd_fail} failed out of {sd_total} tenants")
 
             kill_all_browsers()
             await asyncio.sleep(5)
@@ -2239,7 +2416,7 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                 except Exception as e:
                     logger.error(f"Step 7 attempt {attempt + 1} failed: {e}")
 
-                # On final attempt, skip any remaining failed domains
+                # On the final attempt, preserve failures for a later retry.
                 if attempt >= MAX_PIPELINE_RETRIES:
                     async with SessionLocal() as db:
                         failed_domains = (await db.execute(
@@ -2253,25 +2430,18 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                             )
                         )).scalars().all()
                         for d in failed_domains:
-                            # Use skip flag instead of lying about completion
-                            d.step6_skipped = True
-                            d.error_message = f"SKIPPED mailbox creation after {MAX_PIPELINE_RETRIES} retries"
+                            d.step6_skipped = False
+                            d.error_message = (
+                                d.error_message
+                                or f"Mailbox creation failed after {MAX_PIPELINE_RETRIES + 1} attempts"
+                            )
                             await log_activity(batch_id, 7, STEP_NAMES[7], "domain", str(d.id),
-                                d.name, "skipped", d.error_message)
-                            # Also mark the parent tenant as complete if all its domains are done/skipped
+                                d.name, "failed", d.error_message)
                             if d.tenant_id:
-                                remaining = await db.scalar(
-                                    select(func.count(Domain.id)).where(
-                                        Domain.tenant_id == d.tenant_id,
-                                        Domain.step6_complete.is_not(True),
-                                        Domain.step6_skipped.is_not(True),
-                                    )
-                                ) or 0
-                                if remaining == 0:
-                                    t = await db.get(Tenant, d.tenant_id)
-                                    if t and not t.step6_complete:
-                                        t.step6_complete = True
-                                        t.step6_error = f"SKIPPED after {MAX_PIPELINE_RETRIES} retries"
+                                t = await db.get(Tenant, d.tenant_id)
+                                if t:
+                                    t.step6_complete = False
+                                    t.step6_error = d.error_message
                         await db.commit()
 
                 if attempt < MAX_PIPELINE_RETRIES:
@@ -2294,6 +2464,42 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
 
             if job_id in pipeline_jobs:
                 pipeline_jobs[job_id]["steps"]["7"]["completed"] = mb_complete
+            async with SessionLocal() as db:
+                mb_incomplete = await db.scalar(
+                    select(func.count(Domain.id)).where(
+                        Domain.batch_id == batch_id,
+                        Domain.tenant_id.isnot(None),
+                        Domain.domain_verified_in_m365 == True,
+                        Domain.dkim_enabled == True,
+                        Domain.step6_complete.is_not(True),
+                        Domain.step6_skipped.is_not(True),
+                    )
+                ) or 0
+                batch = await db.get(SetupBatch, batch_id)
+                if batch:
+                    batch.errors_count = mb_incomplete
+                    await db.commit()
+
+            if mb_incomplete:
+                message = (
+                    f"Step 7 incomplete: {mb_complete} domains completed, "
+                    f"{mb_incomplete} domains still require mailbox creation"
+                )
+                await _update_pipeline(batch_id, 7, "error", message)
+                await log_activity(
+                    batch_id, 7, STEP_NAMES[7],
+                    status="failed",
+                    message=message,
+                )
+                if job_id in pipeline_jobs:
+                    pipeline_jobs[job_id]["steps"]["7"]["failed"] = mb_incomplete
+                    pipeline_jobs[job_id]["steps"]["7"]["status"] = "error"
+                    pipeline_jobs[job_id]["status"] = "error"
+                    pipeline_jobs[job_id]["errors"].append({"step": 7, "error": message})
+                logger.error(message)
+                return
+
+            if job_id in pipeline_jobs:
                 pipeline_jobs[job_id]["steps"]["7"]["status"] = "completed"
             logger.info(f"Step 7 complete: {mb_complete} domains mailboxes created")
 
@@ -2303,13 +2509,15 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
             await asyncio.sleep(5)
 
           except Exception as step_error:
-            logger.error(f"Step 7 CRASHED (continuing to next step): {_fmt_err(step_error)}")
+            logger.error(f"Step 7 CRASHED: {_fmt_err(step_error)}")
             import traceback
             logger.error(traceback.format_exc())
             await log_activity(batch_id, 7, STEP_NAMES[7], status="error", message=_fmt_err(step_error))
             if job_id in pipeline_jobs:
                 pipeline_jobs[job_id]["steps"]["7"]["status"] = "error"
                 pipeline_jobs[job_id]["errors"].append({"step": 7, "error": _fmt_err(step_error)})
+                pipeline_jobs[job_id]["status"] = "error"
+            return
         else:
             logger.info(f"Skipping Step 7 (starting from step {start_from_step})")
             if job_id in pipeline_jobs:
@@ -2379,16 +2587,21 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                         if result.get("success"):
                             tenant.step7_complete = True
                             tenant.step7_smtp_auth_enabled = True
+                            tenant.step7_error = None
                             await log_activity(batch_id, 8, STEP_NAMES[8], "tenant", str(tenant.id),
                                 td["domain"], "completed")
                         else:
                             tenant.step7_retry_count = (tenant.step7_retry_count or 0) + 1
                             tenant.step7_error = result.get("error")
                             if tenant.step7_retry_count > MAX_PIPELINE_RETRIES:
-                                tenant.step7_complete = True
-                                tenant.step7_error = f"SKIPPED after {MAX_PIPELINE_RETRIES} retries: {result.get('error')}"
+                                tenant.step7_complete = False
+                                tenant.step7_smtp_auth_enabled = False
+                                tenant.step7_error = (
+                                    f"SMTP auth failed after {MAX_PIPELINE_RETRIES + 1} attempts: "
+                                    f"{result.get('error')}"
+                                )
                                 await log_activity(batch_id, 8, STEP_NAMES[8], "tenant", str(tenant.id),
-                                    td["domain"], "skipped", tenant.step7_error)
+                                    td["domain"], "failed", tenant.step7_error)
                             else:
                                 await log_activity(batch_id, 8, STEP_NAMES[8], "tenant", str(tenant.id),
                                     td["domain"], "failed", result.get("error"))
@@ -2401,16 +2614,50 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
             async with SessionLocal() as db:
                 smtp_ok = await db.scalar(
                     select(func.count(Tenant.id)).where(
-                        Tenant.batch_id == batch_id, Tenant.step7_complete == True
+                        Tenant.batch_id == batch_id,
+                        Tenant.step7_smtp_auth_enabled == True,
+                    )
+                ) or 0
+                smtp_incomplete = await db.scalar(
+                    select(func.count(Tenant.id)).where(
+                        Tenant.batch_id == batch_id,
+                        Tenant.step6_complete == True,
+                        Tenant.step7_smtp_auth_enabled.is_not(True),
                     )
                 ) or 0
                 batch = await db.get(SetupBatch, batch_id)
                 if batch:
                     batch.smtp_completed = smtp_ok
+                    batch.errors_count = smtp_incomplete
                     await db.commit()
 
             if job_id in pipeline_jobs:
                 pipeline_jobs[job_id]["steps"]["8"]["completed"] = smtp_ok
+                pipeline_jobs[job_id]["steps"]["8"]["failed"] = smtp_incomplete
+
+            if smtp_incomplete:
+                message = (
+                    f"Step 8 incomplete: {smtp_ok} tenants have SMTP auth enabled, "
+                    f"{smtp_incomplete} still require repair"
+                )
+                await _update_pipeline(batch_id, 8, "error", message)
+                await log_activity(
+                    batch_id,
+                    8,
+                    STEP_NAMES[8],
+                    status="failed",
+                    message=message,
+                )
+                if job_id in pipeline_jobs:
+                    pipeline_jobs[job_id]["steps"]["8"]["status"] = "error"
+                    pipeline_jobs[job_id]["status"] = "error"
+                    pipeline_jobs[job_id]["errors"].append(
+                        {"step": 8, "error": message}
+                    )
+                logger.error(message)
+                return
+
+            if job_id in pipeline_jobs:
                 pipeline_jobs[job_id]["steps"]["8"]["status"] = "completed"
             logger.info(f"Step 8 complete: {smtp_ok} tenants SMTP auth enabled")
 
@@ -2418,13 +2665,15 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
             await asyncio.sleep(5)
 
           except Exception as step_error:
-            logger.error(f"Step 8 CRASHED (continuing to next step): {_fmt_err(step_error)}")
+            logger.error(f"Step 8 CRASHED: {_fmt_err(step_error)}")
             import traceback
             logger.error(traceback.format_exc())
             await log_activity(batch_id, 8, STEP_NAMES[8], status="error", message=_fmt_err(step_error))
             if job_id in pipeline_jobs:
                 pipeline_jobs[job_id]["steps"]["8"]["status"] = "error"
                 pipeline_jobs[job_id]["errors"].append({"step": 8, "error": _fmt_err(step_error)})
+                pipeline_jobs[job_id]["status"] = "error"
+            return
         else:
             logger.info(f"Skipping Step 8 (starting from step {start_from_step})")
             if job_id in pipeline_jobs:
@@ -2509,7 +2758,14 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
 
             await log_activity(
                 batch_id, 11, STEP_NAMES[11],
-                status="completed",
+                status=(
+                    "failed"
+                    if (
+                        recon_summary.get("sd_drift_unfixable", 0)
+                        or recon_summary.get("smtp_drift_unfixable", 0)
+                    )
+                    else "completed"
+                ),
                 message=(
                     f"SD ok={recon_summary.get('sd_ok', 0)} "
                     f"fixed={recon_summary.get('sd_drift_fixed', 0)} "
@@ -2520,14 +2776,32 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                     f"errors={len(recon_summary.get('errors', []))}"
                 ),
             )
+
+            reconciliation_unfixable = (
+                recon_summary.get("sd_drift_unfixable", 0)
+                + recon_summary.get("smtp_drift_unfixable", 0)
+            )
+            if reconciliation_unfixable:
+                message = (
+                    "Reconciliation incomplete: "
+                    f"{reconciliation_unfixable} tenant checks remain unverified"
+                )
+                await _update_pipeline(batch_id, 11, "error", message)
+                if job_id in pipeline_jobs:
+                    pipeline_jobs[job_id]["status"] = "error"
+                    pipeline_jobs[job_id]["error"] = message
+                logger.error(message)
+                return
           except Exception as step_error:
-            logger.error(f"Step 11 CRASHED (continuing): {_fmt_err(step_error)}")
+            logger.error(f"Step 11 CRASHED: {_fmt_err(step_error)}")
             import traceback
             logger.error(traceback.format_exc())
             await log_activity(batch_id, 11, STEP_NAMES[11], status="error", message=_fmt_err(step_error))
             if job_id in pipeline_jobs:
                 pipeline_jobs[job_id]["steps"]["11"]["status"] = "error"
                 pipeline_jobs[job_id]["errors"].append({"step": 11, "error": _fmt_err(step_error)})
+                pipeline_jobs[job_id]["status"] = "error"
+            return
         else:
             logger.info(f"Skipping Step 11 (starting from step {start_from_step})")
             if job_id in pipeline_jobs:
@@ -2536,6 +2810,51 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
         # ================================================================
         # PIPELINE COMPLETE
         # ================================================================
+        async with SessionLocal() as db:
+            incomplete_domains = await db.scalar(
+                select(func.count(Domain.id)).where(
+                    Domain.batch_id == batch_id,
+                    Domain.tenant_id.isnot(None),
+                    Domain.domain_verified_in_m365 == True,
+                    Domain.dkim_enabled == True,
+                    Domain.step6_complete.is_not(True),
+                    Domain.step6_skipped.is_not(True),
+                )
+            ) or 0
+            incomplete_smtp = await db.scalar(
+                select(func.count(Tenant.id)).where(
+                    Tenant.batch_id == batch_id,
+                    Tenant.step6_complete == True,
+                    Tenant.step7_smtp_auth_enabled.is_not(True),
+                )
+            ) or 0
+
+        if incomplete_domains or incomplete_smtp:
+            message = (
+                "Pipeline cannot complete: "
+                f"{incomplete_domains} domains require mailbox creation and "
+                f"{incomplete_smtp} tenants require SMTP auth"
+            )
+            blocking_step = 7 if incomplete_domains else 8
+            await _update_pipeline(batch_id, blocking_step, "error", message)
+            async with SessionLocal() as db:
+                batch = await db.get(SetupBatch, batch_id)
+                if batch:
+                    batch.pipeline_status = "error"
+                    batch.status = BatchStatus.IN_PROGRESS
+                    batch.errors_count = incomplete_domains + incomplete_smtp
+                    await db.commit()
+            if job_id in pipeline_jobs:
+                pipeline_jobs[job_id]["status"] = "error"
+                pipeline_jobs[job_id]["error"] = message
+            logger.error(message)
+            await log_activity(
+                batch_id, 11, "Pipeline Incomplete",
+                status="failed",
+                message=message,
+            )
+            return
+
         await _update_pipeline(batch_id, 11, "completed", "Pipeline complete!")
 
         async with SessionLocal() as db:

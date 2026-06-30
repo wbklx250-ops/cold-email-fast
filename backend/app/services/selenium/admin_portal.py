@@ -45,6 +45,9 @@ NON_RETRYABLE_SETUP_ERRORS = (
     "MFA setup is required",
     "MFA required but no TOTP secret",
     "MFA code input appeared but no TOTP secret",
+    "already added to",
+    "already added to a different Microsoft 365 organization",
+    "different Microsoft 365 organization",
 )
 
 MFA_CODE_INPUT_SELECTORS = (
@@ -180,6 +183,10 @@ DNS_RECORD_PAGE_SECTION_MARKERS = (
     "mail protection",
 )
 
+CONNECT_PAGE_WAIT_ATTEMPTS = 60
+DNS_PAGE_WAIT_ATTEMPTS = 60
+WIZARD_RESET_RECOVERY_ATTEMPTS = 45
+
 
 def _remember_active_driver(driver):
     """Track the Selenium driver owned by the current worker thread."""
@@ -310,7 +317,7 @@ def _click_first_visible(driver, domain: str, selectors, description: str, timeo
 def _is_domain_entry_page_text(page_text: str) -> bool:
     text = (page_text or "").lower()
     return (
-        "add a domain" in text
+        ("add a domain" in text or "add domain" in text)
         and "domain name" in text
         and ("use this domain" in text or "example: contoso.com" in text)
     )
@@ -333,6 +340,139 @@ def _is_dns_records_page_text(page_text: str) -> bool:
     )
 
 
+def _is_domain_wizard_shell_text(page_text: str) -> bool:
+    text = (page_text or "").lower()
+    if not text or _is_connect_domain_page_text(text) or _is_dns_records_page_text(text):
+        return False
+    return (
+        ("add domain" in text or "add a domain" in text)
+        and "domain name" in text
+        and "verify your domain" in text
+        and "connect domain" in text
+        and "finish" in text
+        and "use this domain" not in text
+        and "example: contoso.com" not in text
+        and "verify you own your domain" not in text
+        and "before we can set up" not in text
+        and "more options" not in text
+    )
+
+
+def _is_verify_ownership_page_text(page_text: str) -> bool:
+    text = (page_text or "").lower()
+    if (
+        not text
+        or _is_connect_domain_page_text(text)
+        or _is_dns_records_page_text(text)
+        or _is_domain_wizard_shell_text(text)
+    ):
+        return False
+    return "verify" in text and (
+        "ownership" in text
+        or "own your domain" in text
+        or "verify you own" in text
+        or "add a txt" in text
+        or "txt record" in text
+    )
+
+
+def _click_exact_verify_button(driver, domain: str, description: str) -> bool:
+    try:
+        for btn in driver.find_elements(By.TAG_NAME, "button"):
+            btn_text = (btn.text or "").strip().lower()
+            if btn_text in ("verify", "try again"):
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
+                time.sleep(0.5)
+                driver.execute_script("arguments[0].click();", btn)
+                logger.info(f"[{domain}] Clicked TXT verification button '{btn_text}' for {description}")
+                return True
+    except Exception as e:
+        logger.warning(f"[{domain}] Could not click exact Verify button for {description}: {e}")
+    return False
+
+
+def _restart_txt_verification_from_visible_page(driver, domain: str, zone_id: str, context: str) -> bool:
+    """
+    Microsoft can reset back to the automatic registrar verification page after
+    TXT verification. Stay on the visible page path: More options -> TXT,
+    scrape the MS= value, add it, then click the TXT-page Verify button.
+    """
+    from app.services.cloudflare_sync import add_txt
+
+    logger.warning(f"[{domain}] Restarting visible TXT verification flow during {context}")
+    _clear_admin_center_interrupts(driver, domain, f"before visible TXT verification restart in {context}", recover_errors=True)
+    page_text = _safe_page_text(driver)
+
+    txt_match = re.search(r"MS=ms\d+", page_text)
+    if not txt_match:
+        if not _click_first_visible(
+            driver,
+            domain,
+            CONNECT_MORE_OPTIONS_SELECTORS,
+            "Verification page More options",
+            timeout=8,
+        ):
+            logger.warning(f"[{domain}] Could not click More options for visible TXT verification restart")
+            return False
+        time.sleep(2)
+        _clear_admin_center_interrupts(driver, domain, f"after verification More options in {context}", recover_errors=True)
+
+        txt_clicked = False
+        for xpath in [
+            "//input[@type='radio'][following-sibling::*[contains(text(), 'TXT record')]]",
+            "//input[@type='radio'][..//*[contains(text(), 'TXT record')]]",
+            "//*[contains(text(), 'Add a TXT record')]",
+            "//label[contains(., 'TXT record')]",
+            "//div[contains(., 'Add a TXT record') and contains(@class, 'radio')]",
+        ]:
+            if click_element(driver, xpath, "TXT radio button during verification restart"):
+                txt_clicked = True
+                break
+        if not txt_clicked:
+            logger.warning(f"[{domain}] Could not select TXT option for visible verification restart")
+            return False
+
+        time.sleep(1)
+        if not click_element(driver, "//button[contains(., 'Continue')]", "Continue button during verification restart"):
+            logger.warning(f"[{domain}] Could not click Continue for visible verification restart")
+            return False
+        time.sleep(3)
+        _clear_admin_center_interrupts(driver, domain, f"TXT value page in {context}", recover_errors=True)
+        page_text = _safe_page_text(driver)
+        txt_match = re.search(r"MS=ms\d+", page_text)
+
+    if not txt_match:
+        logger.warning(f"[{domain}] TXT value not visible during verification restart")
+        return False
+
+    txt_value = txt_match.group(0)
+    logger.info(f"[{domain}] Visible TXT verification restart scraped TXT: {txt_value}")
+    add_txt(zone_id, txt_value)
+    time.sleep(30)
+
+    if not _click_exact_verify_button(driver, domain, "visible TXT verification restart"):
+        logger.warning(f"[{domain}] Could not click TXT-page Verify during verification restart")
+        return False
+    return True
+
+
+def _click_connect_domain_rail_step(driver, domain: str, context: str) -> bool:
+    clicked = _click_first_visible(
+        driver,
+        domain,
+        (
+            (By.CSS_SELECTOR, "#ConnectDomain"),
+            (By.XPATH, "//*[@id='ConnectDomain']"),
+            (By.XPATH, "//*[contains(normalize-space(), 'Connect domain') and (@role='button' or self::button)]"),
+        ),
+        f"Connect domain rail step during {context}",
+        timeout=2,
+    )
+    if clicked:
+        time.sleep(5)
+    return clicked
+
+
 def _enter_domain_if_wizard_reset(driver, domain: str, context: str) -> bool:
     """
     Microsoft's admin-center error recovery can refresh the wizard back to the
@@ -340,8 +480,54 @@ def _enter_domain_if_wizard_reset(driver, domain: str, context: str) -> bool:
     accidentally scrape the reset page.
     """
     page_text = _safe_page_text(driver)
-    if not _is_domain_entry_page_text(page_text):
+    is_domain_entry = _is_domain_entry_page_text(page_text)
+    is_wizard_shell = _is_domain_wizard_shell_text(page_text)
+    if not is_domain_entry and not is_wizard_shell:
         return False
+
+    if is_wizard_shell:
+        logger.warning(f"[{domain}] Domain wizard reset to shell/progress page during {context}; waiting for a real wizard state")
+        for shell_attempt in range(12):
+            _clear_admin_center_interrupts(driver, domain, f"wizard shell recovery in {context}", recover_errors=True)
+            page_text = _safe_page_text(driver).lower()
+            if _is_connect_domain_page_text(page_text) or _is_dns_records_page_text(page_text) or _is_verify_ownership_page_text(page_text):
+                logger.info(f"[{domain}] Wizard shell recovery reached a real page during {context}")
+                return True
+
+            domain_input, input_selector = _find_first_visible(driver, DOMAIN_NAME_INPUT_SELECTORS, timeout=2)
+            if domain_input:
+                logger.info(f"[{domain}] Wizard shell recovery found domain input: {input_selector}")
+                break
+
+            if shell_attempt in (0, 4, 8):
+                logger.warning(f"[{domain}] Wizard shell still has no domain input during {context}; reopening wizard from Domains")
+                try:
+                    driver.get(_build_admin_url(driver, "/Domains"))
+                    wait_for_page_load(driver, timeout=30)
+                    time.sleep(3)
+                    _clear_admin_center_interrupts(driver, domain, f"Domains page during wizard shell recovery in {context}", recover_errors=True)
+                    if not _click_first_visible(
+                        driver,
+                        domain,
+                        ((By.XPATH, "//button[contains(., 'Add domain')]"),),
+                        "Add domain during wizard shell recovery",
+                        timeout=8,
+                    ):
+                        driver.get(_build_admin_url(driver, "/Domains/Wizard"))
+                        wait_for_page_load(driver, timeout=30)
+                except Exception as e:
+                    logger.warning(f"[{domain}] Wizard shell Domains-page recovery failed during {context}: {e}")
+            elif shell_attempt == 10:
+                logger.warning(f"[{domain}] Wizard shell still blank during {context}; navigating back to wizard route")
+                try:
+                    driver.get(_build_admin_url(driver, "/Domains/Wizard"))
+                    wait_for_page_load(driver, timeout=30)
+                except Exception as e:
+                    logger.warning(f"[{domain}] Wizard route navigation failed during {context}: {e}")
+            time.sleep(3)
+        else:
+            logger.warning(f"[{domain}] Wizard shell did not expose a recoverable input during {context}")
+            return True
 
     logger.warning(f"[{domain}] Domain wizard reset to blank Add domain page during {context}; re-entering domain")
     screenshot(driver, f"wizard_reset_{context.replace(' ', '_')}", domain)
@@ -370,9 +556,87 @@ def _enter_domain_if_wizard_reset(driver, domain: str, context: str) -> bool:
         logger.error(f"[{domain}] Could not click Use this domain after wizard reset")
         return False
 
-    time.sleep(6)
-    screenshot(driver, f"wizard_reset_reentered_{context.replace(' ', '_')}", domain)
-    _clear_admin_center_interrupts(driver, domain, f"after wizard reset re-entry in {context}", recover_errors=True)
+    last_state = "domain_entry"
+    for attempt in range(WIZARD_RESET_RECOVERY_ATTEMPTS):
+        time.sleep(2)
+        _clear_admin_center_interrupts(driver, domain, f"after wizard reset re-entry in {context}", recover_errors=True)
+        page_text = _safe_page_text(driver).lower()
+
+        if _is_connect_domain_page_text(page_text):
+            logger.info(f"[{domain}] Wizard reset recovery reached Connect domain page during {context}")
+            screenshot(driver, f"wizard_reset_recovered_connect_{context.replace(' ', '_')}", domain)
+            return True
+
+        if _is_dns_records_page_text(page_text):
+            logger.info(f"[{domain}] Wizard reset recovery reached DNS records page during {context}")
+            screenshot(driver, f"wizard_reset_recovered_dns_{context.replace(' ', '_')}", domain)
+            return True
+
+        if "domain setup is complete" in page_text:
+            logger.info(f"[{domain}] Wizard reset recovery reached setup-complete page during {context}")
+            return True
+
+        if _is_verify_ownership_page_text(page_text):
+            logger.info(f"[{domain}] Wizard reset recovery reached verification page during {context}")
+            screenshot(driver, f"wizard_reset_recovered_verify_{context.replace(' ', '_')}", domain)
+            return True
+
+        if "verifying your domain" in page_text or "verifying..." in page_text:
+            last_state = "verifying"
+            if attempt % 10 == 0:
+                logger.info(f"[{domain}] Wizard reset recovery waiting for verification spinner during {context}")
+            continue
+
+        if _is_domain_wizard_shell_text(page_text):
+            last_state = "wizard_shell"
+            if _click_connect_domain_rail_step(driver, domain, context):
+                logger.info(f"[{domain}] Clicked Connect domain rail step from wizard shell during {context}")
+                continue
+            if attempt in (4, 12, 24, 36):
+                logger.warning(f"[{domain}] Wizard reset recovery still sees shell page during {context}; refreshing")
+                try:
+                    driver.refresh()
+                    wait_for_page_load(driver, timeout=30)
+                except Exception as e:
+                    logger.warning(f"[{domain}] Wizard shell refresh failed during reset recovery: {e}")
+            continue
+
+        if _is_domain_entry_page_text(page_text):
+            last_state = "domain_entry"
+            if _click_connect_domain_rail_step(driver, domain, context):
+                logger.info(f"[{domain}] Clicked Connect domain rail step from domain-entry page during {context}")
+                continue
+            if attempt in (4, 12, 24, 36):
+                logger.warning(f"[{domain}] Wizard reset still on Add domain page during {context}; submitting domain again")
+                domain_input, input_selector = _find_first_visible(driver, DOMAIN_NAME_INPUT_SELECTORS, timeout=5)
+                if domain_input:
+                    try:
+                        domain_input.clear()
+                        domain_input.send_keys(domain)
+                        logger.info(f"[{domain}] Re-entered domain again after reset: {input_selector}")
+                    except Exception as e:
+                        logger.warning(f"[{domain}] Could not re-enter domain again after reset: {e}")
+                _click_first_visible(
+                    driver,
+                    domain,
+                    DOMAIN_USE_BUTTON_SELECTORS,
+                    "Use this domain retry after wizard reset",
+                    timeout=5,
+                )
+            continue
+
+        last_state = "unknown"
+        if attempt % 10 == 0:
+            logger.info(
+                f"[{domain}] Wizard reset recovery waiting for Microsoft page transition during {context}; "
+                f"text={page_text[:180]}"
+            )
+
+    screenshot(driver, f"wizard_reset_reentry_timeout_{context.replace(' ', '_')}", domain)
+    logger.warning(
+        f"[{domain}] Wizard reset recovery did not reach a recognized page during {context}; "
+        f"last_state={last_state}"
+    )
     return True
 
 
@@ -1127,7 +1391,8 @@ def _handle_mfa_setup_interrupt(driver, domain: str, totp_secret: Optional[str],
 def _is_non_retryable_setup_error(error: Optional[str]) -> bool:
     if not error:
         return False
-    return any(marker in error for marker in NON_RETRYABLE_SETUP_ERRORS)
+    error_lower = error.lower()
+    return any(marker.lower() in error_lower for marker in NON_RETRYABLE_SETUP_ERRORS)
 
 
 def dismiss_mfa_setup_interrupt(driver, domain: str = "unknown", max_attempts: int = 2) -> bool:
@@ -1606,7 +1871,7 @@ def setup_domain_with_retry(
             _cleanup_active_driver(domain)
             if _is_non_retryable_setup_error(last_error):
                 logger.error(f"[{domain}] Non-retryable setup error, not retrying: {last_error}")
-                break
+                return result
             
         except Exception as e:
             last_error = str(e)
@@ -2283,17 +2548,31 @@ def setup_domain_complete_via_admin_portal(
                 
                 # Click "Try again" button
                 try_again_clicked = False
+                visible_verification_page = False
+                page_text = _safe_page_text(driver).lower()
+                if _is_domain_entry_page_text(page_text) or _is_domain_wizard_shell_text(page_text):
+                    _enter_domain_if_wizard_reset(driver, domain, f"verification retry {verify_attempt}")
+                    page_text = _safe_page_text(driver).lower()
+                if _is_verify_ownership_page_text(page_text):
+                    visible_verification_page = True
+                    try_again_clicked = _restart_txt_verification_from_visible_page(
+                        driver,
+                        domain,
+                        zone_id,
+                        f"verification retry {verify_attempt}",
+                    )
                 try:
-                    buttons = driver.find_elements(By.TAG_NAME, "button")
-                    for btn in buttons:
-                        btn_text = btn.text.strip().lower()
-                        if "try again" in btn_text or "verify" in btn_text:
-                            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
-                            time.sleep(0.5)
-                            driver.execute_script("arguments[0].click();", btn)
-                            try_again_clicked = True
-                            logger.info(f"[{domain}] Clicked '{btn.text.strip()}' button for retry")
-                            break
+                    if not try_again_clicked and not visible_verification_page:
+                        buttons = driver.find_elements(By.TAG_NAME, "button")
+                        for btn in buttons:
+                            btn_text = btn.text.strip().lower()
+                            if "try again" in btn_text or btn_text == "verify":
+                                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
+                                time.sleep(0.5)
+                                driver.execute_script("arguments[0].click();", btn)
+                                try_again_clicked = True
+                                logger.info(f"[{domain}] Clicked '{btn.text.strip()}' button for retry")
+                                break
                 except Exception as e:
                     logger.warning(f"[{domain}] Could not click Try again: {e}")
                 
@@ -2318,6 +2597,19 @@ def setup_domain_complete_via_admin_portal(
                     if wait_sec % 10 == 0:
                         logger.info(f"[{domain}] Still verifying... ({wait_sec}s)")
                     continue
+
+                if _is_domain_entry_page_text(page_text) or _is_domain_wizard_shell_text(page_text):
+                    logger.warning(f"[{domain}] Verification flow reset to Add domain wizard; recovering before result check")
+                    _enter_domain_if_wizard_reset(driver, domain, "domain verification wait")
+                    recovered_text = _safe_page_text(driver).lower()
+                    if _is_verify_ownership_page_text(recovered_text):
+                        _restart_txt_verification_from_visible_page(
+                            driver,
+                            domain,
+                            zone_id,
+                            "domain verification wait",
+                        )
+                    continue
                 
                 # Spinner gone - check actual result
                 verification_done = True
@@ -2331,19 +2623,44 @@ def setup_domain_complete_via_admin_portal(
             screenshot(driver, f"09_after_verify_{verify_attempt}", domain)
             _clear_admin_center_interrupts(driver, domain, "after verification result", recover_errors=True)
             page_text = _safe_page_text(driver).lower()
+            if _is_domain_entry_page_text(page_text) or _is_domain_wizard_shell_text(page_text):
+                logger.warning(f"[{domain}] Post-verify result page reset to Add domain wizard; recovering")
+                _enter_domain_if_wizard_reset(driver, domain, "after verification result")
+                page_text = _safe_page_text(driver).lower()
+            if _is_domain_wizard_shell_text(page_text):
+                logger.warning(f"[{domain}] Post-verify page is still only the wizard shell; retrying recovery")
+                if verify_attempt >= MAX_VERIFY_RETRIES:
+                    result["error"] = "Microsoft domain wizard did not load after verification"
+                    _cleanup_driver(driver)
+                    _clear_active_driver(driver)
+                    return result
+                continue
             logger.info(f"[{domain}] Post-verify page text (first 500 chars): {page_text[:500]}")
+
+            if "already added to a different microsoft 365 organization" in page_text:
+                org_match = re.search(
+                    r"different microsoft 365 organization:\s*([^\.\n]+\.onmicrosoft\.com)",
+                    page_text,
+                    re.IGNORECASE,
+                )
+                other_org = org_match.group(1) if org_match else "another Microsoft 365 organization"
+                result["verified"] = True
+                result["error"] = (
+                    f"Domain ownership verified, but {domain} is already added to "
+                    f"{other_org}; remove it from that tenant before adding it here"
+                )
+                logger.error(f"[{domain}] {result['error']}")
+                update_status_file(domain, "verification", "failed", result["error"])
+                _cleanup_driver(driver)
+                _clear_active_driver(driver)
+                return result
             
             # ===== CHECK FOR POSITIVE SUCCESS INDICATORS =====
-            success_indicators = [
-                "how do you want to connect",
-                "connect domain",
-                "add dns records",
-                "domain setup is complete",
-                "exchange online",
-                "mail protection"
-            ]
-            
-            if any(indicator in page_text for indicator in success_indicators):
+            if (
+                _is_connect_domain_page_text(page_text)
+                or _is_dns_records_page_text(page_text)
+                or "domain setup is complete" in page_text
+            ):
                 result["verified"] = True
                 update_status_file(domain, "verification", "complete", "Domain ownership verified")
                 logger.info(f"[{domain}] Verification SUCCESS confirmed! (attempt {verify_attempt + 1})")
@@ -2398,9 +2715,9 @@ def setup_domain_complete_via_admin_portal(
     
     logger.info(f"[{domain}] Step 7: Waiting for 'Connect domain' page...")
     
-    # Wait up to 30 seconds for the connect page to appear
+    # Microsoft Admin Center can take multiple minutes to leave the wizard shell.
     connect_page_found = False
-    for attempt in range(15):  # 15 attempts x 2 seconds = 30 seconds
+    for attempt in range(CONNECT_PAGE_WAIT_ATTEMPTS):
         time.sleep(2)
         _clear_admin_center_interrupts(driver, domain, "connect page wait", recover_errors=True)
         page_text = _safe_page_text(driver).lower()
@@ -2426,7 +2743,7 @@ def setup_domain_complete_via_admin_portal(
             # Continue to end for proper cleanup
             break
         
-        logger.info(f"[{domain}] Waiting for connect page... attempt {attempt+1}/15")
+        logger.info(f"[{domain}] Waiting for connect page... attempt {attempt+1}/{CONNECT_PAGE_WAIT_ATTEMPTS}")
     
     # Take screenshot of current state
     screenshot(driver, "08_connect_page", domain)
@@ -2458,9 +2775,8 @@ def setup_domain_complete_via_admin_portal(
     # ===== STEP 8: WAIT FOR DNS RECORDS PAGE =====
     logger.info(f"[{domain}] Step 8: Waiting for DNS records page to load...")
     
-    # Wait up to 30 seconds for DNS records page
     dns_page_found = False
-    for attempt in range(15):
+    for attempt in range(DNS_PAGE_WAIT_ATTEMPTS):
         time.sleep(2)
         if _clear_admin_center_interrupts(driver, domain, "DNS records page wait", recover_errors=True):
             time.sleep(2)
@@ -2488,7 +2804,7 @@ def setup_domain_complete_via_admin_portal(
             # Continue to end for proper cleanup
             break
         else:
-            logger.info(f"[{domain}] Waiting for DNS page... attempt {attempt+1}/15")
+            logger.info(f"[{domain}] Waiting for DNS page... attempt {attempt+1}/{DNS_PAGE_WAIT_ATTEMPTS}")
     
     if not dns_page_found and result["success"] and result["dns_configured"]:
         logger.info(f"[{domain}] Setup already complete before DNS-record extraction")

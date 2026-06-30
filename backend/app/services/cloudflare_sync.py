@@ -404,7 +404,7 @@ def _verify_record_exists(zone_id, record_type, content_search, headers):
 
 
 def add_txt(zone_id, value):
-    """Add TXT record, deleting ALL existing MS= records first.
+    """Add TXT record, preserving the exact verification value if it exists.
     
     IMPORTANT: Checks both HTTP status code AND Cloudflare API success field
     to ensure the record was actually created.
@@ -412,13 +412,20 @@ def add_txt(zone_id, value):
     logger.info(f"Adding TXT: {value}")
     try:
         headers = _headers_for_zone(zone_id)
+        exact_exists = False
         
-        # Delete ALL existing MS= verification records (may be multiple from retries)
+        # Delete stale MS= verification records, but do not delete/recreate the
+        # exact page-scraped value. Microsoft verification can fail if the TXT
+        # keeps disappearing during retry propagation windows.
         resp = httpx.get(f"{CF_API}/zones/{zone_id}/dns_records?type=TXT", headers=headers, timeout=30)
         if _cf_success(resp):
             for r in resp.json().get("result", []):
                 content = r.get("content", "")
                 if content.startswith("MS=") or content.startswith("ms="):
+                    if content.strip().lower() == value.strip().lower():
+                        exact_exists = True
+                        logger.info(f"TXT already present in Cloudflare, preserving stable record: {value}")
+                        continue
                     del_resp = httpx.delete(f"{CF_API}/zones/{zone_id}/dns_records/{r['id']}", headers=headers, timeout=30)
                     if _cf_success(del_resp):
                         logger.info(f"Deleted old TXT: {content}")
@@ -426,6 +433,12 @@ def add_txt(zone_id, value):
                         logger.warning(f"Failed to delete old TXT {content}: {_cf_error_message(del_resp)}")
         elif resp.status_code == 200:
             logger.warning(f"Cloudflare returned 200 but success=false listing TXT records: {_cf_error_message(resp)}")
+
+        if exact_exists:
+            if _verify_record_exists(zone_id, "TXT", value, headers):
+                logger.info(f"TXT record verified in Cloudflare: {value}")
+                return True
+            logger.warning(f"TXT record was listed but verification check did not find it; attempting create: {value}")
         
         # Add new
         resp = httpx.post(f"{CF_API}/zones/{zone_id}/dns_records", headers=headers,

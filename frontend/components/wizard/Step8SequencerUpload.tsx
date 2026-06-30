@@ -223,8 +223,10 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
       }
     } else {
       // Validate Smartlead inputs
-      if (!smartleadApiKey || !smartleadOAuthUrl) {
-        setError("Please enter Smartlead API Key and OAuth URL");
+      const trimmedSmartleadApiKey = smartleadApiKey.trim();
+      const trimmedSmartleadOAuthUrl = smartleadOAuthUrl.trim();
+      if (!trimmedSmartleadOAuthUrl) {
+        setError("Please enter the Smartlead OAuth URL");
         return;
       }
 
@@ -232,16 +234,20 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
       try {
         // Save Smartlead creds to localStorage for persistence
         try {
-          localStorage.setItem("smartlead_api_key", smartleadApiKey);
-          localStorage.setItem("smartlead_oauth_url", smartleadOAuthUrl);
+          if (trimmedSmartleadApiKey) {
+            localStorage.setItem("smartlead_api_key", trimmedSmartleadApiKey);
+          } else {
+            localStorage.removeItem("smartlead_api_key");
+          }
+          localStorage.setItem("smartlead_oauth_url", trimmedSmartleadOAuthUrl);
         } catch (_) {}
 
         const payload = {
-          api_key: smartleadApiKey,
-          oauth_url: smartleadOAuthUrl,
+          api_key: trimmedSmartleadApiKey || undefined,
+          oauth_url: trimmedSmartleadOAuthUrl,
           num_workers: numWorkers,
           skip_uploaded: skipUploaded,
-          configure_settings: configureSettings,
+          configure_settings: Boolean(trimmedSmartleadApiKey) && configureSettings,
           max_email_per_day: maxEmailPerDay,
           time_to_wait_in_mins: waitMins,
           total_warmup_per_day: warmupPerDay,
@@ -276,8 +282,32 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
       const endpoint = sequencer === "instantly"
         ? `${API_BASE}/api/v1/wizard/batches/${batchId}/step8/retry-failed`
         : `${API_BASE}/api/v1/wizard/batches/${batchId}/step8/smartlead/retry-failed`;
-        
-      const res = await fetch(endpoint, { method: "POST" });
+
+      const requestInit: RequestInit = { method: "POST" };
+      if (sequencer === "smartlead") {
+        const trimmedSmartleadApiKey = smartleadApiKey.trim();
+        const trimmedSmartleadOAuthUrl = smartleadOAuthUrl.trim();
+        if (!trimmedSmartleadOAuthUrl) {
+          setError("Please enter the Smartlead OAuth URL");
+          setIsRunning(false);
+          return;
+        }
+        requestInit.headers = { "Content-Type": "application/json" };
+        requestInit.body = JSON.stringify({
+          api_key: trimmedSmartleadApiKey || undefined,
+          oauth_url: trimmedSmartleadOAuthUrl,
+          num_workers: numWorkers,
+          skip_uploaded: true,
+          configure_settings: Boolean(trimmedSmartleadApiKey) && configureSettings,
+          max_email_per_day: maxEmailPerDay,
+          time_to_wait_in_mins: waitMins,
+          total_warmup_per_day: warmupPerDay,
+          daily_rampup: rampup,
+          reply_rate_percentage: replyRate,
+        });
+      }
+
+      const res = await fetch(endpoint, requestInit);
       const data = await res.json();
       if (!data.success) {
         setError(data.error || data.message || "Failed to retry");
@@ -407,6 +437,8 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
   }
 
   const allComplete = status && status.total > 0 && status.uploaded === status.total;
+  const hasSmartleadApiKey = smartleadApiKey.trim().length > 0;
+  const smartleadSettingsEnabled = hasSmartleadApiKey && configureSettings;
 
   return (
     <div className="space-y-6">
@@ -720,7 +752,7 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
             <div className="space-y-3">
               <div>
                 <label className="block text-xs font-medium text-gray-700 mb-1">
-                  API Key *
+                  API Key (optional)
                 </label>
                 <input
                   type="text"
@@ -753,15 +785,15 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
                 <label className="flex items-center mb-3">
                   <input
                     type="checkbox"
-                    checked={configureSettings}
+                    checked={smartleadSettingsEnabled}
                     onChange={(e) => setConfigureSettings(e.target.checked)}
-                    disabled={isRunning}
+                    disabled={isRunning || !hasSmartleadApiKey}
                     className="mr-2"
                   />
                   <span className="text-sm font-medium text-gray-700">Configure sending & warmup settings</span>
                 </label>
 
-                {configureSettings && (
+                {smartleadSettingsEnabled && (
                   <div className="grid grid-cols-2 gap-3 pl-6">
                     <div>
                       <label className="block text-xs text-gray-600 mb-1">Max emails/day</label>
@@ -872,7 +904,7 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
         <p className="mt-1">
           3) Uses parallel workers to process multiple mailboxes simultaneously
         </p>
-        {sequencer === "smartlead" && configureSettings && (
+        {sequencer === "smartlead" && smartleadSettingsEnabled && (
           <p className="mt-1">
             4) Configures sending limits and warmup settings via Smartlead API
           </p>

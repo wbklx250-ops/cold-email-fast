@@ -147,18 +147,24 @@ export default function CsvSequencerUpload() {
         formData.append("instantly_password", instantlyPassword);
       }
     } else {
-      if (!smartleadApiKey || !smartleadOAuthUrl) { setError("Enter Smartlead API key and OAuth URL"); return; }
-      formData.append("smartlead_api_key", smartleadApiKey);
-      formData.append("smartlead_oauth_url", smartleadOAuthUrl);
-      formData.append("configure_settings", String(configureSettings));
+      const trimmedSmartleadApiKey = smartleadApiKey.trim();
+      const trimmedSmartleadOAuthUrl = smartleadOAuthUrl.trim();
+      if (!trimmedSmartleadOAuthUrl) { setError("Enter Smartlead OAuth URL"); return; }
+      if (trimmedSmartleadApiKey) formData.append("smartlead_api_key", trimmedSmartleadApiKey);
+      formData.append("smartlead_oauth_url", trimmedSmartleadOAuthUrl);
+      formData.append("configure_settings", String(Boolean(trimmedSmartleadApiKey) && configureSettings));
       formData.append("max_email_per_day", String(maxEmailPerDay));
       formData.append("time_to_wait_in_mins", String(waitMins));
       formData.append("total_warmup_per_day", String(warmupPerDay));
       formData.append("daily_rampup", String(rampup));
       formData.append("reply_rate_percentage", String(replyRate));
       try {
-        localStorage.setItem("smartlead_api_key", smartleadApiKey);
-        localStorage.setItem("smartlead_oauth_url", smartleadOAuthUrl);
+        if (trimmedSmartleadApiKey) {
+          localStorage.setItem("smartlead_api_key", trimmedSmartleadApiKey);
+        } else {
+          localStorage.removeItem("smartlead_api_key");
+        }
+        localStorage.setItem("smartlead_oauth_url", trimmedSmartleadOAuthUrl);
       } catch (_) {}
     }
 
@@ -194,6 +200,8 @@ export default function CsvSequencerUpload() {
 
   const allComplete = job && job.status === "completed";
   const progress = job && job.total > 0 ? Math.round(((job.uploaded + job.failed + job.skipped) / job.total) * 100) : 0;
+  const hasSmartleadApiKey = smartleadApiKey.trim().length > 0;
+  const smartleadSettingsEnabled = hasSmartleadApiKey && configureSettings;
 
   return (
     <div className="space-y-6">
@@ -287,7 +295,7 @@ export default function CsvSequencerUpload() {
               <label className="block text-sm font-medium text-gray-700 mb-2">Smartlead Configuration</label>
               <div className="space-y-3">
                 <div>
-                  <label className="block text-xs font-medium text-gray-700 mb-1">API Key *</label>
+                  <label className="block text-xs font-medium text-gray-700 mb-1">API Key (optional)</label>
                   <input type="text" value={smartleadApiKey} onChange={(e) => setSmartleadApiKey(e.target.value)} placeholder="sk_..." className="w-full px-3 py-2 border rounded-lg font-mono text-sm" disabled={isRunning} />
                 </div>
                 <div>
@@ -296,10 +304,10 @@ export default function CsvSequencerUpload() {
                 </div>
                 <div className="pt-3 border-t">
                   <label className="flex items-center mb-3">
-                    <input type="checkbox" checked={configureSettings} onChange={(e) => setConfigureSettings(e.target.checked)} disabled={isRunning} className="mr-2" />
+                    <input type="checkbox" checked={smartleadSettingsEnabled} onChange={(e) => setConfigureSettings(e.target.checked)} disabled={isRunning || !hasSmartleadApiKey} className="mr-2" />
                     <span className="text-sm font-medium text-gray-700">Configure sending & warmup settings</span>
                   </label>
-                  {configureSettings && (
+                  {smartleadSettingsEnabled && (
                     <div className="grid grid-cols-2 gap-3 pl-6">
                       <div><label className="block text-xs text-gray-600 mb-1">Max emails/day</label><input type="number" value={maxEmailPerDay} onChange={(e) => setMaxEmailPerDay(parseInt(e.target.value))} className="w-full px-2 py-1 border rounded text-sm" min={1} max={50} /></div>
                       <div><label className="block text-xs text-gray-600 mb-1">Wait mins</label><input type="number" value={waitMins} onChange={(e) => setWaitMins(parseInt(e.target.value))} className="w-full px-2 py-1 border rounded text-sm" min={1} /></div>

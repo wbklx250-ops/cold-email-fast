@@ -8,6 +8,8 @@ ENV PYTHONUNBUFFERED=1
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    # PID 1 init so Chromium/Chromedriver children are reaped in Railway
+    dumb-init \
     # Chrome/Chromium for Selenium
     chromium \
     chromium-driver \
@@ -70,4 +72,5 @@ EXPOSE 8000
 # start.sh is copied via `COPY . .` above (build context is backend/)
 RUN chmod +x start.sh
 
+ENTRYPOINT ["dumb-init", "--"]
 CMD ["./start.sh"]

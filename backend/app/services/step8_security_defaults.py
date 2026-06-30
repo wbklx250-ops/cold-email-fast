@@ -13,7 +13,12 @@ Key design principles:
 5. Retry failed operations
 """
 
+import os
+import signal
+import shutil
+import tempfile
 import time
+import uuid
 import logging
 import pyotp
 from typing import Dict, List, Optional
@@ -64,6 +69,8 @@ class SecurityDefaultsDisabler:
         self.headless = headless
         self.worker_id = worker_id
         self.driver: Optional[webdriver.Chrome] = None
+        self._profile_dir: Optional[str] = None
+        self._driver_pid: Optional[int] = None
         # Set to True by _click_manage_security_defaults when it detects the
         # "Conditional Access has replaced Security Defaults" UI variant.
         # Inspected by disable_for_tenant() to dispatch to the CA-disable path.
@@ -82,8 +89,9 @@ class SecurityDefaultsDisabler:
     
     def _screenshot(self, name: str):
         """Save screenshot for debugging."""
+        if os.getenv("STEP8_SCREENSHOTS", "0") != "1":
+            return
         if self.driver:
-            import os
             os.makedirs(SCREENSHOT_DIR, exist_ok=True)
             path = f"{SCREENSHOT_DIR}/w{self.worker_id}_{name}.png"
             try:
@@ -91,6 +99,98 @@ class SecurityDefaultsDisabler:
                 self._log(f"Screenshot: {path}")
             except:
                 pass
+
+    def _kill_process_tree(self, root_pid: Optional[int]) -> None:
+        """Best-effort cleanup for Chrome children left behind after tab crashes."""
+        if not root_pid or os.name == "nt":
+            return
+        try:
+            root_pid = int(root_pid)
+        except (TypeError, ValueError):
+            return
+
+        children: Dict[int, List[int]] = {}
+        for pid_s in os.listdir("/proc"):
+            if not pid_s.isdigit():
+                continue
+            try:
+                pid = int(pid_s)
+                with open(f"/proc/{pid}/status", encoding="utf-8", errors="ignore") as fh:
+                    ppid = None
+                    for line in fh:
+                        if line.startswith("PPid:"):
+                            ppid = int(line.split()[1])
+                            break
+                if ppid is not None:
+                    children.setdefault(ppid, []).append(pid)
+            except Exception:
+                continue
+
+        stack = [root_pid]
+        targets: List[int] = []
+        while stack:
+            pid = stack.pop()
+            targets.append(pid)
+            stack.extend(children.get(pid, []))
+
+        for pid in reversed(targets):
+            if pid == os.getpid():
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except Exception:
+                pass
+
+    def _kill_profile_processes(self, profile_dir: Optional[str]) -> None:
+        if not profile_dir or os.name == "nt":
+            return
+        for pid_s in os.listdir("/proc"):
+            if not pid_s.isdigit():
+                continue
+            pid = int(pid_s)
+            if pid == os.getpid():
+                continue
+            try:
+                cmd = (
+                    open(f"/proc/{pid}/cmdline", "rb")
+                    .read()
+                    .replace(b"\0", b" ")
+                    .decode(errors="replace")
+                )
+            except Exception:
+                continue
+            if profile_dir not in cmd:
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except Exception:
+                pass
+
+    def _cleanup_driver(self):
+        driver_pid = self._driver_pid
+        profile_dir = self._profile_dir
+        if self.driver:
+            try:
+                service = getattr(self.driver, "service", None)
+                process = getattr(service, "process", None)
+                driver_pid = driver_pid or getattr(process, "pid", None)
+            except Exception:
+                pass
+            try:
+                self.driver.quit()
+            except Exception:
+                pass
+            self.driver = None
+        self._kill_profile_processes(profile_dir)
+        self._kill_process_tree(driver_pid)
+        if profile_dir:
+            shutil.rmtree(profile_dir, ignore_errors=True)
+            self._profile_dir = None
+        self._driver_pid = None
     
     def _setup_driver(self) -> bool:
         """Initialize Chrome driver with optimal settings."""
@@ -99,8 +199,34 @@ class SecurityDefaultsDisabler:
             opts.add_argument("--no-sandbox")
             opts.add_argument("--disable-dev-shm-usage")
             opts.add_argument("--disable-gpu")
-            opts.add_argument("--window-size=1920,1080")
+            opts.add_argument("--disable-gpu-compositing")
+            opts.add_argument("--disable-software-rasterizer")
+            opts.add_argument("--window-size=1024,768")
+            opts.add_argument("--force-device-scale-factor=1")
             opts.add_argument("--disable-blink-features=AutomationControlled")
+            opts.add_argument("--disable-extensions")
+            opts.add_argument("--disable-background-networking")
+            opts.add_argument("--disable-default-apps")
+            opts.add_argument("--disable-sync")
+            opts.add_argument("--disable-translate")
+            opts.add_argument("--disable-notifications")
+            opts.add_argument("--disable-popup-blocking")
+            opts.add_argument("--disable-component-update")
+            opts.add_argument("--disable-domain-reliability")
+            opts.add_argument("--disable-print-preview")
+            opts.add_argument("--disable-speech-api")
+            opts.add_argument("--disable-webgl")
+            opts.add_argument("--disable-site-isolation-trials")
+            opts.add_argument("--process-per-site")
+            opts.add_argument("--renderer-process-limit=2")
+            opts.add_argument("--num-raster-threads=1")
+            opts.add_argument("--disk-cache-size=1")
+            opts.add_argument("--media-cache-size=1")
+            opts.add_argument("--no-first-run")
+            opts.add_argument("--metrics-recording-only")
+            opts.add_argument("--mute-audio")
+            opts.add_argument("--log-level=3")
+            opts.add_argument("--js-flags=--max-old-space-size=256")
             opts.add_experimental_option("excludeSwitches", ["enable-automation"])
             
             # Disable password manager popup
@@ -108,8 +234,13 @@ class SecurityDefaultsDisabler:
                 "credentials_enable_service": False,
                 "profile.password_manager_enabled": False,
                 "profile.password_manager_leak_detection": False,
+                "profile.managed_default_content_settings.images": 2,
+                "profile.default_content_setting_values.notifications": 2,
             }
             opts.add_experimental_option("prefs", prefs)
+            profile_dir = tempfile.mkdtemp(prefix=f"chrome-step8-{self.worker_id}-{uuid.uuid4()}-")
+            self._profile_dir = profile_dir
+            opts.add_argument(f"--user-data-dir={profile_dir}")
             
             if self.headless:
                 opts.add_argument("--headless=new")
@@ -117,6 +248,10 @@ class SecurityDefaultsDisabler:
                 opts.add_argument("--start-maximized")
             
             self.driver = webdriver.Chrome(options=opts)
+            try:
+                self._driver_pid = self.driver.service.process.pid
+            except Exception:
+                self._driver_pid = None
             self.driver.implicitly_wait(5)
             
             # Hide automation indicators
@@ -1520,12 +1655,7 @@ class SecurityDefaultsDisabler:
             self._log(f"[{creds.domain}] verify_sd_disabled error: {e}", "error")
             result["error"] = str(e)
         finally:
-            if self.driver:
-                try:
-                    self.driver.quit()
-                except Exception:
-                    pass
-                self.driver = None
+            self._cleanup_driver()
         return result
 
     def disable_for_tenant(self, creds: TenantCredentials) -> Dict:
@@ -1571,12 +1701,7 @@ class SecurityDefaultsDisabler:
                     )
                     # We close the Selenium browser before the CA path runs
                     # so its (potential) device-code Selenium flow has a clean slate.
-                    if self.driver:
-                        try:
-                            self.driver.quit()
-                        except Exception:
-                            pass
-                        self.driver = None
+                    self._cleanup_driver()
 
                     ca_res = self._disable_ca_policies_for_tenant(creds)
                     # Merge CA fields into the result envelope
@@ -1636,12 +1761,7 @@ class SecurityDefaultsDisabler:
             self._screenshot("error_exception")
         
         finally:
-            if self.driver:
-                try:
-                    self.driver.quit()
-                except:
-                    pass
-                self.driver = None
+            self._cleanup_driver()
         
         return result
     
