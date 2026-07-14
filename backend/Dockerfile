@@ -10,9 +10,9 @@ ENV PYTHONUNBUFFERED=1
 RUN apt-get update && apt-get install -y --no-install-recommends \
     # PID 1 init so Chromium/Chromedriver children are reaped in Railway
     dumb-init \
-    # Chrome/Chromium for Selenium
-    chromium \
-    chromium-driver \
+    # Chrome/Chromium runtime dependencies for Selenium. The actual browser
+    # packages are pinned below; the current Bookworm Chromium 150 build crashes
+    # headless in Railway with Trace/breakpoint trap.
     # General utilities
     wget \
     curl \
@@ -36,6 +36,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxshmfence1 \
     xdg-utils \
     && rm -rf /var/lib/apt/lists/*
+
+# Pin Chromium + ChromeDriver together. Letting apt install the latest package
+# pulled Chromium 150.0.7871.46, which crashes before Selenium can create a
+# session in the Railway container. 149.0.7827.196 was the last known-good pair.
+# Use Debian's immutable snapshot because superseded versions are removed from
+# the regular deb.debian.org package pool and make otherwise repeatable builds
+# fail with HTTP 404.
+ARG CHROMIUM_VERSION=149.0.7827.196-1~deb12u1
+ARG CHROMIUM_DEB_BASE=https://snapshot.debian.org/archive/debian-security/20260626T014759Z/pool/updates/main/c/chromium
+RUN set -eux; \
+    wget -O /tmp/chromium-common.deb "$CHROMIUM_DEB_BASE/chromium-common_${CHROMIUM_VERSION}_amd64.deb"; \
+    wget -O /tmp/chromium-sandbox.deb "$CHROMIUM_DEB_BASE/chromium-sandbox_${CHROMIUM_VERSION}_amd64.deb"; \
+    wget -O /tmp/chromium.deb "$CHROMIUM_DEB_BASE/chromium_${CHROMIUM_VERSION}_amd64.deb"; \
+    wget -O /tmp/chromium-driver.deb "$CHROMIUM_DEB_BASE/chromium-driver_${CHROMIUM_VERSION}_amd64.deb"; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        /tmp/chromium-common.deb \
+        /tmp/chromium-sandbox.deb \
+        /tmp/chromium.deb \
+        /tmp/chromium-driver.deb; \
+    rm -rf /var/lib/apt/lists/* /tmp/chromium*.deb; \
+    chromium --version; \
+    chromedriver --version
 
 # Install PowerShell Core (Debian 12 Bookworm)
 RUN curl -sSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /usr/share/keyrings/microsoft.gpg \
