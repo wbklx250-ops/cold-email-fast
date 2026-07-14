@@ -2,7 +2,6 @@ import time
 import re
 import os
 import json
-import asyncio
 import pyotp
 import tempfile
 import uuid
@@ -19,8 +18,9 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.action_chains import ActionChains
 import logging
 
-# Import the working BrowserWorker from tenant_automation.py
-# This ensures Step 5 uses the EXACT same browser setup as Step 4
+# BrowserWorker is still used by later admin-center automation. Step 6 uses a
+# lean browser profile below because performance logging makes the M365 admin
+# wizard tab unstable in Railway.
 from app.services.tenant_automation import BrowserWorker
 
 logger = logging.getLogger(__name__)
@@ -31,6 +31,69 @@ os.makedirs(SCREENSHOTS, exist_ok=True)
 os.makedirs(STATUS_DIR, exist_ok=True)
 SCREENSHOT_DIR = "/tmp/screenshots"
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+
+
+def _create_step6_admin_center_driver(headless: bool = True):
+    """
+    Create the browser used for the M365 domain DNS wizard.
+
+    This intentionally does not enable Chrome performance logging. The shared
+    tenant BrowserWorker enables it for token extraction, but the Admin Center
+    DNS wizard does not need it and it caused reproducible tab crashes in
+    Railway after MFA/Domains navigation.
+    """
+    opts = Options()
+    if headless:
+        opts.add_argument("--headless=new")
+
+    for arg in (
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--window-size=1920,1080",
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--disable-default-apps",
+        "--disable-sync",
+        "--disable-translate",
+        "--no-first-run",
+        "--disable-notifications",
+        "--disable-popup-blocking",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-features=ThirdPartyCookieBlocking,VizDisplayCompositor",
+        "--disable-software-rasterizer",
+        "--js-flags=--max-old-space-size=512",
+        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    ):
+        opts.add_argument(arg)
+
+    chrome_binary = os.environ.get("CHROME_PATH")
+    if chrome_binary:
+        opts.binary_location = chrome_binary
+
+    opts.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    opts.add_experimental_option(
+        "prefs",
+        {
+            "credentials_enable_service": False,
+            "profile.password_manager_enabled": False,
+            "profile.password_manager_leak_detection": False,
+            "profile.cookie_controls_mode": 0,
+            "profile.block_third_party_cookies": False,
+        },
+    )
+
+    profile_dir = tempfile.mkdtemp(prefix=f"chrome-step6-{uuid.uuid4()}-")
+    opts.add_argument(f"--user-data-dir={profile_dir}")
+
+    driver = webdriver.Chrome(options=opts)
+    driver._profile_dir = profile_dir
+    try:
+        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+    except Exception:
+        pass
+    return driver
 
 MFA_SETUP_URL_MARKERS = ("mfasetup", "registered=false")
 MFA_SETUP_TEXT_MARKERS = (
@@ -241,6 +304,27 @@ def _safe_page_text(driver) -> str:
             pass
 
 
+BROWSER_SESSION_FAILURE_MARKERS = (
+    "tab crashed",
+    "invalid session id",
+    "chrome not reachable",
+    "disconnected",
+    "target window already closed",
+    "no such window",
+)
+
+
+def _browser_session_usable(driver, domain: str, context: str) -> bool:
+    try:
+        driver.execute_script("return 1;")
+        return True
+    except Exception as e:
+        msg = str(e).lower()
+        log = logger.error if any(marker in msg for marker in BROWSER_SESSION_FAILURE_MARKERS) else logger.warning
+        log(f"[{domain}] Browser session is not usable during {context}: {e}")
+        return False
+
+
 def _mfa_setup_blocking_reason(driver) -> Optional[str]:
     current_url = _safe_current_url(driver).lower()
     if any(marker in current_url for marker in MFA_SETUP_URL_MARKERS):
@@ -337,6 +421,23 @@ def _is_dns_records_page_text(page_text: str) -> bool:
     return (
         ("add dns records" in text or "dns records" in text)
         and sum(1 for marker in DNS_RECORD_PAGE_SECTION_MARKERS if marker in text) >= 1
+    )
+
+
+def _is_domain_setup_complete_page_text(page_text: str) -> bool:
+    text = (page_text or "").lower()
+    if not text:
+        return False
+    if any(marker in text for marker in ("error", "failed", "couldn't verify", "doesn't match", "try again")):
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "domain setup is complete",
+            "setup is complete",
+            "is all set up",
+            "you're all set",
+        )
     )
 
 
@@ -572,7 +673,7 @@ def _enter_domain_if_wizard_reset(driver, domain: str, context: str) -> bool:
             screenshot(driver, f"wizard_reset_recovered_dns_{context.replace(' ', '_')}", domain)
             return True
 
-        if "domain setup is complete" in page_text:
+        if _is_domain_setup_complete_page_text(page_text):
             logger.info(f"[{domain}] Wizard reset recovery reached setup-complete page during {context}")
             return True
 
@@ -645,6 +746,8 @@ def _select_own_dns_on_connect_page(driver, domain: str, max_attempts: int = 5) 
     for attempt in range(max_attempts):
         logger.info(f"[{domain}] Connect-domain DNS selection attempt {attempt + 1}/{max_attempts}")
         _clear_admin_center_interrupts(driver, domain, "connect domain DNS selection", recover_errors=True)
+        if not _browser_session_usable(driver, domain, "connect domain DNS selection"):
+            return False
         if _enter_domain_if_wizard_reset(driver, domain, "connect domain DNS selection"):
             continue
 
@@ -669,10 +772,32 @@ def _select_own_dns_on_connect_page(driver, domain: str, max_attempts: int = 5) 
         if not more_clicked:
             logger.warning(f"[{domain}] Could not click 'More options' - may already be expanded")
 
-        time.sleep(2)
+        wizard_reset_after_more = False
+        option_expanded = False
+        for expand_wait in range(12):
+            time.sleep(1)
+            if _clear_admin_center_interrupts(driver, domain, "connect page More options", recover_errors=True):
+                time.sleep(2)
+            if not _browser_session_usable(driver, domain, "connect page More options"):
+                return False
+            if _enter_domain_if_wizard_reset(driver, domain, "connect page More options"):
+                wizard_reset_after_more = True
+                break
+            page_text_after_more = _safe_page_text(driver).lower()
+            if "add your own dns records" in page_text_after_more:
+                option_expanded = True
+                break
+
+        if wizard_reset_after_more:
+            continue
+        if not option_expanded:
+            logger.warning(f"[{domain}] 'Add your own DNS records' did not appear after More options")
+
         screenshot(driver, f"09_more_options_expanded_{attempt + 1}", domain)
         if _clear_admin_center_interrupts(driver, domain, "connect page More options", recover_errors=True):
             time.sleep(2)
+        if not _browser_session_usable(driver, domain, "connect page More options"):
+            return False
         if _enter_domain_if_wizard_reset(driver, domain, "connect page More options"):
             continue
 
@@ -718,6 +843,8 @@ def _select_own_dns_on_connect_page(driver, domain: str, max_attempts: int = 5) 
         screenshot(driver, f"10_dns_option_selected_{attempt + 1}", domain)
         if _clear_admin_center_interrupts(driver, domain, "connect page DNS option", recover_errors=True):
             time.sleep(2)
+        if not _browser_session_usable(driver, domain, "connect page DNS option"):
+            return False
         if _enter_domain_if_wizard_reset(driver, domain, "connect page DNS option"):
             continue
 
@@ -759,6 +886,8 @@ def _select_own_dns_on_connect_page(driver, domain: str, max_attempts: int = 5) 
         time.sleep(5)
         if _clear_admin_center_interrupts(driver, domain, "after connect Continue", recover_errors=True):
             time.sleep(2)
+        if not _browser_session_usable(driver, domain, "after connect Continue"):
+            return False
         if _enter_domain_if_wizard_reset(driver, domain, "after connect Continue"):
             continue
 
@@ -766,251 +895,8 @@ def _select_own_dns_on_connect_page(driver, domain: str, max_attempts: int = 5) 
 
     logger.warning(
         f"[{domain}] Manual own-DNS option did not survive Microsoft admin-center resets; "
-        "trying the visible Microsoft-managed connect flow through the UI"
+        "retrying with a fresh Selenium browser attempt"
     )
-    _clear_admin_center_interrupts(driver, domain, "before Microsoft-managed connect fallback", recover_errors=True)
-    if _enter_domain_if_wizard_reset(driver, domain, "before Microsoft-managed connect fallback"):
-        return False
-
-    page_text = _safe_page_text(driver).lower()
-    if not _is_connect_domain_page_text(page_text):
-        return False
-
-    continue_clicked = _click_first_visible(
-        driver,
-        domain,
-        CONNECT_CONTINUE_SELECTORS,
-        "Microsoft-managed connect Continue",
-        timeout=8,
-    )
-    if not continue_clicked:
-        return False
-
-    time.sleep(8)
-    screenshot(driver, "10_microsoft_managed_connect_continue", domain)
-    _clear_admin_center_interrupts(driver, domain, "after Microsoft-managed connect Continue", recover_errors=True)
-    if _enter_domain_if_wizard_reset(driver, domain, "after Microsoft-managed connect Continue"):
-        return False
-
-    logger.info(f"[{domain}] Continued through Microsoft-managed connect UI; waiting for resulting wizard page")
-    return True
-
-
-def _run_async_blocking(coro):
-    """Run an async helper from the synchronous Selenium worker thread."""
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(coro)
-
-    result = {}
-    error = {}
-
-    def _runner():
-        try:
-            result["value"] = asyncio.run(coro)
-        except Exception as exc:
-            error["value"] = exc
-
-    worker = threading.Thread(target=_runner, daemon=True)
-    worker.start()
-    worker.join()
-    if "value" in error:
-        raise error["value"]
-    return result.get("value")
-
-
-def _read_dkim_config_for_fallback(admin_email: str, admin_password: str, domain: str) -> dict:
-    """
-    Read/create the Exchange Online DKIM signing config for a fallback DNS flow.
-
-    The admin-center DNS wizard normally displays these CNAME targets. When that
-    wizard crashes before the records page, Exchange is the source of truth.
-    """
-    from app.services.objective_reconciliation import (
-        _attach_dkim_selectors_from_error,
-        _read_dkim_truth,
-    )
-
-    domain_data = {
-        "name": domain,
-        "tenant": {
-            "admin_email": admin_email,
-            "admin_password": admin_password,
-        },
-    }
-
-    attempts = (
-        ("read", {"create": False, "enable": False}),
-        ("create", {"create": True, "enable": False}),
-        ("enable_probe", {"create": True, "enable": True}),
-    )
-    last_dkim = {}
-
-    for label, kwargs in attempts:
-        dkim = _attach_dkim_selectors_from_error(
-            _run_async_blocking(_read_dkim_truth(domain_data, **kwargs))
-        )
-        last_dkim = dkim
-        selector1 = (dkim.get("selector1") or "").rstrip(".")
-        selector2 = (dkim.get("selector2") or "").rstrip(".")
-        if selector1 and selector2:
-            dkim = dict(dkim)
-            dkim["selector1"] = selector1
-            dkim["selector2"] = selector2
-            logger.info(f"[{domain}] Fallback DKIM selectors resolved via Exchange {label}")
-            return dkim
-
-        logger.warning(
-            "[%s] Exchange DKIM %s did not return selectors "
-            "(success=%s exists=%s accepted_domain_exists=%s enabled=%s error=%s)",
-            domain,
-            label,
-            dkim.get("success"),
-            dkim.get("exists"),
-            dkim.get("accepted_domain_exists"),
-            dkim.get("enabled"),
-            dkim.get("error"),
-        )
-
-    return last_dkim
-
-
-def _enable_dkim_for_fallback(admin_email: str, admin_password: str, domain: str) -> tuple[bool, Optional[str]]:
-    from app.services.objective_reconciliation import (
-        _attach_dkim_selectors_from_error,
-        _read_dkim_truth,
-    )
-
-    domain_data = {
-        "name": domain,
-        "tenant": {
-            "admin_email": admin_email,
-            "admin_password": admin_password,
-        },
-    }
-    dkim = _attach_dkim_selectors_from_error(
-        _run_async_blocking(_read_dkim_truth(domain_data, create=True, enable=True))
-    )
-    enabled = bool(dkim.get("enabled") or dkim.get("ok"))
-    return enabled, dkim.get("error")
-
-
-def _configure_m365_dns_without_admin_center(
-    domain: str,
-    zone_id: str,
-    admin_email: str,
-    admin_password: str,
-    reason: str,
-    result: dict,
-) -> bool:
-    """
-    Fallback when the admin-center wizard keeps crashing/resetting.
-
-    Microsoft's required MX/SPF/autodiscover values are deterministic. DKIM
-    selectors come from Exchange Online, so use PowerShell for those instead of
-    scraping a broken admin-center page.
-    """
-    logger.warning(f"[{domain}] Falling back to direct M365 DNS configuration: {reason}")
-
-    try:
-        from app.services.cloudflare_sync import (
-            add_mx,
-            add_spf,
-            add_cname,
-            cleanup_before_dns_setup,
-        )
-    except Exception as e:
-        logger.error(f"[{domain}] Could not import Cloudflare DNS helpers for fallback: {e}")
-        result["error"] = f"Fallback DNS helper import failed: {e}"
-        return False
-
-    mx_target = f"{domain.replace('.', '-')}.mail.protection.outlook.com"
-    spf_value = "v=spf1 include:spf.protection.outlook.com -all"
-
-    cleanup_before_dns_setup(zone_id)
-    mx_ok = bool(add_mx(zone_id, mx_target, 0))
-    spf_ok = bool(add_spf(zone_id, spf_value))
-    autodiscover_ok = bool(add_cname(zone_id, "autodiscover", "autodiscover.outlook.com"))
-
-    result["mx_value"] = mx_target
-    result["spf_value"] = spf_value
-
-    dkim_ok = False
-    selector1 = None
-    selector2 = None
-    try:
-        dkim = _read_dkim_config_for_fallback(admin_email, admin_password, domain)
-        selector1 = (dkim.get("selector1") or "").rstrip(".")
-        selector2 = (dkim.get("selector2") or "").rstrip(".")
-        if selector1 and selector2:
-            logger.info(f"[{domain}] Fallback DKIM selector1: {selector1}")
-            logger.info(f"[{domain}] Fallback DKIM selector2: {selector2}")
-            dkim1_ok = bool(add_cname(zone_id, "selector1._domainkey", selector1))
-            dkim2_ok = bool(add_cname(zone_id, "selector2._domainkey", selector2))
-            dkim_ok = dkim1_ok and dkim2_ok
-            if dkim_ok:
-                result["dkim_selector1_cname"] = selector1
-                result["dkim_selector2_cname"] = selector2
-        else:
-            logger.error(f"[{domain}] Exchange did not return DKIM selectors during fallback: {dkim.get('error')}")
-    except Exception as e:
-        logger.error(f"[{domain}] Fallback DKIM selector lookup failed: {e}")
-
-    enable_ok = False
-    if dkim_ok:
-        for enable_attempt in range(3):
-            try:
-                if enable_attempt:
-                    logger.info(f"[{domain}] Waiting before fallback DKIM enable retry {enable_attempt + 1}/3")
-                    time.sleep(45)
-                enable_ok, enable_error = _enable_dkim_for_fallback(admin_email, admin_password, domain)
-                if enable_ok:
-                    logger.info(f"[{domain}] Fallback DKIM enabled")
-                    break
-                logger.warning(f"[{domain}] Fallback DKIM enable failed: {enable_error}")
-            except Exception as e:
-                logger.warning(f"[{domain}] Fallback DKIM enable attempt failed: {e}")
-
-    result["verified"] = True
-    result["dns_configured"] = bool(mx_ok and spf_ok and autodiscover_ok and dkim_ok)
-    result["success"] = bool(result["dns_configured"] and enable_ok)
-
-    if result["success"]:
-        result["error"] = None
-        logger.info(f"[{domain}] Fallback M365 DNS configuration completed successfully")
-        return True
-
-    missing = []
-    if not mx_ok:
-        missing.append("MX")
-    if not spf_ok:
-        missing.append("SPF")
-    if not autodiscover_ok:
-        missing.append("autodiscover")
-    if not dkim_ok:
-        missing.append("DKIM selectors")
-    if dkim_ok and not enable_ok:
-        missing.append("DKIM enable")
-    result["error"] = f"Fallback DNS configuration incomplete: {', '.join(missing)}"
-    logger.error(f"[{domain}] {result['error']}")
-    return False
-
-
-def _run_or_defer_direct_dns_fallback(
-    domain: str,
-    zone_id: str,
-    admin_email: str,
-    admin_password: str,
-    reason: str,
-    result: dict,
-    allow_direct_dns_fallback: bool,
-) -> bool:
-    result["error"] = (
-        f"Selenium DNS flow did not reach the Microsoft DNS records page ({reason}); "
-        "retrying the browser flow instead of using direct DNS fallback"
-    )
-    logger.warning(f"[{domain}] {result['error']}")
     return False
 
 
@@ -1819,6 +1705,7 @@ def setup_domain_with_retry(
     totp_secret: Optional[str],
     max_retries: int = 2,
     headless: bool = True,
+    expected_dns_values: Optional[dict] = None,
 ) -> dict:
     """
     Setup domain with automatic retry on failure.
@@ -1858,7 +1745,7 @@ def setup_domain_with_retry(
                 admin_password=admin_password,
                 totp_secret=totp_secret,
                 headless=headless,
-                allow_direct_dns_fallback=False,
+                expected_dns_values=expected_dns_values,
             )
             
             if result.get("success"):
@@ -1880,7 +1767,7 @@ def setup_domain_with_retry(
             if _is_non_retryable_setup_error(last_error):
                 logger.error(f"[{domain}] Non-retryable setup exception, not retrying: {last_error}")
                 break
-    
+
     # All attempts failed
     logger.error(f"[{domain}] FAILED after {attempts_used} attempts. Last error: {last_error}")
     return {
@@ -2185,14 +2072,14 @@ def setup_domain_complete_via_admin_portal(
     totp_secret=None,
     cloudflare_service=None,
     headless=False,
-    allow_direct_dns_fallback=False,
+    expected_dns_values=None,
 ):
     """Complete M365 domain setup following EXACT wizard flow.
     
     IMPORTANT: Each step has individual error handling for better resilience.
     The retry wrapper closes this attempt's browser if an unhandled exception bubbles out.
     """
-    from app.services.cloudflare_sync import add_txt, add_mx, add_spf, add_cname, cleanup_before_verification, cleanup_before_dns_setup, resolve_zone_id
+    from app.services.cloudflare_sync import add_txt, add_mx, add_spf, add_cname, add_dmarc, cleanup_before_verification, cleanup_before_dns_setup, resolve_zone_id, verify_existing_m365_dns_setup
     
     logger.info(f"[{domain}] ========== STARTING DOMAIN SETUP ==========")
     driver = None
@@ -2206,7 +2093,53 @@ def setup_domain_complete_via_admin_portal(
         "spf_value": None,
         "dkim_selector1_cname": None,
         "dkim_selector2_cname": None,
+        "dmarc_configured": False,
     }
+
+    expected_dns_values = expected_dns_values or {}
+
+    def _complete_from_existing_microsoft_completion(context: str) -> dict:
+        logger.info(f"[{domain}] Microsoft reports setup complete during {context}; verifying Cloudflare DNS readback")
+        dns_results = verify_existing_m365_dns_setup(
+            zone_id=zone_id,
+            domain=domain,
+            mx_value=expected_dns_values.get("mx_value"),
+            spf_value=expected_dns_values.get("spf_value"),
+            dkim_selector1=(
+                expected_dns_values.get("dkim_selector1_cname")
+                or expected_dns_values.get("dkim_selector1")
+            ),
+            dkim_selector2=(
+                expected_dns_values.get("dkim_selector2_cname")
+                or expected_dns_values.get("dkim_selector2")
+            ),
+        )
+        result["verified"] = True
+        result["dns_configured"] = all(dns_results.values())
+        result["dmarc_configured"] = dns_results.get("dmarc", False)
+        result["mx_value"] = expected_dns_values.get("mx_value")
+        result["spf_value"] = expected_dns_values.get("spf_value")
+        result["dkim_selector1_cname"] = (
+            expected_dns_values.get("dkim_selector1_cname")
+            or expected_dns_values.get("dkim_selector1")
+        )
+        result["dkim_selector2_cname"] = (
+            expected_dns_values.get("dkim_selector2_cname")
+            or expected_dns_values.get("dkim_selector2")
+        )
+        if result["dns_configured"]:
+            result["success"] = True
+            result["error"] = None
+            update_status_file(domain, "complete", "complete", "Microsoft setup complete and Cloudflare DNS verified")
+        else:
+            failed = [name for name, ok in dns_results.items() if not ok]
+            result["success"] = False
+            result["error"] = (
+                "Microsoft reports setup complete, but Cloudflare DNS readback failed for: "
+                + ", ".join(failed)
+            )
+            update_status_file(domain, "complete", "failed", result["error"])
+        return result
     
     # ===== SETUP BROWSER WITH RETRY =====
     # Chrome can fail to start if resources are exhausted - retry up to 3 times
@@ -2217,8 +2150,7 @@ def setup_domain_complete_via_admin_portal(
     
     for chrome_attempt in range(CHROME_STARTUP_RETRIES):
         try:
-            worker = BrowserWorker(worker_id=f"step5-{uuid.uuid4()}", headless=headless)
-            driver = worker._create_driver()
+            driver = _create_step6_admin_center_driver(headless=headless)
             _remember_active_driver(driver)
             driver.implicitly_wait(15)  # Increased from 10
             driver.set_page_load_timeout(60)  # Add page load timeout
@@ -2391,12 +2323,12 @@ def setup_domain_complete_via_admin_portal(
         logger.info(f"[{domain}] Domain already verified and connected - on DNS page")
         result["verified"] = True
         # Will continue to Step 8 (DNS records page)
-    elif "domain setup is complete" in page_text:
-        logger.info(f"[{domain}] Domain already fully set up!")
-        result["success"] = True
-        result["verified"] = True
-        result["dns_configured"] = True
-        # Continue to end of function for proper cleanup
+    elif _is_domain_setup_complete_page_text(page_text):
+        logger.info(f"[{domain}] Domain already fully set up according to Microsoft")
+        _complete_from_existing_microsoft_completion("after domain entry")
+        _cleanup_driver(driver)
+        _clear_active_driver(driver)
+        return result
     
     # ===== STEP 5: VERIFICATION PAGE =====
     _clear_admin_center_interrupts(driver, domain, "before verification-page check", recover_errors=True)
@@ -2659,7 +2591,7 @@ def setup_domain_complete_via_admin_portal(
             if (
                 _is_connect_domain_page_text(page_text)
                 or _is_dns_records_page_text(page_text)
-                or "domain setup is complete" in page_text
+                or _is_domain_setup_complete_page_text(page_text)
             ):
                 result["verified"] = True
                 update_status_file(domain, "verification", "complete", "Domain ownership verified")
@@ -2734,14 +2666,12 @@ def setup_domain_complete_via_admin_portal(
         elif _enter_domain_if_wizard_reset(driver, domain, "connect page wait"):
             logger.info(f"[{domain}] Re-entered domain after wizard reset while waiting for connect page")
             continue
-        elif "domain setup is complete" in page_text:
-            # Already complete!
-            logger.info(f"[{domain}] Domain already complete!")
-            result["success"] = True
-            result["verified"] = True
-            result["dns_configured"] = True
-            # Continue to end for proper cleanup
-            break
+        elif _is_domain_setup_complete_page_text(page_text):
+            logger.info(f"[{domain}] Domain already complete according to Microsoft")
+            _complete_from_existing_microsoft_completion("connect page wait")
+            _cleanup_driver(driver)
+            _clear_active_driver(driver)
+            return result
         
         logger.info(f"[{domain}] Waiting for connect page... attempt {attempt+1}/{CONNECT_PAGE_WAIT_ATTEMPTS}")
     
@@ -2754,19 +2684,7 @@ def setup_domain_complete_via_admin_portal(
     if _is_connect_domain_page_text(page_text):
         if not _select_own_dns_on_connect_page(driver, domain):
             logger.error(f"[{domain}] Could not select own DNS flow on connect page")
-            if _run_or_defer_direct_dns_fallback(
-                domain,
-                zone_id,
-                admin_email,
-                admin_password,
-                "connect-domain own-DNS selection failed",
-                result,
-                allow_direct_dns_fallback,
-            ):
-                _cleanup_driver(driver)
-                _clear_active_driver(driver)
-                return result
-            result["error"] = result.get("error") or "Could not select own DNS flow on connect page"
+            result["error"] = "Could not select own DNS flow on connect page"
             logger.error(f"[{domain}] FAILED - cleaning up browser")
             _cleanup_driver(driver)
             _clear_active_driver(driver)
@@ -2796,38 +2714,19 @@ def setup_domain_complete_via_admin_portal(
             dns_page_found = True
             logger.info(f"[{domain}] Found DNS records page after {(attempt+1)*2} seconds")
             break
-        elif "domain setup is complete" in page_text:
-            logger.info(f"[{domain}] Domain already complete!")
-            result["success"] = True
-            result["verified"] = True
-            result["dns_configured"] = True
-            # Continue to end for proper cleanup
-            break
+        elif _is_domain_setup_complete_page_text(page_text):
+            logger.info(f"[{domain}] Domain already complete according to Microsoft")
+            _complete_from_existing_microsoft_completion("DNS page wait")
+            _cleanup_driver(driver)
+            _clear_active_driver(driver)
+            return result
         else:
             logger.info(f"[{domain}] Waiting for DNS page... attempt {attempt+1}/{DNS_PAGE_WAIT_ATTEMPTS}")
-    
-    if not dns_page_found and result["success"] and result["dns_configured"]:
-        logger.info(f"[{domain}] Setup already complete before DNS-record extraction")
-        _cleanup_driver(driver)
-        _clear_active_driver(driver)
-        return result
 
     if not dns_page_found:
         logger.error(f"[{domain}] DNS page not detected; refusing to extract DNS from the wrong wizard page")
         screenshot(driver, "warning_dns_page_not_detected", domain)
-        if _run_or_defer_direct_dns_fallback(
-            domain,
-            zone_id,
-            admin_email,
-            admin_password,
-            "DNS records page did not load",
-            result,
-            allow_direct_dns_fallback,
-        ):
-            _cleanup_driver(driver)
-            _clear_active_driver(driver)
-            return result
-        result["error"] = result.get("error") or "DNS records page did not load"
+        result["error"] = "DNS records page did not load"
         _cleanup_driver(driver)
         _clear_active_driver(driver)
         return result
@@ -2951,19 +2850,7 @@ def setup_domain_complete_via_admin_portal(
     if not _is_dns_records_page_text(page_text):
         logger.error(f"[{domain}] Current page is not the DNS records page; aborting DNS extraction")
         screenshot(driver, "error_not_dns_records_page", domain)
-        if _run_or_defer_direct_dns_fallback(
-            domain,
-            zone_id,
-            admin_email,
-            admin_password,
-            "DNS extraction attempted on wrong page",
-            result,
-            allow_direct_dns_fallback,
-        ):
-            _cleanup_driver(driver)
-            _clear_active_driver(driver)
-            return result
-        result["error"] = result.get("error") or "DNS extraction attempted on wrong page"
+        result["error"] = "DNS extraction attempted on wrong page"
         _cleanup_driver(driver)
         _clear_active_driver(driver)
         return result
@@ -3004,74 +2891,78 @@ def setup_domain_complete_via_admin_portal(
 
     if not (mx_match and spf_match and sel1_match and sel2_match):
         logger.warning(f"[{domain}] DNS values are incomplete on the admin-center page; retrying Selenium flow")
-        _run_or_defer_direct_dns_fallback(
-            domain,
-            zone_id,
-            admin_email,
-            admin_password,
-            "admin-center DNS page did not expose all required values",
-            result,
-            allow_direct_dns_fallback,
-        )
+        result["error"] = "Admin-center DNS page did not expose all required values"
         _cleanup_driver(driver)
         _clear_active_driver(driver)
         return result
     
     # ===== STEP 8i: ADD ALL RECORDS TO CLOUDFLARE =====
     logger.info(f"[{domain}] Step 8i: Cleaning up conflicting DNS records before adding M365 records")
-    cleanup_before_dns_setup(zone_id)
+    if not cleanup_before_dns_setup(zone_id):
+        result["error"] = "Cloudflare DNS cleanup failed before M365 record setup"
+        update_status_file(domain, "dns_setup", "failed", result["error"])
+        _cleanup_driver(driver)
+        _clear_active_driver(driver)
+        return result
     
     logger.info(f"[{domain}] Step 8i: Adding DNS records to Cloudflare")
+    dns_write_results = {
+        "mx": False,
+        "spf": False,
+        "autodiscover": False,
+        "dkim_selector1": False,
+        "dkim_selector2": False,
+        "dmarc": False,
+    }
     
     if mx_match:
         mx_target = mx_match.group(1)
         logger.info(f"[{domain}] Adding MX: {mx_target}")
-        add_mx(zone_id, mx_target, 0)
+        dns_write_results["mx"] = add_mx(zone_id, mx_target, 0)
         # Store in result for database update
         result["mx_value"] = mx_target
     
     if spf_match:
         spf_value = spf_match.group(1).strip()
         logger.info(f"[{domain}] Adding SPF: {spf_value}")
-        add_spf(zone_id, spf_value)
+        dns_write_results["spf"] = add_spf(zone_id, spf_value)
         # Store in result for database update
         result["spf_value"] = spf_value
     
     logger.info(f"[{domain}] Adding autodiscover CNAME")
-    add_cname(zone_id, "autodiscover", "autodiscover.outlook.com")
+    dns_write_results["autodiscover"] = add_cname(zone_id, "autodiscover", "autodiscover.outlook.com")
     
     # Add DKIM CNAMEs with FULL target values
     if sel1_match:
         dkim1_target = sel1_match.group(1)
         logger.info(f"[{domain}] Adding DKIM: selector1._domainkey -> {dkim1_target}")
-        add_cname(zone_id, "selector1._domainkey", dkim1_target)
+        dns_write_results["dkim_selector1"] = add_cname(zone_id, "selector1._domainkey", dkim1_target)
         # Store in result for database update
         result["dkim_selector1_cname"] = dkim1_target
     
     if sel2_match:
         dkim2_target = sel2_match.group(1)
         logger.info(f"[{domain}] Adding DKIM: selector2._domainkey -> {dkim2_target}")
-        add_cname(zone_id, "selector2._domainkey", dkim2_target)
+        dns_write_results["dkim_selector2"] = add_cname(zone_id, "selector2._domainkey", dkim2_target)
         # Store in result for database update
         result["dkim_selector2_cname"] = dkim2_target
+
+    dns_write_results["dmarc"] = add_dmarc(zone_id, domain)
+    result["dmarc_configured"] = dns_write_results["dmarc"]
     
-    # Only mark dns_configured if we actually found and added the critical records
-    if mx_match and spf_match:
+    # Only mark dns_configured if every required record was written and verified.
+    if all(dns_write_results.values()):
         result["dns_configured"] = True
         update_status_file(domain, "dns_setup", "complete", "DNS records added to Cloudflare")
     else:
-        missing = []
-        if not mx_match:
-            missing.append("MX")
-        if not spf_match:
-            missing.append("SPF")
-        if not sel1_match:
-            missing.append("DKIM selector1")
-        if not sel2_match:
-            missing.append("DKIM selector2")
-        logger.error(f"[{domain}] DNS setup INCOMPLETE - missing values: {', '.join(missing)}")
+        failed_records = [name for name, ok in dns_write_results.items() if not ok]
+        logger.error(f"[{domain}] DNS setup INCOMPLETE - failed records: {', '.join(failed_records)}")
         result["dns_configured"] = False
-        update_status_file(domain, "dns_setup", "partial", f"Missing DNS values: {', '.join(missing)}")
+        result["error"] = f"Cloudflare DNS setup failed for: {', '.join(failed_records)}"
+        update_status_file(domain, "dns_setup", "failed", result["error"])
+        _cleanup_driver(driver)
+        _clear_active_driver(driver)
+        return result
     
     # ===== STEP 8f: WAIT FOR DNS PROPAGATION =====
     update_status_file(domain, "finalizing", "in_progress", "Waiting for DNS propagation")
@@ -3141,7 +3032,7 @@ def setup_domain_complete_via_admin_portal(
         page_text = _safe_page_text(driver).lower()
         
         # Check if we're done
-        if "complete" in page_text or "domain setup is complete" in page_text:
+        if _is_domain_setup_complete_page_text(page_text):
             logger.info(f"[{domain}] SUCCESS - Setup complete on attempt {attempt + 1}!")
             result["success"] = True
             break
@@ -3173,7 +3064,7 @@ def setup_domain_complete_via_admin_portal(
     _clear_admin_center_interrupts(driver, domain, "final setup result", recover_errors=True)
     page_text = _safe_page_text(driver).lower()
     
-    if "complete" in page_text or "domain setup is complete" in page_text:
+    if _is_domain_setup_complete_page_text(page_text):
         logger.info(f"[{domain}] Clicking Done button")
         try:
             btns = driver.find_elements(By.TAG_NAME, "button")
@@ -3187,14 +3078,9 @@ def setup_domain_complete_via_admin_portal(
         # Only set success=True if we actually reached completion page
         result["success"] = True
     else:
-        # Did NOT reach completion - check if DNS was at least configured
-        if result["dns_configured"] and result["verified"]:
-            logger.warning(f"[{domain}] DNS configured but wizard did not reach 'complete' page - marking as partial success")
-            result["success"] = True  # Still consider success if DNS is done
-        else:
-            logger.error(f"[{domain}] Did not reach completion page and DNS not fully configured")
-            if not result["error"]:
-                result["error"] = "Setup did not reach completion page"
+        logger.error(f"[{domain}] Did not reach Microsoft domain setup completion page")
+        if not result["error"]:
+            result["error"] = "Microsoft domain setup wizard did not reach completion page"
     
     # ===== FINAL STATUS UPDATE =====
     if result["success"]:

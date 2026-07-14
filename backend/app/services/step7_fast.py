@@ -877,8 +877,10 @@ async def process_domain_fast(
             incomplete_tenant_domains = await db.scalar(
                 select(func.count(Domain.id)).where(
                     Domain.tenant_id == tenant_id,
+                    Domain.step5_complete == True,
                     Domain.domain_verified_in_m365 == True,
                     Domain.dkim_enabled == True,
+                    Domain.dmarc_configured == True,
                     Domain.step6_complete.is_not(True),
                     Domain.step6_skipped.is_not(True),
                 )
@@ -1248,8 +1250,10 @@ async def run_step7_fast(batch_id: UUID, display_name: str) -> Dict[str, Any]:
             .where(
                 Domain.batch_id == batch_id,
                 Tenant.batch_id == batch_id,
+                Domain.step5_complete == True,
                 Domain.domain_verified_in_m365 == True,
                 Domain.dkim_enabled == True,
+                Domain.dmarc_configured == True,
                 Domain.step6_complete.is_not(True),
                 Domain.step6_skipped.is_not(True),
             )

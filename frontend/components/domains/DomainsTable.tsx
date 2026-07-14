@@ -7,7 +7,6 @@ import { Badge } from "@/components/ui/Badge";
 interface DomainsTableProps {
   domains: Domain[];
   onConfirmNs?: (id: string) => void;
-  onCreateRecords?: (id: string) => void;
   onDelete?: (id: string) => void;
   selectedDomains?: Set<string>;
   onSelectDomain?: (id: string, selected: boolean) => void;
@@ -44,7 +43,6 @@ const formatDate = (dateString: string): string => {
 export function DomainsTable({ 
   domains, 
   onConfirmNs, 
-  onCreateRecords, 
   onDelete,
   selectedDomains = new Set(),
   onSelectDomain,
@@ -187,14 +185,6 @@ export function DomainsTable({
                         className="text-blue-600 hover:text-blue-900 text-xs px-2 py-1 rounded border border-blue-200 hover:bg-blue-50"
                       >
                         Confirm NS
-                      </button>
-                    )}
-                    {domain.status === "cf_zone_active" && onCreateRecords && (
-                      <button
-                        onClick={() => onCreateRecords(domain.id)}
-                        className="text-green-600 hover:text-green-900 text-xs px-2 py-1 rounded border border-green-200 hover:bg-green-50"
-                      >
-                        Create Records
                       </button>
                     )}
                     {onDelete && domain.status !== "retired" && (

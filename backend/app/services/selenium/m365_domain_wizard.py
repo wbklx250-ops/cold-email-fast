@@ -405,8 +405,7 @@ def handle_dns_records_page(driver, domain, zone_id) -> dict:
         extracted["spf_value"] = spf_match.group(1).strip()
         logger.info(f"[{domain}] Found SPF: {extracted['spf_value']}")
     else:
-        extracted["spf_value"] = "v=spf1 include:spf.protection.outlook.com -all"
-        logger.info(f"[{domain}] Using default SPF")
+        logger.error(f"[{domain}] SPF value not found on Microsoft DNS records page")
     
     # === STEP 4: EXTRACT AUTODISCOVER ===
     # Usually "autodiscover.outlook.com"
@@ -414,8 +413,9 @@ def handle_dns_records_page(driver, domain, zone_id) -> dict:
     if autodiscover_match:
         extracted["autodiscover_target"] = f"autodiscover.{autodiscover_match.group(1)}"
     else:
-        extracted["autodiscover_target"] = "autodiscover.outlook.com"
-    logger.info(f"[{domain}] Found autodiscover: {extracted['autodiscover_target']}")
+        logger.error(f"[{domain}] Autodiscover value not found on Microsoft DNS records page")
+    if extracted["autodiscover_target"]:
+        logger.info(f"[{domain}] Found autodiscover: {extracted['autodiscover_target']}")
     
     # === STEP 5: SCROLL TO ADVANCED OPTIONS AND CHECK DKIM ===
     logger.info(f"[{domain}] Looking for Advanced options / DKIM checkbox...")
@@ -500,6 +500,22 @@ def handle_dns_records_page(driver, domain, zone_id) -> dict:
     if selector2_match:
         extracted["dkim_selector2"] = selector2_match.group(1)
         logger.info(f"[{domain}] Found DKIM selector2: {extracted['dkim_selector2']}")
+
+    missing_values = [
+        name
+        for name, value in {
+            "MX": extracted["mx_target"],
+            "SPF": extracted["spf_value"],
+            "autodiscover": extracted["autodiscover_target"],
+            "DKIM selector1": extracted["dkim_selector1"],
+            "DKIM selector2": extracted["dkim_selector2"],
+        }.items()
+        if not value
+    ]
+    if missing_values:
+        extracted["error"] = f"Microsoft DNS page missing required values: {', '.join(missing_values)}"
+        logger.error(f"[{domain}] {extracted['error']}")
+        return extracted
     
     # === STEP 7: ADD ALL RECORDS TO CLOUDFLARE ===
     logger.info(f"[{domain}] Adding records to Cloudflare (deleting duplicates first)...")
@@ -521,6 +537,7 @@ def handle_dns_records_page(driver, domain, zone_id) -> dict:
         set_dkim(zone_id, extracted["dkim_selector1"], extracted["dkim_selector2"])
     else:
         logger.warning(f"[{domain}] DKIM selectors not found, skipping DKIM setup")
+        extracted["error"] = "Microsoft DNS page did not expose all required DKIM selectors"
     
     logger.info(f"[{domain}] All DNS records added to Cloudflare")
     
@@ -677,7 +694,7 @@ def complete_wizard(driver, domain) -> bool:
                 continue
     
     screenshot(driver, "41_wizard_final", domain)
-    return True
+    return False
 
 
 def run_full_domain_setup(domain: str, zone_id: str, admin_email: str, 
@@ -756,6 +773,23 @@ def run_full_domain_setup(domain: str, zone_id: str, admin_email: str,
         # Step 6: Handle DNS records page (MX, SPF, autodiscover, DKIM)
         logger.info(f"[{domain}] === STEP 6: DNS RECORDS PAGE ===")
         dns_values = handle_dns_records_page(driver, domain, zone_id)
+        if dns_values.get("error"):
+            result["error"] = dns_values["error"]
+            return result
+        missing_dns_values = [
+            name
+            for name, value in {
+                "MX": dns_values.get("mx_target"),
+                "SPF": dns_values.get("spf_value"),
+                "autodiscover": dns_values.get("autodiscover_target"),
+                "DKIM selector1": dns_values.get("dkim_selector1"),
+                "DKIM selector2": dns_values.get("dkim_selector2"),
+            }.items()
+            if not value
+        ]
+        if missing_dns_values:
+            result["error"] = f"Microsoft DNS page missing required values: {', '.join(missing_dns_values)}"
+            return result
         
         result["mx_target"] = dns_values.get("mx_target")
         result["spf_value"] = dns_values.get("spf_value")
@@ -768,7 +802,9 @@ def run_full_domain_setup(domain: str, zone_id: str, admin_email: str,
         
         # Step 7: Complete wizard
         logger.info(f"[{domain}] === STEP 7: COMPLETE WIZARD ===")
-        complete_wizard(driver, domain)
+        if not complete_wizard(driver, domain):
+            result["error"] = "Microsoft domain setup wizard did not reach completion page"
+            return result
         
         result["success"] = True
         logger.info(f"[{domain}] ========== SETUP COMPLETE ==========")

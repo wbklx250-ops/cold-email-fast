@@ -218,12 +218,6 @@ export const confirmNameservers = async (id: string): Promise<Domain> => {
   });
 };
 
-export const createDnsRecords = async (id: string): Promise<{ message: string; records_created: string[] }> => {
-  return apiRequest<{ message: string; records_created: string[] }>(`${API_BASE}/api/v1/domains/${id}/create-dns`, {
-    method: "POST",
-  });
-};
-
 export const verifyDnsRecords = async (id: string): Promise<Domain> => {
   return apiRequest<Domain>(`${API_BASE}/api/v1/domains/${id}/status`, {
     method: "GET",
@@ -840,27 +834,6 @@ export const bulkImportTenantsCsv = async (file: File): Promise<TenantBulkImport
   return (await response.json()) as TenantBulkImportResult;
 };
 
-export const bulkAddTenantsToM365 = async (tenantIds?: string[]): Promise<TenantBulkOperationResult> => {
-  return apiRequest<TenantBulkOperationResult>(`${API_BASE}/api/v1/tenants/bulk-add-to-m365`, {
-    method: "POST",
-    body: tenantIds || null,
-  });
-};
-
-export const bulkSetupTenantDns = async (tenantIds?: string[]): Promise<TenantBulkOperationResult> => {
-  return apiRequest<TenantBulkOperationResult>(`${API_BASE}/api/v1/tenants/bulk-setup-dns`, {
-    method: "POST",
-    body: tenantIds || null,
-  });
-};
-
-export const bulkSetupTenantDkim = async (tenantIds?: string[]): Promise<TenantBulkOperationResult> => {
-  return apiRequest<TenantBulkOperationResult>(`${API_BASE}/api/v1/tenants/bulk-setup-dkim`, {
-    method: "POST",
-    body: tenantIds || null,
-  });
-};
-
 export const bulkCreateMailboxesInM365 = async (tenantIds?: string[]): Promise<TenantBulkOperationResult> => {
   return apiRequest<TenantBulkOperationResult>(`${API_BASE}/api/v1/tenants/bulk-create-mailboxes`, {
     method: "POST",
@@ -988,18 +961,6 @@ export const wizardImportTenants = async (file: File): Promise<WizardStepResult>
   }
 
   return (await response.json()) as WizardStepResult;
-};
-
-export const wizardSetupM365 = async (): Promise<WizardStepResult> => {
-  return apiRequest<WizardStepResult>(`${API_BASE}/api/v1/wizard/step5/setup-m365`, {
-    method: "POST",
-  });
-};
-
-export const wizardSetupDkim = async (): Promise<WizardStepResult> => {
-  return apiRequest<WizardStepResult>(`${API_BASE}/api/v1/wizard/step5/setup-dkim`, {
-    method: "POST",
-  });
 };
 
 export const wizardGenerateMailboxes = async (

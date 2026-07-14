@@ -435,22 +435,26 @@ def _do_login(
         logger.warning(f"[{tenant_name}] MFA setup interrupt dismiss raised: {e}")
 
     # --- VERIFY WE'RE IN THE ADMIN PORTAL ---
-    time.sleep(2)
+    # Microsoft can leave the browser on a login.microsoftonline.com reprocess
+    # URL after auth. Treat that as an intermediate login URL, not as the admin
+    # app itself, and explicitly navigate to Admin Center before continuing.
+    for attempt in range(3):
+        time.sleep(2 if attempt == 0 else 4)
+        current_url = driver.current_url.lower()
+        if "admin.cloud.microsoft" in current_url or "admin.microsoft.com" in current_url:
+            logger.info(f"[{tenant_name}] Login successful — URL: {current_url}")
+            return True
+
+        logger.info(f"[{tenant_name}] Login URL is not Admin Center yet; opening admin.cloud.microsoft")
+        driver.get("https://admin.cloud.microsoft")
+
     current_url = driver.current_url.lower()
-    if "admin.microsoft.com" in current_url or "portal.office.com" in current_url:
-        logger.info(f"[{tenant_name}] Login successful — URL: {current_url}")
+    if "admin.cloud.microsoft" in current_url or "admin.microsoft.com" in current_url:
+        logger.info(f"[{tenant_name}] Login successful after explicit Admin Center navigation — URL: {current_url}")
         return True
 
-    # Sometimes there's a redirect delay
-    time.sleep(4)
-    current_url = driver.current_url.lower()
-    if "admin" in current_url or "office" in current_url or "microsoft" in current_url:
-        logger.info(f"[{tenant_name}] Login appears successful — URL: {current_url}")
-        return True
-
-    logger.warning(f"[{tenant_name}] Login uncertain — URL: {current_url}")
-    # Still return True — the domains page navigation will confirm
-    return True
+    logger.warning(f"[{tenant_name}] Login did not reach Admin Center — URL: {current_url}")
+    return False
 
 
 def _get_domains_url(driver: webdriver.Chrome, tenant_name: str) -> str:
@@ -462,9 +466,17 @@ def _get_domains_url(driver: webdriver.Chrome, tenant_name: str) -> str:
     to avoid a broken redirect chain.
     """
     current_url = driver.current_url
-    # Extract base: e.g. "https://admin.cloud.microsoft" or "https://admin.microsoft.com"
-    # Strip hash fragment and query params
-    base = current_url.split("#")[0].split("?")[0].rstrip("/")
+    if "admin.cloud.microsoft" in current_url:
+        base = "https://admin.cloud.microsoft"
+    elif "admin.microsoft.com" in current_url:
+        base = "https://admin.microsoft.com"
+    else:
+        logger.warning(
+            f"[{tenant_name}] Current URL is not an Admin Center host ({current_url}); "
+            "using admin.cloud.microsoft for Domains page"
+        )
+        base = "https://admin.cloud.microsoft"
+
     domains_url = f"{base}/#/Domains"
     logger.info(f"[{tenant_name}] Admin base URL: {base}")
     return domains_url
@@ -607,11 +619,11 @@ def _scrape_domains(driver: webdriver.Chrome, tenant_name: str) -> List[DomainIn
                     if match.lower().endswith(".onmicrosoft.com"):
                         domain_info.is_default = True
 
-                    # Default: custom domains are verified (M365 shows them as Healthy)
-                    # Only mark unverified if explicit unverified indicators found
                     row_lower = row_text.lower()
                     is_custom = not match.lower().endswith(".onmicrosoft.com")
-                    domain_info.is_verified = is_custom  # Custom = verified by default
+                    domain_info.is_verified = False if is_custom else True
+                    if is_custom:
+                        domain_info.status_text = "Status unknown"
 
                     # Explicitly unverified indicators override the default
                     if any(kw in row_lower for kw in [
@@ -625,7 +637,6 @@ def _scrape_domains(driver: webdriver.Chrome, tenant_name: str) -> List[DomainIn
                             "Setup in progress"
                         )
 
-                    # Explicitly verified indicators confirm the default
                     if "healthy" in row_lower or "verified" in row_lower:
                         domain_info.is_verified = True
                         domain_info.status_text = "Healthy"
@@ -661,9 +672,10 @@ def _scrape_domains(driver: webdriver.Chrome, tenant_name: str) -> List[DomainIn
                         if match.lower().endswith(".onmicrosoft.com"):
                             domain_info.is_default = True
 
-                        # Default custom domains to verified, same logic as Strategy 1
                         is_custom = not match.lower().endswith(".onmicrosoft.com")
-                        domain_info.is_verified = is_custom
+                        domain_info.is_verified = False if is_custom else True
+                        if is_custom:
+                            domain_info.status_text = "Status unknown"
 
                         # Check adjacent text for explicit status overrides
                         line_lower = line.lower()

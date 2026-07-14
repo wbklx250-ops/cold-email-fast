@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { Domain, confirmNameservers, createDnsRecords, verifyDnsRecords, deleteDomain } from "@/lib/api";
+import { Domain, confirmNameservers, verifyDnsRecords, deleteDomain } from "@/lib/api";
 
 interface DomainActionsProps {
   domain: Domain;
@@ -19,7 +19,6 @@ interface ActionFeedback {
 export function DomainActions({ domain, onUpdate }: DomainActionsProps) {
   const router = useRouter();
   const [confirmNsState, setConfirmNsState] = useState<ActionFeedback>({ state: "idle" });
-  const [createRecordsState, setCreateRecordsState] = useState<ActionFeedback>({ state: "idle" });
   const [verifyDnsState, setVerifyDnsState] = useState<ActionFeedback>({ state: "idle" });
   const [deleteState, setDeleteState] = useState<ActionFeedback>({ state: "idle" });
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
@@ -34,21 +33,6 @@ export function DomainActions({ domain, onUpdate }: DomainActionsProps) {
     } catch (err) {
       console.error("Failed to confirm nameservers:", err);
       setConfirmNsState({ state: "error", message: "Failed to confirm. NS may not be propagated yet." });
-    }
-  };
-
-  const handleCreateRecords = async () => {
-    setCreateRecordsState({ state: "loading" });
-    try {
-      const result = await createDnsRecords(domain.id);
-      setCreateRecordsState({ state: "success", message: `Created ${result.records_created.length} DNS records` });
-      // Refresh domain data
-      const updated = await verifyDnsRecords(domain.id);
-      onUpdate(updated);
-      setTimeout(() => setCreateRecordsState({ state: "idle" }), 3000);
-    } catch (err) {
-      console.error("Failed to create DNS records:", err);
-      setCreateRecordsState({ state: "error", message: "Failed to create DNS records" });
     }
   };
 
@@ -121,7 +105,6 @@ export function DomainActions({ domain, onUpdate }: DomainActionsProps) {
 
   // Determine which actions to show based on status
   const showConfirmNs = domain.status === "ns_propagating";
-  const showCreateRecords = domain.status === "dns_configuring";
   const showVerifyDns = domain.status === "dns_configuring" || domain.status === "active";
   const isFullyActive = domain.status === "active" && 
     domain.mx_configured && domain.spf_configured && domain.dkim_enabled && domain.dmarc_configured;
@@ -137,9 +120,9 @@ export function DomainActions({ domain, onUpdate }: DomainActionsProps) {
               Update your nameservers at your domain registrar, then click the button below to confirm.
             </p>
           )}
-          {showCreateRecords && (
+          {domain.status === "dns_configuring" && (
             <p className="text-sm text-blue-700">
-              Nameservers are configured! Now create the DNS records for email.
+              Email DNS is created by the batch setup wizard after Microsoft shows the required records.
             </p>
           )}
           {showVerifyDns && !isFullyActive && (
@@ -174,15 +157,6 @@ export function DomainActions({ domain, onUpdate }: DomainActionsProps) {
             "I've Updated My Nameservers",
             handleConfirmNs,
             confirmNsState,
-            "primary"
-          )
-        )}
-
-        {showCreateRecords && (
-          renderActionButton(
-            "Create DNS Records",
-            handleCreateRecords,
-            createRecordsState,
             "primary"
           )
         )}

@@ -7,7 +7,6 @@ import {
   DomainStatus,
   listDomains, 
   confirmNameservers, 
-  createDnsRecords, 
   bulkDeleteDomains, 
   deleteDomain,
   bulkImportDomains,
@@ -101,20 +100,6 @@ export default function DomainsPage() {
     } catch (err) {
       console.error("Failed to confirm nameservers:", err);
       alert("Failed to confirm nameservers. Please try again.");
-    } finally {
-      setActionLoading(null);
-    }
-  };
-
-  const handleCreateRecords = async (id: string) => {
-    setActionLoading(id);
-    try {
-      await createDnsRecords(id);
-      // Refresh to get updated domain
-      await fetchDomains();
-    } catch (err) {
-      console.error("Failed to create DNS records:", err);
-      alert("Failed to create DNS records. Please try again.");
     } finally {
       setActionLoading(null);
     }
@@ -457,7 +442,6 @@ export default function DomainsPage() {
         <DomainsTable
           domains={filteredDomains}
           onConfirmNs={handleConfirmNs}
-          onCreateRecords={handleCreateRecords}
           onDelete={handleDeleteDomain}
           selectedDomains={selectedDomains}
           onSelectDomain={handleSelectDomain}

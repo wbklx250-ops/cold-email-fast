@@ -3,7 +3,8 @@ Objective batch reconciliation.
 
 This pass treats local DB flags as cache only. It checks Microsoft Graph,
 Exchange Online, and Cloudflare directly, then updates DB flags from observed
-truth and repairs only missing/incorrect pieces.
+truth. Email-auth DNS repairs must go through the Microsoft Admin Center
+setup wizard; this reconciliation pass does not write MX/SPF/DKIM records.
 """
 
 from __future__ import annotations
@@ -198,7 +199,7 @@ async def _repair_m365_domain_with_selenium(
     domain_data: Dict[str, Any],
     reason: str,
 ) -> Dict[str, Any]:
-    """Fallback for tenants where Graph app consent is unavailable."""
+    """Repair M365 domain state only through the Admin Center DNS wizard."""
     domain = domain_data["name"]
     tenant = domain_data["tenant"]
     result = {
@@ -208,7 +209,7 @@ async def _repair_m365_domain_with_selenium(
         "token_ok": False,
         "access_token": None,
         "verification_txt": None,
-        "action": "selenium_fallback",
+        "action": "admin_center_wizard_repair",
         "error": reason,
     }
 
@@ -238,7 +239,7 @@ async def _repair_m365_domain_with_selenium(
             "totp_secret": tenant.get("totp_secret"),
         }
 
-        logger.info("[%s] Graph unavailable; running Selenium M365 setup fallback", domain)
+        logger.info("[%s] Running Admin Center DNS wizard repair", domain)
         future = asyncio.get_event_loop().run_in_executor(
             None,
             _sync_setup_domain,
@@ -266,15 +267,15 @@ async def _repair_m365_domain_with_selenium(
                 "domain_exists": verified,
                 "verified": verified,
                 "verification_txt": selenium_result.get("verification_txt"),
-                "action": "selenium_repaired" if verified else "selenium_failed",
+                "action": "admin_center_wizard_repaired" if verified else "admin_center_wizard_failed",
                 "error": None if verified else selenium_result.get("error") or reason,
             }
         )
         return result
     except Exception as exc:
-        logger.exception("[%s] Selenium M365 fallback failed", domain)
-        result["action"] = "selenium_exception"
-        result["error"] = f"{reason}; Selenium fallback failed: {exc}"
+        logger.exception("[%s] Admin Center DNS wizard repair failed", domain)
+        result["action"] = "admin_center_wizard_exception"
+        result["error"] = f"{reason}; Admin Center DNS wizard repair failed: {exc}"
         return result
 
 
@@ -298,18 +299,19 @@ async def _verify_m365_without_graph(
     auto_fix: bool,
 ) -> Dict[str, Any]:
     """
-    If Graph app consent is missing, use Exchange as objective evidence first.
+    If Graph readback is unavailable, use Exchange as objective evidence first.
 
     A DKIM signing config can only be read/created for a domain accepted by the
-    tenant. That is enough to avoid expensive Selenium for already-attached
-    domains, while still falling back to Selenium for domains that are not in
-    Exchange.
+    tenant. If the domain is not visible there, the only repair path is the
+    Admin Center DNS wizard.
     """
     domain = domain_data["name"]
     result = {
         "ok": False,
         "domain_exists": False,
         "verified": False,
+        "email_service_enabled": False,
+        "supported_services": [],
         "token_ok": False,
         "access_token": None,
         "verification_txt": None,
@@ -337,6 +339,7 @@ async def _verify_m365_without_graph(
                 "ok": True,
                 "domain_exists": True,
                 "verified": True,
+                "email_service_enabled": True,
                 "action": "exchange_dkim_confirmed",
                 "error": None,
             }
@@ -359,6 +362,8 @@ async def _verify_m365_domain(
         "ok": False,
         "domain_exists": False,
         "verified": False,
+        "email_service_enabled": False,
+        "supported_services": [],
         "token_ok": False,
         "access_token": None,
         "verification_txt": None,
@@ -386,59 +391,26 @@ async def _verify_m365_domain(
         graph_domain = await _get_graph_domain(access_token, domain)
     except RuntimeError as exc:
         return await _verify_m365_without_graph(domain_data, str(exc), auto_fix)
-    if not graph_domain and auto_fix:
-        status, data = await _graph_request(
-            access_token,
-            "POST",
-            "/domains",
-            {"id": domain},
-        )
-        if status not in (200, 201):
-            result["action"] = "add_failed"
-            result["error"] = data.get("error", {}).get("message") or str(data)
-            return result
-        result["action"] = "added"
-        graph_domain = await _get_graph_domain(access_token, domain)
 
     result["domain_exists"] = graph_domain is not None
     result["verified"] = bool(graph_domain and graph_domain.get("isVerified"))
+    result["supported_services"] = _as_list(graph_domain.get("supportedServices") if graph_domain else [])
+    result["email_service_enabled"] = "email" in result["supported_services"]
 
-    if result["verified"]:
+    if result["verified"] and result["email_service_enabled"]:
         result["ok"] = True
         return result
 
-    if not auto_fix or not graph_domain:
+    if not graph_domain:
+        result["error"] = "Domain is missing from this tenant"
+    elif not result["verified"]:
         result["error"] = "Domain is not verified in this tenant"
-        return result
+    else:
+        result["error"] = f"Domain is verified but Email service is not enabled; supportedServices={result['supported_services']}"
 
-    txt_value = await _get_verification_txt(access_token, domain)
-    result["verification_txt"] = txt_value
-    if txt_value:
-        zone_id = domain_data.get("cloudflare_zone_id")
-        if not zone_id:
-            zone = await cloudflare_service.get_zone_by_name(domain)
-            zone_id = zone.get("zone_id") if zone else None
-        if zone_id:
-            await cloudflare_service.ensure_txt_record(
-                zone_id=zone_id,
-                name="@",
-                content=txt_value,
-                domain=domain,
-            )
-            await asyncio.sleep(5)
+    if auto_fix:
+        return await _repair_m365_domain_with_selenium(domain_data, result["error"])
 
-    status, data = await _graph_request(access_token, "POST", f"/domains/{domain}/verify")
-    if status not in (200, 201, 204):
-        result["action"] = "verify_failed"
-        result["error"] = data.get("error", {}).get("message") or str(data)
-        return result
-
-    graph_domain = await _get_graph_domain(access_token, domain)
-    result["verified"] = bool(graph_domain and graph_domain.get("isVerified"))
-    result["ok"] = result["verified"]
-    result["action"] = "verified" if result["ok"] else "verify_incomplete"
-    if not result["ok"]:
-        result["error"] = "Graph verify returned but domain is still not verified"
     return result
 
 
@@ -594,6 +566,7 @@ async def _ensure_cloudflare_truth(
         "autodiscover": False,
         "dkim1": False,
         "dkim2": False,
+        "dmarc": False,
         "error": None,
     }
     try:
@@ -613,14 +586,11 @@ async def _ensure_cloudflare_truth(
         result["zone_id"] = zone.get("zone_id")
 
         if auto_fix:
-            await cloudflare_service.ensure_email_dns_records(result["zone_id"], domain)
-            if dkim_truth and dkim_truth.get("selector1") and dkim_truth.get("selector2"):
-                await cloudflare_service.ensure_dkim_cnames(
-                    result["zone_id"],
-                    domain,
-                    dkim_truth["selector1"],
-                    dkim_truth["selector2"],
-                )
+            logger.info(
+                "[%s] Objective reconciliation is read-only for email DNS; "
+                "rerun Step 6 Admin Center wizard to repair missing records.",
+                domain,
+            )
 
         records = await cloudflare_service.list_dns_records(result["zone_id"])
 
@@ -654,11 +624,20 @@ async def _ensure_cloudflare_truth(
             ),
             None,
         )
+        dmarc = next(
+            (
+                r for r in records
+                if r.get("type") == "TXT" and _matches_name(r, "_dmarc")
+                and (r.get("content") or "").strip().lower().startswith("v=dmarc1")
+            ),
+            None,
+        )
         result["mx"] = bool(mx and "mail.protection.outlook.com" in (mx.get("content") or ""))
         result["spf"] = bool(spf and "include:spf.protection.outlook.com" in (spf.get("content") or ""))
         result["autodiscover"] = bool(
             autodiscover and (autodiscover.get("content") or "").rstrip(".").lower() == "autodiscover.outlook.com"
         )
+        result["dmarc"] = bool(dmarc)
 
         if dkim_truth and dkim_truth.get("selector1") and dkim_truth.get("selector2"):
             dk1 = next(
@@ -940,7 +919,13 @@ async def _save_domain_truth(
             domain.mx_record_added = bool(cf.get("mx"))
             domain.spf_record_added = bool(cf.get("spf"))
             domain.autodiscover_added = bool(cf.get("autodiscover"))
-            domain.dns_records_created = bool(cf.get("mx") and cf.get("spf") and cf.get("autodiscover"))
+            domain.dmarc_configured = bool(cf.get("dmarc"))
+            domain.dns_records_created = bool(
+                cf.get("mx")
+                and cf.get("spf")
+                and cf.get("autodiscover")
+                and cf.get("dmarc")
+            )
             domain.dkim_cnames_added = bool(cf.get("dkim1") and cf.get("dkim2"))
             if dkim.get("selector1"):
                 domain.dkim_selector1 = dkim["selector1"]
@@ -951,7 +936,16 @@ async def _save_domain_truth(
             domain.dkim_enabled = bool(dkim.get("enabled"))
             if dkim.get("enabled") and not domain.dkim_enabled_at:
                 domain.dkim_enabled_at = now
-            domain.step5_complete = bool(m365.get("verified") and dkim.get("enabled"))
+            domain.step5_complete = bool(
+                m365.get("verified")
+                and dkim.get("enabled")
+                and cf.get("mx")
+                and cf.get("spf")
+                and cf.get("autodiscover")
+                and cf.get("dkim1")
+                and cf.get("dkim2")
+                and cf.get("dmarc")
+            )
             domain.status = DomainStatus.ACTIVE if domain.step5_complete else DomainStatus.PROBLEM
 
             if mailbox:
@@ -996,10 +990,35 @@ async def _save_domain_truth(
 
         tenant = await db.get(Tenant, tenant_id)
         if tenant:
-            if m365.get("verified"):
-                tenant.domain_verified_in_m365 = True
-            if dkim.get("enabled"):
-                tenant.dkim_enabled = True
+            linked_domains = list((await db.execute(
+                select(Domain).where(Domain.tenant_id == tenant_id)
+            )).scalars().all())
+            if linked_domains:
+                tenant.domain_verified_in_m365 = all(
+                    d.domain_verified_in_m365 for d in linked_domains
+                )
+                tenant.mx_record_added = all(d.mx_record_added for d in linked_domains)
+                tenant.spf_record_added = all(d.spf_record_added for d in linked_domains)
+                tenant.autodiscover_added = all(d.autodiscover_added for d in linked_domains)
+                tenant.dkim_cnames_added = all(d.dkim_cnames_added for d in linked_domains)
+                tenant.dkim_enabled = all(d.step5_complete for d in linked_domains)
+                tenant.step5_complete = tenant.dkim_enabled
+                if tenant.step5_complete:
+                    tenant.dkim_enabled_at = tenant.dkim_enabled_at or now
+                    tenant.step5_completed_at = tenant.step5_completed_at or now
+                    tenant.status = TenantStatus.DKIM_ENABLED
+                else:
+                    tenant.dkim_enabled_at = None
+                    tenant.step5_completed_at = None
+                    if tenant.status == TenantStatus.DKIM_ENABLED:
+                        tenant.status = (
+                            TenantStatus.DOMAIN_VERIFIED
+                            if any(d.domain_verified_in_m365 for d in linked_domains)
+                            else TenantStatus.DOMAIN_LINKED
+                        )
+                    tenant.setup_error = tenant.setup_error or (
+                        "Objective reconciliation found incomplete wizard DNS/M365 setup"
+                    )
             remaining = await db.scalar(
                 select(func.count(Domain.id)).where(
                     Domain.tenant_id == tenant_id,
@@ -1194,9 +1213,19 @@ async def objective_reconcile_batch(
                 if mailbox_truth and mailbox_truth.get("all_ok"):
                     summary["mailboxes_ok"] += 1
 
+                dns_ok = bool(
+                    cf.get("mx")
+                    and cf.get("spf")
+                    and cf.get("autodiscover")
+                    and cf.get("dkim1")
+                    and cf.get("dkim2")
+                    and cf.get("dmarc")
+                )
+                domain_result["dns_ok"] = dns_ok
                 domain_ok = bool(
                     m365.get("verified")
                     and dkim.get("enabled")
+                    and dns_ok
                     and mailbox_truth
                     and mailbox_truth.get("all_ok")
                 )

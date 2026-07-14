@@ -520,8 +520,8 @@ async def bulk_create_mailboxes_in_m365(
     if tenant_ids:
         tenant_query = tenant_query.where(Tenant.id.in_(tenant_ids))
     else:
-        # Only process tenants with DKIM enabled
-        tenant_query = tenant_query.where(Tenant.status == TenantStatus.DKIM_ENABLED)
+        # Only process tenants that completed the Admin Center Step 5 flow.
+        tenant_query = tenant_query.where(Tenant.step5_complete == True)
     
     tenant_result = await db.execute(tenant_query)
     tenants = list(tenant_result.scalars().all())

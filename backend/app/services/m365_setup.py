@@ -29,8 +29,9 @@ from typing import Optional, Dict, Any, List
 from uuid import UUID
 from dataclasses import dataclass, field
 
+import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, or_
 
 from app.core.config import get_settings
 from app.db.session import get_fresh_db_session, BackgroundSessionLocal
@@ -123,6 +124,7 @@ def _sync_setup_domain(tenant_data: dict) -> dict:
             admin_password=tenant_data["admin_password"],
             totp_secret=tenant_data["totp_secret"],
             headless=STEP6_HEADLESS,
+            expected_dns_values=tenant_data.get("expected_dns_values"),
         )
         
         logger.info(f"[{domain}] Selenium automation completed: success={result.get('success')}")
@@ -153,6 +155,199 @@ def _is_tenant_conflict_error(error: str | None) -> bool:
         return False
     error_lower = error.lower()
     return any(marker in error_lower for marker in TENANT_CONFLICT_ERROR_MARKERS)
+
+
+def _tenant_token_domain(tenant_obj: Tenant | None, domain_data: dict) -> str:
+    if tenant_obj and tenant_obj.onmicrosoft_domain:
+        return tenant_obj.onmicrosoft_domain
+    if tenant_obj and tenant_obj.microsoft_tenant_id:
+        return tenant_obj.microsoft_tenant_id
+    admin_email = domain_data.get("admin_email") or ""
+    if "@" in admin_email:
+        return admin_email.split("@", 1)[1]
+    return ""
+
+
+async def _get_readonly_graph_token(
+    tenant_domain: str,
+    admin_email: str,
+    admin_password: str,
+) -> Optional[str]:
+    """Mint a Graph token for post-wizard readback only.
+
+    This must never be used to add, verify, or configure the domain. It exists
+    only to fail closed unless Microsoft reports the custom domain is verified
+    and Email-enabled after the Admin Center DNS wizard completes.
+    """
+    if not tenant_domain or not admin_email or not admin_password:
+        return None
+
+    token_url = f"https://login.microsoftonline.com/{tenant_domain}/oauth2/v2.0/token"
+    token_attempts: List[tuple[str, dict]] = []
+
+    configured_client_id = getattr(_settings, "azure_client_id", None) or getattr(_settings, "MS_CLIENT_ID", None)
+    configured_client_secret = getattr(_settings, "azure_client_secret", None) or getattr(_settings, "MS_CLIENT_SECRET", None)
+    if configured_client_id:
+        data = {
+            "grant_type": "password",
+            "client_id": configured_client_id,
+            "scope": "https://graph.microsoft.com/.default",
+            "username": admin_email,
+            "password": admin_password,
+        }
+        if configured_client_secret:
+            data["client_secret"] = configured_client_secret
+        token_attempts.append(("configured_app", data))
+
+    token_attempts.append(
+        (
+            "azure_powershell_client",
+            {
+                "grant_type": "password",
+                "client_id": "1b730954-1685-4b74-9bfd-dac224a7b894",
+                "scope": "https://graph.microsoft.com/.default",
+                "username": admin_email,
+                "password": admin_password,
+            },
+        )
+    )
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for label, data in token_attempts:
+            try:
+                resp = await client.post(token_url, data=data)
+            except Exception as exc:
+                logger.warning("Post-wizard Graph token exception for %s via %s: %s", admin_email, label, exc)
+                continue
+            if resp.status_code == 200:
+                return resp.json().get("access_token")
+            logger.warning("Post-wizard Graph token failed for %s via %s: %s", admin_email, label, resp.status_code)
+
+    return None
+
+
+async def _read_post_wizard_domain_truth(
+    domain_name: str,
+    tenant_obj: Tenant | None,
+    domain_data: dict,
+) -> Dict[str, Any]:
+    token = await _get_readonly_graph_token(
+        tenant_domain=_tenant_token_domain(tenant_obj, domain_data),
+        admin_email=domain_data.get("admin_email") or (tenant_obj.admin_email if tenant_obj else ""),
+        admin_password=domain_data.get("admin_password") or (tenant_obj.admin_password if tenant_obj else ""),
+    )
+    if not token:
+        return {
+            "ok": False,
+            "exists": False,
+            "is_verified": False,
+            "supported_services": [],
+            "error": "could not mint read-only Graph token for post-wizard tenant verification",
+        }
+
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(f"https://graph.microsoft.com/v1.0/domains/{domain_name}", headers=headers)
+
+    if resp.status_code == 404:
+        return {
+            "ok": False,
+            "exists": False,
+            "is_verified": False,
+            "supported_services": [],
+            "error": "domain is missing from the assigned Microsoft tenant",
+        }
+    if resp.status_code >= 400:
+        return {
+            "ok": False,
+            "exists": False,
+            "is_verified": False,
+            "supported_services": [],
+            "error": f"Graph readback failed after wizard: {resp.status_code} {resp.text[:300]}",
+        }
+
+    graph_domain = resp.json()
+    supported_services = [str(value) for value in (graph_domain.get("supportedServices") or [])]
+    is_verified = bool(graph_domain.get("isVerified"))
+    has_email = any(value.lower() == "email" for value in supported_services)
+    if not is_verified:
+        error = "domain exists in Microsoft tenant but is not verified"
+    elif not has_email:
+        error = f"domain is verified but Email service is not enabled; supportedServices={supported_services}"
+    else:
+        error = None
+
+    return {
+        "ok": is_verified and has_email,
+        "exists": True,
+        "is_verified": is_verified,
+        "supported_services": supported_services,
+        "error": error,
+    }
+
+
+async def _sync_tenant_step5_state(session: AsyncSession, tenant_obj: Tenant | None, now: datetime) -> None:
+    if not tenant_obj:
+        return
+
+    domains_result = await session.execute(
+        select(Domain).where(Domain.tenant_id == tenant_obj.id)
+    )
+    linked_domains = list(domains_result.scalars().all())
+    if not linked_domains:
+        return
+
+    primary_domain = next(
+        (domain for domain in linked_domains if domain.id == tenant_obj.domain_id),
+        linked_domains[0],
+    )
+    all_domains_complete = all(
+        domain.step5_complete
+        and domain.domain_verified_in_m365
+        and domain.dkim_enabled
+        and domain.mx_record_added
+        and domain.spf_record_added
+        and domain.autodiscover_added
+        and domain.dkim_cnames_added
+        and domain.dmarc_configured
+        for domain in linked_domains
+    )
+
+    tenant_obj.domain_added_to_m365 = all(domain.domain_added_to_m365 for domain in linked_domains)
+    tenant_obj.domain_verified_in_m365 = all(domain.domain_verified_in_m365 for domain in linked_domains)
+    tenant_obj.mx_record_added = all(domain.mx_record_added for domain in linked_domains)
+    tenant_obj.spf_record_added = all(domain.spf_record_added for domain in linked_domains)
+    tenant_obj.autodiscover_added = all(domain.autodiscover_added for domain in linked_domains)
+    tenant_obj.dkim_cnames_added = all(domain.dkim_cnames_added for domain in linked_domains)
+    tenant_obj.dkim_enabled = all_domains_complete
+    tenant_obj.step5_complete = all_domains_complete
+
+    if primary_domain.mx_value:
+        tenant_obj.mx_value = primary_domain.mx_value
+    if primary_domain.spf_value:
+        tenant_obj.spf_value = primary_domain.spf_value
+    if primary_domain.dkim_selector1_cname:
+        tenant_obj.dkim_selector1 = primary_domain.dkim_selector1_cname
+        tenant_obj.dkim_selector1_cname = primary_domain.dkim_selector1_cname
+    if primary_domain.dkim_selector2_cname:
+        tenant_obj.dkim_selector2 = primary_domain.dkim_selector2_cname
+        tenant_obj.dkim_selector2_cname = primary_domain.dkim_selector2_cname
+
+    if all_domains_complete:
+        tenant_obj.dkim_enabled_at = tenant_obj.dkim_enabled_at or now
+        tenant_obj.step5_completed_at = tenant_obj.step5_completed_at or now
+        tenant_obj.status = TenantStatus.DKIM_ENABLED
+        tenant_obj.setup_step = "6"
+        tenant_obj.setup_error = None
+    else:
+        tenant_obj.dkim_enabled_at = None
+        tenant_obj.step5_completed_at = None
+        if tenant_obj.status == TenantStatus.DKIM_ENABLED:
+            tenant_obj.status = (
+                TenantStatus.DOMAIN_VERIFIED
+                if any(domain.domain_verified_in_m365 for domain in linked_domains)
+                else TenantStatus.DOMAIN_LINKED
+            )
 
 
 async def _save_step6_result(domain_data: dict, selenium_result: dict):
@@ -187,24 +382,51 @@ async def _save_step6_result(domain_data: dict, selenium_result: dict):
                         "dns_configured": False,
                         "error": str(selenium_result)
                     }
+
+                if selenium_result.get("success"):
+                    truth = await _read_post_wizard_domain_truth(domain_name, tenant_obj, domain_data)
+                    selenium_result["m365_graph_confirmed"] = bool(truth.get("ok"))
+                    selenium_result["m365_domain_exists"] = bool(truth.get("exists"))
+                    selenium_result["m365_is_verified"] = bool(truth.get("is_verified"))
+                    selenium_result["m365_supported_services"] = truth.get("supported_services") or []
+                    if not truth.get("ok"):
+                        selenium_result = {
+                            **selenium_result,
+                            "success": False,
+                            "verified": bool(truth.get("is_verified")),
+                            "dns_configured": False,
+                            "force_unsafe": True,
+                            "error": f"Admin Center wizard completed, but Microsoft tenant truth is unsafe: {truth.get('error')}",
+                        }
+                    elif not selenium_result.get("dmarc_configured"):
+                        selenium_result = {
+                            **selenium_result,
+                            "success": False,
+                            "verified": True,
+                            "dns_configured": False,
+                            "force_unsafe": True,
+                            "error": "Admin Center wizard completed, but DMARC was not confirmed in Cloudflare",
+                        }
                 error_msg = selenium_result.get("error", "Unknown error")
                 
                 if selenium_result.get("success"):
+                    now = datetime.utcnow()
                     # Full success — domain verified AND DNS configured
                     domain_obj.domain_added_to_m365 = True
                     domain_obj.domain_verified_in_m365 = True
-                    domain_obj.domain_verified_at = datetime.utcnow()
+                    domain_obj.domain_verified_at = now
                     domain_obj.mx_record_added = True
                     domain_obj.spf_record_added = True
                     domain_obj.autodiscover_added = True
                     domain_obj.dkim_cnames_added = True
                     domain_obj.dkim_enabled = True
-                    domain_obj.dkim_enabled_at = datetime.utcnow()
+                    domain_obj.dkim_enabled_at = now
                     domain_obj.step5_complete = True
                     domain_obj.status = DomainStatus.ACTIVE
-                    domain_obj.m365_verified_at = datetime.utcnow()
+                    domain_obj.m365_verified_at = now
                     domain_obj.mx_configured = True
                     domain_obj.spf_configured = True
+                    domain_obj.dmarc_configured = bool(selenium_result.get("dmarc_configured"))
                     domain_obj.dns_records_created = True
                     domain_obj.error_message = None
                     
@@ -230,9 +452,7 @@ async def _save_step6_result(domain_data: dict, selenium_result: dict):
                         domain_obj.cloudflare_zone_id = selenium_result["corrected_zone_id"]
                         logger.info(f"[{domain_name}] Updated cloudflare_zone_id: {old_zone_id} -> {selenium_result['corrected_zone_id']}")
                     
-                    # Clear tenant error
-                    if tenant_obj:
-                        tenant_obj.setup_error = None
+                    await _sync_tenant_step5_state(session, tenant_obj, now)
                     
                     await session.commit()
                     
@@ -252,31 +472,49 @@ async def _save_step6_result(domain_data: dict, selenium_result: dict):
                     domain_obj.error_message = error_msg
                     if tenant_obj:
                         tenant_obj.setup_error = error_msg
+                    await _sync_tenant_step5_state(session, tenant_obj, datetime.utcnow())
                     await session.commit()
                     logger.error(f"[{domain_name}] ✗ DB SAVED tenant conflict: {error_msg}")
 
                 elif selenium_result.get("verified"):
                     # Partial success — domain verified but DNS may not be complete
+                    now = datetime.utcnow()
                     domain_obj.domain_added_to_m365 = True
                     domain_obj.domain_verified_in_m365 = True
-                    domain_obj.domain_verified_at = datetime.utcnow()
-                    domain_obj.status = DomainStatus.M365_VERIFIED
-                    domain_obj.m365_verified_at = datetime.utcnow()
-                    domain_obj.error_message = "Domain verified but DNS setup incomplete"
+                    domain_obj.domain_verified_at = now
+                    domain_obj.dkim_enabled = False
+                    domain_obj.dkim_enabled_at = None
+                    domain_obj.step5_complete = False
+                    domain_obj.status = DomainStatus.PROBLEM if selenium_result.get("force_unsafe") else DomainStatus.M365_VERIFIED
+                    domain_obj.m365_verified_at = now
+                    domain_obj.error_message = error_msg if selenium_result.get("force_unsafe") else "Domain verified but DNS setup incomplete"
                     
                     if selenium_result.get("verification_txt"):
                         domain_obj.m365_verification_txt = selenium_result["verification_txt"]
                         domain_obj.verification_txt_value = selenium_result["verification_txt"]
                         domain_obj.verification_txt_added = True
                     
+                    await _sync_tenant_step5_state(session, tenant_obj, now)
                     await session.commit()
                     logger.info(f"[{domain_name}] ✓ DB SAVED: PARTIAL (verified only)")
                 
                 else:
                     # Complete failure
+                    if "m365_domain_exists" in selenium_result:
+                        domain_obj.domain_added_to_m365 = bool(selenium_result.get("m365_domain_exists"))
+                    if "m365_is_verified" in selenium_result:
+                        domain_obj.domain_verified_in_m365 = bool(selenium_result.get("m365_is_verified"))
+                        if not domain_obj.domain_verified_in_m365:
+                            domain_obj.domain_verified_at = None
+                            domain_obj.m365_verified_at = None
+                    domain_obj.dkim_enabled = False
+                    domain_obj.dkim_enabled_at = None
+                    domain_obj.step5_complete = False
+                    domain_obj.status = DomainStatus.PROBLEM if selenium_result.get("force_unsafe") else DomainStatus.ERROR
                     domain_obj.error_message = error_msg
                     if tenant_obj:
                         tenant_obj.setup_error = error_msg
+                    await _sync_tenant_step5_state(session, tenant_obj, datetime.utcnow())
                     await session.commit()
                     logger.error(f"[{domain_name}] ✗ DB SAVED error: {error_msg}")
                 
@@ -339,7 +577,13 @@ async def run_step5_for_batch(
             .where(
                 Tenant.batch_id == batch_id,
                 Tenant.first_login_completed == True,
-                Domain.domain_verified_in_m365.is_not(True),
+                or_(
+                    Domain.domain_verified_in_m365.is_not(True),
+                    Domain.dkim_enabled.is_not(True),
+                    Domain.step5_complete.is_not(True),
+                    Domain.dmarc_configured.is_not(True),
+                ),
+                Domain.step5_skipped.is_not(True),
                 (Domain.step5_retry_count <= MAX_PIPELINE_RETRIES) | Domain.step5_retry_count.is_(None),
             )
             .order_by(Domain.domain_index_in_tenant)  # Process domain 0 before 1 before 2
@@ -397,6 +641,14 @@ async def run_step5_for_batch(
             "admin_password": tenant.admin_password,
             "totp_secret": tenant.totp_secret,
             "already_verified": domain.domain_verified_in_m365,
+            "expected_dns_values": {
+                "mx_value": domain.mx_value,
+                "spf_value": domain.spf_value,
+                "dkim_selector1": domain.dkim_selector1,
+                "dkim_selector2": domain.dkim_selector2,
+                "dkim_selector1_cname": domain.dkim_selector1_cname,
+                "dkim_selector2_cname": domain.dkim_selector2_cname,
+            },
         }
         
         domains_data.append(domain_data)
@@ -634,6 +886,14 @@ async def run_step5_for_tenant(db: AsyncSession, tenant_id: UUID, on_progress=No
             "admin_email": tenant.admin_email,
             "admin_password": tenant.admin_password,
             "totp_secret": tenant.totp_secret,
+            "expected_dns_values": {
+                "mx_value": domain.mx_value,
+                "spf_value": domain.spf_value,
+                "dkim_selector1": domain.dkim_selector1,
+                "dkim_selector2": domain.dkim_selector2,
+                "dkim_selector1_cname": domain.dkim_selector1_cname,
+                "dkim_selector2_cname": domain.dkim_selector2_cname,
+            },
         }
         
         # PHASE 2: Run Selenium in thread

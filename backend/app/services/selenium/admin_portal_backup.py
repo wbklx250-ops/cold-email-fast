@@ -937,6 +937,21 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
         logger.info(f"[{domain}] DKIM selector2 target: {sel2_match.group(1)}")
     else:
         logger.warning(f"[{domain}] DKIM selector2 NOT FOUND")
+
+    missing_values = []
+    if not mx_match:
+        missing_values.append("MX")
+    if not spf_match:
+        missing_values.append("SPF")
+    if not sel1_match:
+        missing_values.append("DKIM selector1")
+    if not sel2_match:
+        missing_values.append("DKIM selector2")
+    if missing_values:
+        result["error"] = f"Microsoft DNS page missing required values: {', '.join(missing_values)}"
+        update_status_file(domain, "dns_setup", "failed", result["error"])
+        _cleanup_driver(driver)
+        return result
     
     # ===== STEP 8i: ADD ALL RECORDS TO CLOUDFLARE =====
     logger.info(f"[{domain}] Step 8i: Adding DNS records to Cloudflare")
@@ -1034,7 +1049,7 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
         page_text = driver.find_element(By.TAG_NAME, "body").text.lower()
         
         # Check if we're done
-        if "complete" in page_text or "domain setup is complete" in page_text:
+        if "domain setup is complete" in page_text or "setup is complete" in page_text:
             logger.info(f"[{domain}] SUCCESS - Setup complete on attempt {attempt + 1}!")
             result["success"] = True
             break
@@ -1065,7 +1080,7 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     screenshot(driver, "15_final", domain)
     page_text = driver.find_element(By.TAG_NAME, "body").text.lower()
     
-    if "complete" in page_text:
+    if "domain setup is complete" in page_text or "setup is complete" in page_text:
         logger.info(f"[{domain}] Clicking Done button")
         try:
             btns = driver.find_elements(By.TAG_NAME, "button")
@@ -1076,8 +1091,10 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
                     break
         except:
             pass
-    
-    result["success"] = True
+        result["success"] = True
+    else:
+        result["success"] = False
+        result["error"] = result.get("error") or "Microsoft domain setup wizard did not reach completion page"
     
     # ===== FINAL STATUS UPDATE =====
     if result["success"]:

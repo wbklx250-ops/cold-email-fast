@@ -29,6 +29,17 @@ from app.services.tenant_import import (
 router = APIRouter(prefix="/api/v1/tenants", tags=["tenants"])
 
 
+def _raise_wizard_only_m365_setup_disabled() -> None:
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            "Legacy tenant M365/DNS/DKIM bulk actions are disabled. "
+            "Use the batch setup wizard/pipeline Step 6 so Microsoft Admin Center "
+            "is the source of DNS, DKIM, and completion truth."
+        ),
+    )
+
+
 def encrypt_password(password: str) -> str:
     """Simple base64 encoding for MVP. Replace with proper encryption in production."""
     return base64.b64encode(password.encode()).decode()
@@ -584,6 +595,8 @@ async def bulk_add_domains_to_m365(
     
     Returns: Summary of results per tenant
     """
+    _raise_wizard_only_m365_setup_disabled()
+
     # Initialize services
     try:
         ms_service = MicrosoftGraphService()
@@ -782,6 +795,8 @@ async def bulk_setup_dns(
     
     Returns: Summary of results
     """
+    _raise_wizard_only_m365_setup_disabled()
+
     # Initialize Cloudflare service
     try:
         cf_service = CloudflareService()
@@ -939,6 +954,8 @@ async def bulk_setup_dkim(
     
     Returns: Summary of results
     """
+    _raise_wizard_only_m365_setup_disabled()
+
     # Initialize services
     try:
         ps_service = PowerShellService()

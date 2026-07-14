@@ -25,7 +25,7 @@ from uuid import UUID
 
 import httpx
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, select, update
 
 logger = logging.getLogger("smartlead")
 
@@ -691,6 +691,8 @@ def _mailbox_not_ready_reasons(mailbox) -> list[str]:
     reasons = []
     if not mailbox.created_in_exchange:
         reasons.append("created_in_exchange=false")
+    if not mailbox.setup_complete:
+        reasons.append("setup_complete=false")
     if not mailbox.delegated:
         reasons.append("delegated=false")
     if not mailbox.password_set:
@@ -699,6 +701,22 @@ def _mailbox_not_ready_reasons(mailbox) -> list[str]:
         reasons.append("account_enabled=false")
     if not (mailbox.initial_password or mailbox.password):
         reasons.append("missing_password")
+    return reasons
+
+
+def _domain_not_ready_reasons(domain) -> list[str]:
+    if domain is None:
+        return ["matching_domain_not_found"]
+
+    reasons = []
+    if not domain.step5_complete:
+        reasons.append("domain_step5_complete=false")
+    if not domain.domain_verified_in_m365:
+        reasons.append("domain_verified_in_m365=false")
+    if not domain.dkim_enabled:
+        reasons.append("domain_dkim_enabled=false")
+    if not domain.dmarc_configured:
+        reasons.append("domain_dmarc_configured=false")
     return reasons
 
 
@@ -874,6 +892,7 @@ async def run_smartlead_upload_for_batch(
     """
     from app.models.mailbox import Mailbox
     from app.models.tenant import Tenant
+    from app.models.domain import Domain
     from app.models.batch import SetupBatch
     from app.db.session import async_session_factory
 
@@ -921,10 +940,20 @@ async def run_smartlead_upload_for_batch(
         if not batch:
             return {"error": "Batch not found", "total": 0, "uploaded": 0, "failed": 0, "skipped": 0}
         
-        # Get all candidate mailboxes for tenants in this batch.
+        # Get all candidate mailboxes for tenants in this batch. Keep this as a
+        # broad candidate query so unsafe rows are explicitly marked ineligible
+        # instead of silently disappearing from upload diagnostics.
         query = (
-            select(Mailbox)
+            select(Mailbox, Domain)
             .join(Tenant, Mailbox.tenant_id == Tenant.id)
+            .outerjoin(
+                Domain,
+                and_(
+                    Domain.batch_id == Tenant.batch_id,
+                    func.lower(Domain.name)
+                    == func.lower(func.split_part(Mailbox.email, "@", 2)),
+                ),
+            )
             .where(Tenant.batch_id == batch_id)
         )
         
@@ -932,17 +961,17 @@ async def run_smartlead_upload_for_batch(
             query = query.where(Mailbox.smartlead_uploaded == False)
             
         result = await session.execute(query)
-        candidate_mailboxes = result.scalars().all()
+        candidate_rows = result.all()
         
-        if not candidate_mailboxes:
+        if not candidate_rows:
             logger.info(f"No mailboxes to upload for batch {batch_id}")
             return {"total": 0, "uploaded": 0, "failed": 0, "skipped": 0, "errors": []}
 
         mailboxes = []
         ineligible_count = 0
         ineligible_errors = []
-        for mb in candidate_mailboxes:
-            not_ready_reasons = _mailbox_not_ready_reasons(mb)
+        for mb, domain in candidate_rows:
+            not_ready_reasons = _mailbox_not_ready_reasons(mb) + _domain_not_ready_reasons(domain)
             if not_ready_reasons:
                 ineligible_count += 1
                 error = f"Skipped - mailbox not upload-ready ({', '.join(not_ready_reasons)})"

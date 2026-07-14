@@ -46,6 +46,11 @@ async def retry_dkim_enable_job():
     connection pool exhaustion.
     """
     logger.info("=== DKIM Enable Retry Job Starting ===")
+    logger.warning(
+        "DKIM retry job disabled: Step 5 auth state must be repaired through "
+        "the Admin Center setup wizard pipeline."
+    )
+    return {"status": "skipped", "message": "DKIM retry disabled; rerun Step 5 wizard"}
     
     try:
         # First, check if Step 5 automation is currently running
@@ -224,6 +229,7 @@ async def trigger_dkim_retry_now():
 
 async def get_pending_dkim_count() -> int:
     """Get count of tenants pending DKIM enable."""
+    return 0
     try:
         async with AsyncSession(async_engine, expire_on_commit=False) as session:
             cutoff_time = datetime.utcnow() - timedelta(hours=DKIM_RETRY_WINDOW_HOURS)
@@ -247,6 +253,12 @@ async def get_pending_dkim_count() -> int:
 
 async def get_dkim_retry_status():
     """Get status of pending DKIM retries with details."""
+    return {
+        "pending_count": 0,
+        "pending": [],
+        "disabled": True,
+        "message": "DKIM retry is disabled; rerun Step 5 Admin Center wizard",
+    }
     try:
         async with AsyncSession(async_engine, expire_on_commit=False) as session:
             cutoff_time = datetime.utcnow() - timedelta(hours=DKIM_RETRY_WINDOW_HOURS)

@@ -14,7 +14,7 @@ from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, B
 from pydantic import BaseModel
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, update
+from sqlalchemy import select, func, update, or_
 
 from app.db.session import get_db_session as get_db, SessionLocal
 from app.models.batch import SetupBatch, BatchStatus
@@ -41,8 +41,11 @@ pipeline_jobs = {}
 
 MAX_PIPELINE_RETRIES = 4   # Max retries per tenant per step
 STEP5_MAX_WORKERS = 2      # Max parallel browsers for first login (Railway memory limit)
-STEP6_MAX_WORKERS = 2      # Max parallel browsers for M365 domain setup (Railway memory limit)
-STEP6_CHUNK_SIZE = 2        # Process 2 domains at a time, kill all browsers between chunks
+# M365 admin-center pages are heavy enough that two parallel Chromium sessions
+# can crash tabs or wedge ChromeDriver on Railway. Keep Step 6 serial and
+# reclaim the browser after every domain.
+STEP6_MAX_WORKERS = 1
+STEP6_CHUNK_SIZE = 1
 
 def _fmt_err(exc: Exception) -> str:
     """Format exception for logging — never returns empty string."""
@@ -56,7 +59,7 @@ STEP_NAMES = {
     1: "Create Cloudflare Zones",
     2: "Update Nameservers",
     3: "Verify NS Propagation",
-    4: "Create DNS Records & Redirects",
+    4: "Cloudflare Redirects",
     5: "First Login Automation",
     6: "M365 Domain Setup & DKIM",
     7: "Create Mailboxes & Delegate",
@@ -65,6 +68,24 @@ STEP_NAMES = {
     10: "Upload to Sequencer",
     11: "Reconciliation & Verification",
 }
+
+
+def _step5_incomplete_domain_filter():
+    return or_(
+        Domain.domain_verified_in_m365.is_not(True),
+        Domain.dkim_enabled.is_not(True),
+        Domain.step5_complete.is_not(True),
+        Domain.dmarc_configured.is_not(True),
+    )
+
+
+def _step5_ready_domain_filters():
+    return (
+        Domain.step5_complete == True,
+        Domain.domain_verified_in_m365 == True,
+        Domain.dkim_enabled == True,
+        Domain.dmarc_configured == True,
+    )
 
 
 @router.post("/validate")
@@ -588,7 +609,7 @@ async def skip_failed_domains(
             select(Domain).where(
                 Domain.batch_id == batch_id,
                 Domain.tenant_id.isnot(None),
-                Domain.domain_verified_in_m365.is_not(True),
+                _step5_incomplete_domain_filter(),
                 Domain.step5_skipped.is_not(True),
             )
         )
@@ -605,8 +626,7 @@ async def skip_failed_domains(
             select(Domain).where(
                 Domain.batch_id == batch_id,
                 Domain.tenant_id.isnot(None),
-                Domain.domain_verified_in_m365 == True,
-                Domain.dkim_enabled == True,
+                *_step5_ready_domain_filters(),
                 Domain.step6_complete.is_not(True),
                 Domain.step6_skipped.is_not(True),
             )
@@ -666,7 +686,7 @@ async def skip_domains(
                 select(Domain).where(
                     Domain.batch_id == batch_id,
                     Domain.tenant_id.isnot(None),
-                    Domain.domain_verified_in_m365.is_not(True),
+                    _step5_incomplete_domain_filter(),
                     Domain.step5_skipped.is_not(True),
                 )
             )
@@ -693,7 +713,12 @@ async def skip_domains(
 
                 if not domain:
                     not_found.append(clean_name)
-                elif domain.domain_verified_in_m365 and domain.dkim_enabled:
+                elif (
+                    domain.step5_complete
+                    and domain.domain_verified_in_m365
+                    and domain.dkim_enabled
+                    and domain.dmarc_configured
+                ):
                     already_done.append(clean_name)
                 elif domain.step5_skipped:
                     already_done.append(clean_name)
@@ -711,8 +736,7 @@ async def skip_domains(
                 select(Domain).where(
                     Domain.batch_id == batch_id,
                     Domain.tenant_id.isnot(None),
-                    Domain.domain_verified_in_m365 == True,
-                    Domain.dkim_enabled == True,
+                    *_step5_ready_domain_filters(),
                     Domain.step6_complete.is_not(True),
                     Domain.step6_skipped.is_not(True),
                 )
@@ -788,7 +812,7 @@ async def get_failed_domains(
             select(Domain).where(
                 Domain.batch_id == batch_id,
                 Domain.tenant_id.isnot(None),
-                Domain.domain_verified_in_m365.is_not(True),
+                _step5_incomplete_domain_filter(),
                 Domain.step5_skipped.is_not(True),
             ).order_by(Domain.name)
         )
@@ -796,8 +820,7 @@ async def get_failed_domains(
             select(Domain).where(
                 Domain.batch_id == batch_id,
                 Domain.tenant_id.isnot(None),
-                Domain.domain_verified_in_m365 == True,
-                Domain.dkim_enabled == True,
+                *_step5_ready_domain_filters(),
             ).order_by(Domain.name)
         )
         skipped_result = await db.execute(
@@ -812,8 +835,7 @@ async def get_failed_domains(
             select(Domain).where(
                 Domain.batch_id == batch_id,
                 Domain.tenant_id.isnot(None),
-                Domain.domain_verified_in_m365 == True,
-                Domain.dkim_enabled == True,
+                *_step5_ready_domain_filters(),
                 Domain.step6_complete.is_not(True),
                 Domain.step6_skipped.is_not(True),
             ).order_by(Domain.name)
@@ -898,7 +920,7 @@ async def retry_failed(
             sql_update(Domain).where(
                 Domain.batch_id == batch_id,
                 Domain.tenant_id.isnot(None),
-                Domain.domain_verified_in_m365.is_not(True),
+                _step5_incomplete_domain_filter(),
             ).values(step5_retry_count=0, step5_skipped=False, error_message=None)
         )
     if step == 7 or step is None:
@@ -1577,11 +1599,13 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                                 await cloudflare_service.create_phase1_dns(zone_result["zone_id"], domain.name)
                                 domain.phase1_cname_added = True
                                 domain.phase1_dmarc_added = True
+                                domain.dmarc_configured = True
                             except Exception as dns_e:
                                 if "already exists" in str(dns_e).lower():
                                     logger.info(f"Phase 1 DNS already exists for {domain.name} — skipping")
                                     domain.phase1_cname_added = True
                                     domain.phase1_dmarc_added = True
+                                    domain.dmarc_configured = True
                                 else:
                                     logger.warning(f"Phase 1 DNS failed for {domain.name}: {dns_e}")
 
@@ -1631,10 +1655,12 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                         await cloudflare_service.create_phase1_dns(domain.cloudflare_zone_id, domain.name)
                         domain.phase1_cname_added = True
                         domain.phase1_dmarc_added = True
+                        domain.dmarc_configured = True
                     except Exception as e:
                         if "already exists" in str(e).lower():
                             domain.phase1_cname_added = True
                             domain.phase1_dmarc_added = True
+                            domain.dmarc_configured = True
                         else:
                             logger.warning(f"Phase 1 DNS for re-used domain {domain.name}: {e}")
                     await db.commit()
@@ -1912,20 +1938,20 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                 pipeline_jobs[job_id]["steps"]["3"]["status"] = "completed"
 
         # ================================================================
-        # STEP 4: Create DNS Records + Redirects
+        # STEP 4: Cloudflare redirects only
         # ================================================================
         if start_from_step <= 4:
           try:
-            await _update_pipeline(batch_id, 4, "running", "Creating DNS records and redirects...")
+            await _update_pipeline(batch_id, 4, "running", "Creating redirects; email DNS is deferred to Admin Center wizard...")
             await log_activity(batch_id, 4, STEP_NAMES[4], status="started")
 
             async with SessionLocal() as db:
-                # Only process domains that need DNS (skip already-configured re-used domains)
+                # Email-auth DNS is created by the Microsoft Admin Center wizard
+                # in Step 6. Step 4 may only configure non-mail redirects.
                 domains = (await db.execute(
                     select(Domain).where(
                         Domain.batch_id == batch_id,
                         Domain.cloudflare_zone_id.isnot(None),
-                        Domain.dns_records_created.is_not(True),
                     )
                 )).scalars().all()
 
@@ -1939,22 +1965,12 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                         if not zone_id:
                             continue
 
-                        dns_result = await cloudflare_service.ensure_email_dns_records(zone_id, domain.name)
-
-                        all_ok = all(r["success"] for r in dns_result.values())
-                        if all_ok:
-                            domain.dns_records_created = True
-                            dns_done += 1
-                            await log_activity(batch_id, 4, STEP_NAMES[4], "domain", str(domain.id), domain.name, "completed", "DNS records ensured")
-                        else:
-                            errors = [f"{k}: {v['error']}" for k, v in dns_result.items() if v.get("error")]
-                            domain.error_message = "; ".join(errors)
-                            await log_activity(batch_id, 4, STEP_NAMES[4], "domain", str(domain.id), domain.name, "failed", domain.error_message)
-
                         if domain.redirect_url and not getattr(domain, 'redirect_configured', False):
                             try:
                                 await cloudflare_service.create_redirect_rule(zone_id, domain.name, domain.redirect_url)
                                 domain.redirect_configured = True
+                                dns_done += 1
+                                await log_activity(batch_id, 4, STEP_NAMES[4], "domain", str(domain.id), domain.name, "completed", "Redirect configured; email DNS deferred to Admin Center wizard")
                             except Exception as re:
                                 logger.warning(f"Redirect failed for {domain.name}: {re}")
 
@@ -1980,7 +1996,7 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                 pipeline_jobs[job_id]["steps"]["4"]["status"] = "completed"
                 pipeline_jobs[job_id]["steps"]["4"]["completed"] = total_dns_done
 
-            logger.info(f"Step 4: {dns_done} new DNS configured, {total_dns_done} total ready")
+            logger.info(f"Step 4: {dns_done} redirects configured, {total_dns_done} domains already have wizard DNS")
 
           except Exception as step_error:
             logger.error(f"Step 4 CRASHED (continuing to next step): {_fmt_err(step_error)}")
@@ -2175,7 +2191,7 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                         select(func.count(Domain.id)).where(
                             Domain.batch_id == batch_id,
                             Domain.tenant_id.isnot(None),
-                            Domain.domain_verified_in_m365.is_not(True),
+                            _step5_incomplete_domain_filter(),
                             Domain.step5_skipped.is_not(True),
                             (Domain.step5_retry_count <= MAX_PIPELINE_RETRIES) | Domain.step5_retry_count.is_(None),
                         )
@@ -2205,7 +2221,7 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                         select(Domain).where(
                             Domain.batch_id == batch_id,
                             Domain.tenant_id.isnot(None),
-                            Domain.domain_verified_in_m365.is_not(True),
+                            _step5_incomplete_domain_filter(),
                             Domain.step5_skipped.is_not(True),
                         )
                     )).scalars().all()
@@ -2230,8 +2246,7 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                     select(func.count(Domain.id)).where(
                         Domain.batch_id == batch_id,
                         Domain.tenant_id.isnot(None),
-                        Domain.domain_verified_in_m365 == True,
-                        Domain.dkim_enabled == True,
+                        *_step5_ready_domain_filters(),
                     )
                 ) or 0
                 m365_skipped = await db.scalar(
@@ -2288,8 +2303,7 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                     .where(
                         Tenant.batch_id == batch_id,
                         Domain.batch_id == batch_id,
-                        Domain.domain_verified_in_m365 == True,
-                        Domain.dkim_enabled == True,
+                        *_step5_ready_domain_filters(),
                         Tenant.security_defaults_disabled.is_not(True),
                         Tenant.totp_secret.isnot(None),
                     )
@@ -2396,8 +2410,7 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                         select(func.count(Domain.id)).where(
                             Domain.batch_id == batch_id,
                             Domain.tenant_id.isnot(None),
-                            Domain.domain_verified_in_m365 == True,
-                            Domain.dkim_enabled == True,
+                            *_step5_ready_domain_filters(),
                             Domain.step6_complete.is_not(True),
                             Domain.step6_skipped.is_not(True),
                         )
@@ -2423,8 +2436,7 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                             select(Domain).where(
                                 Domain.batch_id == batch_id,
                                 Domain.tenant_id.isnot(None),
-                                Domain.domain_verified_in_m365 == True,
-                                Domain.dkim_enabled == True,
+                                *_step5_ready_domain_filters(),
                                 Domain.step6_complete.is_not(True),
                                 Domain.step6_skipped.is_not(True),
                             )
@@ -2469,8 +2481,7 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                     select(func.count(Domain.id)).where(
                         Domain.batch_id == batch_id,
                         Domain.tenant_id.isnot(None),
-                        Domain.domain_verified_in_m365 == True,
-                        Domain.dkim_enabled == True,
+                        *_step5_ready_domain_filters(),
                         Domain.step6_complete.is_not(True),
                         Domain.step6_skipped.is_not(True),
                     )
@@ -2815,8 +2826,7 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                 select(func.count(Domain.id)).where(
                     Domain.batch_id == batch_id,
                     Domain.tenant_id.isnot(None),
-                    Domain.domain_verified_in_m365 == True,
-                    Domain.dkim_enabled == True,
+                    *_step5_ready_domain_filters(),
                     Domain.step6_complete.is_not(True),
                     Domain.step6_skipped.is_not(True),
                 )

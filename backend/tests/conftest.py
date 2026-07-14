@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.pool import StaticPool
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID, JSONB
 
-from app.db.session import get_db_session
+from app.db.session import get_db_session, get_db_session_with_retry
 
 
 # SQLite in-memory database URL for tests
@@ -110,6 +110,7 @@ async def client(test_engine) -> AsyncGenerator[AsyncClient, None]:
             yield session
     
     app.dependency_overrides[get_db_session] = override_get_db
+    app.dependency_overrides[get_db_session_with_retry] = override_get_db
     
     # Create test client with ASGI transport
     transport = ASGITransport(app=app)

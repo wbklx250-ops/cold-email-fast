@@ -403,6 +403,44 @@ def _verify_record_exists(zone_id, record_type, content_search, headers):
         return False
 
 
+def verify_existing_m365_dns_setup(
+    zone_id,
+    domain,
+    mx_value=None,
+    spf_value=None,
+    dkim_selector1=None,
+    dkim_selector2=None,
+):
+    """
+    Read back existing Cloudflare DNS for a domain Microsoft already reports
+    complete. Does not trust local DB flags; requires live Cloudflare records.
+    DMARC is ensured because Microsoft does not always expose it in the wizard.
+    """
+    headers = _headers_for_zone(zone_id)
+    expected_mx = mx_value or f"{domain.replace('.', '-')}.mail.protection.outlook.com"
+    expected_spf = spf_value or "include:spf.protection.outlook.com"
+    results = {
+        "mx": _verify_record_exists(zone_id, "MX", expected_mx, headers),
+        "spf": _verify_record_exists(zone_id, "TXT", expected_spf, headers),
+        "autodiscover": _verify_record_exists(zone_id, "CNAME", "autodiscover.outlook.com", headers),
+        "dkim_selector1": False,
+        "dkim_selector2": False,
+        "dmarc": add_dmarc(zone_id, domain),
+    }
+
+    if dkim_selector1:
+        results["dkim_selector1"] = _verify_record_exists(zone_id, "CNAME", dkim_selector1, headers)
+    else:
+        logger.error("Cannot verify selector1 DKIM for %s: missing expected target", domain)
+
+    if dkim_selector2:
+        results["dkim_selector2"] = _verify_record_exists(zone_id, "CNAME", dkim_selector2, headers)
+    else:
+        logger.error("Cannot verify selector2 DKIM for %s: missing expected target", domain)
+
+    return results
+
+
 def add_txt(zone_id, value):
     """Add TXT record, preserving the exact verification value if it exists.
     
@@ -493,7 +531,11 @@ def add_mx(zone_id, target, priority=0):
         if _cf_success(resp):
             record_id = resp.json().get("result", {}).get("id", "unknown")
             logger.info(f"MX added successfully (record_id={record_id})")
-            return True
+            if _verify_record_exists(zone_id, "MX", target, headers):
+                logger.info(f"MX record verified in Cloudflare: {target}")
+                return True
+            logger.error("MX record was not found in Cloudflare after creation: %s", target)
+            return False
         else:
             error_msg = _cf_error_message(resp)
             logger.error(f"MX add FAILED: {error_msg}")
@@ -530,7 +572,11 @@ def add_spf(zone_id, value):
         if _cf_success(resp):
             record_id = resp.json().get("result", {}).get("id", "unknown")
             logger.info(f"SPF added successfully (record_id={record_id})")
-            return True
+            if _verify_record_exists(zone_id, "TXT", value, headers):
+                logger.info(f"SPF record verified in Cloudflare: {value}")
+                return True
+            logger.error("SPF record was not found in Cloudflare after creation: %s", value)
+            return False
         else:
             error_msg = _cf_error_message(resp)
             logger.error(f"SPF add FAILED: {error_msg}")
@@ -579,10 +625,17 @@ def add_cname(zone_id, name, target):
         if _cf_success(resp):
             record_id = resp.json().get("result", {}).get("id", "unknown")
             logger.info(f"CNAME added successfully: {name} -> {target} (record_id={record_id})")
-            return True
+            if _verify_record_exists(zone_id, "CNAME", target, headers):
+                logger.info(f"CNAME record verified in Cloudflare: {name} -> {target}")
+                return True
+            logger.error("CNAME record was not found in Cloudflare after creation: %s -> %s", name, target)
+            return False
         elif "already exists" in resp.text.lower():
-            logger.info("CNAME already exists")
-            return True
+            if _verify_record_exists(zone_id, "CNAME", target, headers):
+                logger.info("CNAME already exists with expected target")
+                return True
+            logger.error("CNAME already exists conflict does not match expected target: %s -> %s", name, target)
+            return False
         else:
             error_msg = _cf_error_message(resp)
             logger.error(f"CNAME add FAILED ({name} -> {target}): {error_msg}")
@@ -618,3 +671,51 @@ def add_dkim(zone_id, selector1_target, selector2_target):
     result2 = add_cname(zone_id, "selector2._domainkey", selector2_target)
     
     return result1 and result2
+
+
+def add_dmarc(zone_id, domain, value="v=DMARC1; p=none;"):
+    """Ensure a basic DMARC TXT record exists at _dmarc."""
+    logger.info(f"Ensuring DMARC: _dmarc.{domain} -> {value}")
+    try:
+        headers = _headers_for_zone(zone_id)
+
+        resp = httpx.get(f"{CF_API}/zones/{zone_id}/dns_records?type=TXT", headers=headers, timeout=30)
+        if _cf_success(resp):
+            for r in resp.json().get("result", []):
+                record_name = (r.get("name") or "").lower()
+                content = (r.get("content") or "").strip()
+                if record_name.startswith("_dmarc.") and content.lower().startswith("v=dmarc1"):
+                    logger.info("DMARC already exists: %s -> %s", r.get("name"), content)
+                    return True
+        elif resp.status_code == 200:
+            logger.warning(f"Cloudflare returned 200 but success=false listing TXT records: {_cf_error_message(resp)}")
+        else:
+            logger.error(f"Failed to list TXT records before DMARC add: {_cf_error_message(resp)}")
+            return False
+
+        create_resp = httpx.post(
+            f"{CF_API}/zones/{zone_id}/dns_records",
+            headers=headers,
+            json={"type": "TXT", "name": "_dmarc", "content": value, "ttl": 1},
+            timeout=30,
+        )
+
+        if _cf_success(create_resp):
+            record_id = create_resp.json().get("result", {}).get("id", "unknown")
+            logger.info(f"DMARC added successfully (record_id={record_id})")
+            if _verify_record_exists(zone_id, "TXT", value, headers):
+                logger.info("DMARC record verified in Cloudflare")
+                return True
+            logger.error("DMARC record was not found in Cloudflare after creation")
+            return False
+
+        if "already exists" in create_resp.text.lower():
+            logger.info("DMARC already exists")
+            return _verify_record_exists(zone_id, "TXT", "v=DMARC1", headers)
+
+        logger.error(f"DMARC add FAILED: {_cf_error_message(create_resp)}")
+        logger.error(f"DMARC full response: status={create_resp.status_code}, body={create_resp.text[:500]}")
+        return False
+    except Exception as e:
+        logger.error(f"DMARC error: {e}")
+        return False

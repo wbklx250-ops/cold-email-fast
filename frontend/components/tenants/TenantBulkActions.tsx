@@ -5,17 +5,11 @@ import {
   Tenant,
   TenantStatus,
   TenantBulkOperationResult,
-  bulkAddTenantsToM365,
-  bulkSetupTenantDns,
-  bulkSetupTenantDkim,
   bulkCreateMailboxesInM365,
   bulkConfigureMailboxes,
 } from "@/lib/api";
 
 type BulkOperation = 
-  | "add_to_m365" 
-  | "setup_dns" 
-  | "setup_dkim" 
   | "create_mailboxes" 
   | "configure_mailboxes";
 
@@ -37,30 +31,6 @@ interface OperationConfig {
 }
 
 const OPERATIONS: Record<BulkOperation, OperationConfig> = {
-  add_to_m365: {
-    label: "Add to M365",
-    icon: "[M365]",
-    description: "Add custom domains to M365 and verify",
-    validStatuses: ["new", "imported", "domain_linked"],
-    action: bulkAddTenantsToM365,
-    color: "blue",
-  },
-  setup_dns: {
-    label: "Setup DNS",
-    icon: "[DNS]",
-    description: "Configure MX and SPF records in Cloudflare",
-    validStatuses: ["domain_verified"],
-    action: bulkSetupTenantDns,
-    color: "indigo",
-  },
-  setup_dkim: {
-    label: "Setup DKIM",
-    icon: "[DKIM]",
-    description: "Configure DKIM records and enable signing",
-    validStatuses: ["dns_configuring"],
-    action: bulkSetupTenantDkim,
-    color: "purple",
-  },
   create_mailboxes: {
     label: "Create in M365",
     icon: "[+]",

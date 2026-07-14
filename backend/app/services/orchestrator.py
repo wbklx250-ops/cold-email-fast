@@ -76,6 +76,10 @@ class TenantSetupOrchestrator:
         """
         Run complete setup for a tenant.
         """
+        raise RuntimeError(
+            "Legacy Graph/Cloudflare tenant orchestrator is disabled. "
+            "Use the Admin Center setup wizard pipeline for domain DNS and DKIM setup."
+        )
         def update_step(step: SetupStep):
             tenant.setup_step = step.value
             if on_step:

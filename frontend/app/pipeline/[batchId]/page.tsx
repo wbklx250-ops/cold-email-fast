@@ -11,7 +11,7 @@ const STEP_NAMES: Record<number, string> = {
   1: "Create Cloudflare Zones",
   2: "Update Nameservers",
   3: "Verify NS Propagation",
-  4: "Create DNS Records",
+  4: "Cloudflare Redirects",
   5: "First Login",
   6: "M365 Domain Setup",
   7: "Create Mailboxes",

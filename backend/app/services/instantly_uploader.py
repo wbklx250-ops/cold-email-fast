@@ -30,11 +30,12 @@ from selenium.common.exceptions import (
     NoSuchWindowException, InvalidSessionIdException,
     ElementClickInterceptedException, StaleElementReferenceException
 )
-from sqlalchemy import select, update
+from sqlalchemy import and_, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.mailbox import Mailbox
 from app.models.tenant import Tenant
+from app.models.domain import Domain
 from app.models.batch import SetupBatch
 from app.db.session import async_session_factory
 
@@ -1082,9 +1083,21 @@ async def run_instantly_upload_for_batch(
         query = (
             select(Mailbox)
             .join(Tenant, Mailbox.tenant_id == Tenant.id)
+            .join(
+                Domain,
+                and_(
+                    Domain.batch_id == Tenant.batch_id,
+                    func.lower(Domain.name)
+                    == func.lower(func.split_part(Mailbox.email, "@", 2)),
+                ),
+            )
             .where(
                 Tenant.batch_id == batch_id,
                 Mailbox.setup_complete == True,
+                Domain.step5_complete == True,
+                Domain.domain_verified_in_m365 == True,
+                Domain.dkim_enabled == True,
+                Domain.dmarc_configured == True,
             )
         )
 

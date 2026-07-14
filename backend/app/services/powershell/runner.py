@@ -1370,8 +1370,7 @@ try {{
         """
         Get DKIM configuration with MFA support.
         
-        Uses Exchange Admin Center UI automation as the primary method,
-        with PowerShell fallbacks if UI fails.
+        Uses Exchange Admin Center UI automation only.
         
         Returns: (success, selector1_cname, selector2_cname)
         """
@@ -1400,51 +1399,7 @@ try {{
         except Exception as e:
             logger.warning(f"[{domain_name}] Exchange Admin Center UI exception: {e}")
         
-        # FALLBACK 1: Try basic credential auth with PowerShell
-        logger.info(f"[{domain_name}] Trying PowerShell credential auth for DKIM config...")
-        try:
-            success, sel1, sel2 = await self.get_dkim_config_with_credentials(
-                admin_email, admin_password, domain_name
-            )
-            
-            if success:
-                return True, sel1, sel2
-        except Exception as e:
-            logger.warning(f"[{domain_name}] PowerShell credential auth failed: {e}")
-        
-        # FALLBACK 2: Try Selenium + token-based approach
-        logger.info(f"[{domain_name}] Trying Selenium OAuth + PowerShell for DKIM config...")
-        try:
-            selenium_success, access_token, selenium_error = await self._get_access_token_via_selenium(
-                admin_email, admin_password, totp_secret
-            )
-            
-            if selenium_success and access_token:
-                organization = admin_email.split('@')[1]
-                return await self.get_dkim_config(access_token, organization, domain_name)
-            else:
-                logger.warning(f"[{domain_name}] Selenium OAuth failed: {selenium_error}")
-        except Exception as e:
-            logger.warning(f"[{domain_name}] Selenium OAuth exception: {e}")
-        
-        # FALLBACK 3: Construct DKIM CNAMEs from known pattern
-        logger.info(f"[{domain_name}] All methods failed, constructing DKIM CNAMEs from pattern...")
-        if onmicrosoft_domain or (admin_email and '.onmicrosoft.com' in admin_email):
-            tenant_name = None
-            if onmicrosoft_domain:
-                tenant_name = onmicrosoft_domain.replace('.onmicrosoft.com', '')
-            else:
-                email_domain = admin_email.split('@')[1]
-                tenant_name = email_domain.replace('.onmicrosoft.com', '')
-            
-            if tenant_name:
-                domain_normalized = domain_name.replace('.', '-')
-                selector1 = f"selector1-{domain_normalized}._domainkey.{tenant_name}.onmicrosoft.com"
-                selector2 = f"selector2-{domain_normalized}._domainkey.{tenant_name}.onmicrosoft.com"
-                logger.info(f"[{domain_name}] Constructed DKIM CNAMEs: {selector1}, {selector2}")
-                return True, selector1, selector2
-        
-        logger.error(f"[{domain_name}] Could not get DKIM config via any method")
+        logger.error(f"[{domain_name}] Could not get DKIM config via Exchange Admin Center UI")
         return False, None, None
     
     async def enable_dkim_with_mfa(
@@ -1457,8 +1412,7 @@ try {{
         """
         Enable DKIM with MFA support.
         
-        Uses Exchange Admin Center UI automation as the primary method,
-        with PowerShell fallbacks if UI fails.
+        Uses Exchange Admin Center UI automation only.
         
         Returns: (success, error_message)
         """
@@ -1486,37 +1440,8 @@ try {{
         except Exception as e:
             logger.warning(f"[{domain_name}] Exchange Admin Center UI exception: {e}")
         
-        # FALLBACK 1: Try basic credential auth with PowerShell
-        logger.info(f"[{domain_name}] Trying PowerShell credential auth to enable DKIM...")
-        try:
-            success, error = await self.enable_dkim_with_credentials(
-                admin_email, admin_password, domain_name
-            )
-            
-            if success:
-                return True, None
-            else:
-                logger.warning(f"[{domain_name}] PowerShell credential auth failed: {error}")
-        except Exception as e:
-            logger.warning(f"[{domain_name}] PowerShell credential auth exception: {e}")
-        
-        # FALLBACK 2: Try Selenium + token-based approach
-        logger.info(f"[{domain_name}] Trying Selenium OAuth + PowerShell to enable DKIM...")
-        try:
-            selenium_success, access_token, selenium_error = await self._get_access_token_via_selenium(
-                admin_email, admin_password, totp_secret
-            )
-            
-            if selenium_success and access_token:
-                organization = admin_email.split('@')[1]
-                return await self.enable_dkim(access_token, organization, domain_name)
-            else:
-                logger.warning(f"[{domain_name}] Selenium OAuth failed: {selenium_error}")
-        except Exception as e:
-            logger.warning(f"[{domain_name}] Selenium OAuth exception: {e}")
-        
-        logger.error(f"[{domain_name}] Could not enable DKIM via any method")
-        return False, "All DKIM enable methods failed"
+        logger.error(f"[{domain_name}] Could not enable DKIM via Exchange Admin Center UI")
+        return False, "Exchange Admin Center UI DKIM enable failed"
 
 
 # Singleton

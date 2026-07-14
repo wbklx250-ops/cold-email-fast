@@ -34,8 +34,18 @@ class WizardCompletionResult:
     autodiscover_value: Optional[str] = None
     dkim_selector1: Optional[str] = None
     dkim_selector2: Optional[str] = None
+    dmarc_added: bool = False
     error: Optional[str] = None
     error_step: Optional[str] = None
+
+
+def _is_domain_setup_complete_text(page_text: str) -> bool:
+    text = (page_text or "").lower()
+    if not text:
+        return False
+    if any(marker in text for marker in ("error", "failed", "couldn't verify", "doesn't match", "try again")):
+        return False
+    return "domain setup is complete" in text or "setup is complete" in text or "is all set up" in text
 
 
 class DomainWizardCompleter:
@@ -145,11 +155,28 @@ class DomainWizardCompleter:
             
             logger.info(f"[{self.domain_name}] Extracted: MX={result.mx_value}, DKIM1={result.dkim_selector1}")
             self._screenshot("wizard_dns_records_extracted", self.domain_name)
+
+            missing_values = [
+                name
+                for name, value in {
+                    "MX": result.mx_value,
+                    "SPF": result.spf_value,
+                    "autodiscover": result.autodiscover_value,
+                    "DKIM selector1": result.dkim_selector1,
+                    "DKIM selector2": result.dkim_selector2,
+                }.items()
+                if not value
+            ]
+            if missing_values:
+                result.error = f"Wizard DNS page missing required values: {', '.join(missing_values)}"
+                result.error_step = "dns_extraction"
+                logger.error(f"[{self.domain_name}] {result.error}")
+                return result
             
             # ========== Add DNS to Cloudflare ==========
             logger.info(f"[{self.domain_name}] Adding DNS records to Cloudflare...")
             
-            await self._add_dns_to_cloudflare(
+            dns_write_results = await self._add_dns_to_cloudflare(
                 cloudflare_zone_id=cloudflare_zone_id,
                 cloudflare_service=cloudflare_service,
                 mx_value=result.mx_value,
@@ -158,6 +185,7 @@ class DomainWizardCompleter:
                 dkim_selector1=result.dkim_selector1,
                 dkim_selector2=result.dkim_selector2,
             )
+            result.dmarc_added = dns_write_results.get("dmarc", False)
             
             # ========== Wait for DNS propagation ==========
             logger.info(f"[{self.domain_name}] Waiting 30s for DNS propagation...")
@@ -192,7 +220,7 @@ class DomainWizardCompleter:
             self._screenshot("wizard_looking_for_done", self.domain_name)
             
             page_text = self.driver.page_source.lower()
-            if "domain setup is complete" in page_text or "setup is complete" in page_text:
+            if _is_domain_setup_complete_text(page_text):
                 logger.info(f"[{self.domain_name}] ✓ Domain setup complete! Clicking Done...")
                 
                 done_btn = self._find_clickable([
@@ -222,13 +250,13 @@ class DomainWizardCompleter:
                         break
                 
                 # Check again
-                if "domain setup is complete" in self.driver.page_source.lower():
+                if _is_domain_setup_complete_text(self.driver.page_source):
                     result.success = True
                     logger.info(f"[{self.domain_name}] ✓ Wizard completed after clicking through")
                 else:
-                    # Still mark as success if we got DNS records
-                    result.success = True
-                    logger.info(f"[{self.domain_name}] Wizard finished (may need manual completion)")
+                    result.error = "Microsoft domain setup wizard did not reach completion page"
+                    result.error_step = "wizard_completion"
+                    logger.error(f"[{self.domain_name}] {result.error}")
             
             return result
             
@@ -295,8 +323,8 @@ class DomainWizardCompleter:
         """
         result = {
             "mx_value": None,
-            "spf_value": "v=spf1 include:spf.protection.outlook.com -all",  # Standard
-            "autodiscover_value": "autodiscover.outlook.com",  # Standard
+            "spf_value": None,
+            "autodiscover_value": None,
             "dkim_selector1": None,
             "dkim_selector2": None,
         }
@@ -412,8 +440,16 @@ class DomainWizardCompleter:
                 elif 'mail.protection.outlook' in val.lower() and not result["mx_value"]:
                     result["mx_value"] = val.strip()
                     logger.info(f"[{self.domain_name}] Found MX in input: {val}")
+                elif 'autodiscover.outlook.com' in val.lower() and not result["autodiscover_value"]:
+                    result["autodiscover_value"] = val.strip()
+                    logger.info(f"[{self.domain_name}] Found autodiscover in input: {val}")
             except:
                 continue
+
+        autodiscover_match = re.search(r'(autodiscover\.outlook\.com)', page_source, re.IGNORECASE)
+        if autodiscover_match and not result["autodiscover_value"]:
+            result["autodiscover_value"] = autodiscover_match.group(1)
+            logger.info(f"[{self.domain_name}] Found autodiscover: {result['autodiscover_value']}")
         
         return result
     
@@ -426,8 +462,30 @@ class DomainWizardCompleter:
         autodiscover_value: Optional[str],
         dkim_selector1: Optional[str],
         dkim_selector2: Optional[str],
-    ):
+    ) -> dict[str, bool]:
         """Add all DNS records to Cloudflare, handling duplicates."""
+        missing_values = [
+            name
+            for name, value in {
+                "MX": mx_value,
+                "SPF": spf_value,
+                "autodiscover": autodiscover_value,
+                "DKIM selector1": dkim_selector1,
+                "DKIM selector2": dkim_selector2,
+            }.items()
+            if not value
+        ]
+        if missing_values:
+            raise RuntimeError(f"missing required DNS values: {', '.join(missing_values)}")
+
+        write_results = {
+            "mx": False,
+            "spf": False,
+            "autodiscover": False,
+            "dkim_selector1": False,
+            "dkim_selector2": False,
+            "dmarc": False,
+        }
         
         # First, delete conflicting SPF records
         logger.info(f"[{self.domain_name}] Cleaning up conflicting DNS records...")
@@ -453,40 +511,62 @@ class DomainWizardCompleter:
             logger.warning(f"[{self.domain_name}] Error cleaning DKIM records: {e}")
         
         # Add MX record
-        if mx_value:
-            try:
-                await cloudflare_service.ensure_mx_record(cloudflare_zone_id, self.domain_name, mx_value)
-                logger.info(f"[{self.domain_name}] ✓ MX record added")
-            except Exception as e:
-                logger.warning(f"[{self.domain_name}] MX error: {e}")
+        try:
+            await cloudflare_service.ensure_mx_record(cloudflare_zone_id, "@", mx_value, 0, self.domain_name)
+            write_results["mx"] = True
+            logger.info(f"[{self.domain_name}] ✓ MX record added")
+        except Exception as e:
+            logger.error(f"[{self.domain_name}] MX error: {e}")
         
         # Add SPF record
-        if spf_value:
-            try:
+        try:
+            if hasattr(cloudflare_service, "replace_spf_record"):
+                await cloudflare_service.replace_spf_record(cloudflare_zone_id, self.domain_name, spf_value)
+            else:
                 await cloudflare_service.create_txt_record(cloudflare_zone_id, "@", spf_value)
-                logger.info(f"[{self.domain_name}] ✓ SPF record added")
-            except Exception as e:
-                if "already exists" not in str(e).lower():
-                    logger.warning(f"[{self.domain_name}] SPF error: {e}")
+            write_results["spf"] = True
+            logger.info(f"[{self.domain_name}] ✓ SPF record added")
+        except Exception as e:
+            logger.error(f"[{self.domain_name}] SPF error: {e}")
         
         # Add autodiscover CNAME
-        if autodiscover_value:
-            try:
-                await cloudflare_service.ensure_autodiscover_cname(cloudflare_zone_id, self.domain_name, autodiscover_value)
-                logger.info(f"[{self.domain_name}] ✓ Autodiscover CNAME added")
-            except Exception as e:
-                logger.warning(f"[{self.domain_name}] Autodiscover error: {e}")
+        try:
+            await cloudflare_service.ensure_autodiscover_cname(cloudflare_zone_id, self.domain_name, autodiscover_value)
+            write_results["autodiscover"] = True
+            logger.info(f"[{self.domain_name}] ✓ Autodiscover CNAME added")
+        except Exception as e:
+            logger.error(f"[{self.domain_name}] Autodiscover error: {e}")
         
         # Add DKIM CNAMEs
-        if dkim_selector1 and dkim_selector2:
-            try:
-                await cloudflare_service.ensure_dkim_cnames(
-                    cloudflare_zone_id, self.domain_name,
-                    dkim_selector1, dkim_selector2
-                )
-                logger.info(f"[{self.domain_name}] ✓ DKIM CNAMEs added")
-            except Exception as e:
-                logger.warning(f"[{self.domain_name}] DKIM error: {e}")
+        try:
+            dkim_result = await cloudflare_service.ensure_dkim_cnames(
+                cloudflare_zone_id, self.domain_name,
+                dkim_selector1, dkim_selector2
+            )
+            dkim_errors = dkim_result.get("errors") if isinstance(dkim_result, dict) else None
+            write_results["dkim_selector1"] = not dkim_errors and bool(dkim_result.get("selector1_id") if isinstance(dkim_result, dict) else True)
+            write_results["dkim_selector2"] = not dkim_errors and bool(dkim_result.get("selector2_id") if isinstance(dkim_result, dict) else True)
+            logger.info(f"[{self.domain_name}] ✓ DKIM CNAMEs added")
+        except Exception as e:
+            logger.error(f"[{self.domain_name}] DKIM error: {e}")
+
+        try:
+            await cloudflare_service.ensure_txt_record(
+                cloudflare_zone_id,
+                "_dmarc",
+                "v=DMARC1; p=none;",
+                self.domain_name,
+            )
+            write_results["dmarc"] = True
+            logger.info(f"[{self.domain_name}] ✓ DMARC record added")
+        except Exception as e:
+            logger.error(f"[{self.domain_name}] DMARC error: {e}")
+
+        failed_records = [name for name, ok in write_results.items() if not ok]
+        if failed_records:
+            raise RuntimeError(f"Cloudflare DNS setup failed for: {', '.join(failed_records)}")
+
+        return write_results
     
     async def _handle_page3_validation(
         self,
@@ -508,7 +588,7 @@ class DomainWizardCompleter:
             page_text = self.driver.page_source.lower()
             
             # Check for success
-            if "domain setup is complete" in page_text or "setup is complete" in page_text:
+            if _is_domain_setup_complete_text(page_text):
                 logger.info(f"[{self.domain_name}] ✓ DNS validation passed!")
                 return True
             
@@ -536,7 +616,7 @@ class DomainWizardCompleter:
                 time.sleep(3)
                 
                 # Check again
-                if "domain setup is complete" in self.driver.page_source.lower():
+                if _is_domain_setup_complete_text(self.driver.page_source):
                     return True
                 continue
             

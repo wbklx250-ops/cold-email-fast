@@ -9,7 +9,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, BackgroundTasks, Response
 from fastapi.responses import StreamingResponse, PlainTextResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import or_, select, func, update, text
+from sqlalchemy import and_, or_, select, func, update, text
 from sqlalchemy.orm import selectinload
 from typing import Optional, List
 from pydantic import BaseModel
@@ -46,6 +46,17 @@ from app.services.azure_step6 import (
 router = APIRouter(prefix="/api/v1/wizard", tags=["wizard"])
 
 logger = logging.getLogger(__name__)
+
+
+def _raise_wizard_only_step5_disabled(action: str) -> None:
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            f"{action} is disabled for Step 5. Use the Admin Center setup "
+            "wizard automation/pipeline so Microsoft supplies, validates, "
+            "and completes the domain DNS setup."
+        ),
+    )
 
 # C2 FIX: prevent fire-and-forget asyncio tasks from being garbage-collected
 _background_tasks: set = set()
@@ -820,13 +831,23 @@ async def _run_step5_with_retry(batch_id: UUID, job_id: str):
         async with async_session_factory() as db:
             # Find tenants needing step 5
             result = await db.execute(
-                select(Tenant).where(
+                select(Tenant)
+                .join(Domain, Domain.tenant_id == Tenant.id)
+                .where(
                     Tenant.batch_id == batch_id,
                     Tenant.first_login_completed == True,
                     Tenant.domain_id.isnot(None),
-                    Tenant.dkim_enabled.is_not(True),
+                    or_(
+                        Tenant.step5_complete.is_not(True),
+                        Tenant.dkim_enabled.is_not(True),
+                        Domain.step5_complete.is_not(True),
+                        Domain.domain_verified_in_m365.is_not(True),
+                        Domain.dkim_enabled.is_not(True),
+                        Domain.dmarc_configured.is_not(True),
+                    ),
                     (Tenant.step5_retry_count <= MAX_AUTO_RETRIES) | Tenant.step5_retry_count.is_(None),
                 )
+                .distinct()
             )
             tenants = result.scalars().all()
             
@@ -851,7 +872,7 @@ async def _run_step5_with_retry(batch_id: UUID, job_id: str):
                     else:
                         tenant.step5_retry_count += 1
                         if tenant.step5_retry_count > MAX_AUTO_RETRIES:
-                            tenant.step5_complete = True  # Skip
+                            tenant.step5_complete = False
                             tenant.setup_error = f"SKIPPED after {MAX_AUTO_RETRIES} retries"
                             auto_run_jobs[job_id]["progress"]["step5"]["skipped"] += 1
                         else:
@@ -885,7 +906,7 @@ async def _run_security_defaults_with_retry(batch_id: UUID, job_id: str):
             result = await db.execute(
                 select(Tenant).where(
                     Tenant.batch_id == batch_id,
-                    ((Tenant.step5_complete == True) | (Tenant.dkim_enabled == True)),
+                    Tenant.step5_complete == True,
                     Tenant.security_defaults_disabled.is_not(True),
                     Tenant.totp_secret.isnot(None),
                 )
@@ -962,7 +983,7 @@ async def _run_step6_with_retry(batch_id: UUID, display_name: str, job_id: str):
             result = await db.execute(
                 select(Tenant).where(
                     Tenant.batch_id == batch_id,
-                    ((Tenant.step5_complete == True) | (Tenant.dkim_enabled == True)),
+                    Tenant.step5_complete == True,
                     Tenant.step6_complete.is_not(True),
                     (Tenant.step6_retry_count <= MAX_AUTO_RETRIES) | Tenant.step6_retry_count.is_(None),
                 )
@@ -1400,10 +1421,20 @@ async def rerun_step(
         else:
             # Normal: Only reset incomplete tenants
             incomplete_tenants = await db.execute(
-                select(Tenant).where(
+                select(Tenant)
+                .join(Domain, Domain.tenant_id == Tenant.id)
+                .where(
                     Tenant.batch_id == batch_id,
-                    Tenant.dkim_enabled.is_not(True),
+                    or_(
+                        Tenant.step5_complete.is_not(True),
+                        Tenant.dkim_enabled.is_not(True),
+                        Domain.step5_complete.is_not(True),
+                        Domain.domain_verified_in_m365.is_not(True),
+                        Domain.dkim_enabled.is_not(True),
+                        Domain.dmarc_configured.is_not(True),
+                    ),
                 )
+                .distinct()
             )
             tenants_to_reset = incomplete_tenants.scalars().all()
             
@@ -1612,7 +1643,7 @@ async def get_batch_status(batch_id: UUID, db: RetryableSession = Depends(get_db
     tenants_dkim_enabled = await db.scalar(
         select(func.count(Tenant.id)).where(
             Tenant.batch_id == batch_id,
-            Tenant.status == TenantStatus.DKIM_ENABLED
+            Tenant.step5_complete == True,
         )
     ) or 0
     
@@ -1729,6 +1760,7 @@ async def start_full_automation(
     5. Set up DKIM
     6. Create all mailboxes
     """
+    _raise_wizard_only_step5_disabled("Legacy full automation")
     job_id = str(batch_id)
     
     # Initialize tracking
@@ -2100,14 +2132,9 @@ async def batch_create_zones(
                 else:
                     raise Exception("Failed to create Cloudflare zone")
             
-            # Ensure DNS records exist
+            # Email-auth DNS must be supplied by the Admin Center setup
+            # wizard. This step only creates the zone and optional redirect.
             if existing_zone_id:
-                await cloudflare_service.ensure_email_dns_records(
-                    existing_zone_id,
-                    domain_name
-                )
-                print(f"DEBUG batch_create_zones: DNS records verified for {domain_name}")
-                
                 # Create redirect rule if not already configured
                 actual_redirect = domain_redirect_url or redirect_url
                 if actual_redirect:
@@ -2929,6 +2956,7 @@ async def get_verify_domain_script(batch_id: UUID, tenant_id: UUID, db: AsyncSes
 @router.post("/batches/{batch_id}/step5/mark-verified/{tenant_id}")
 async def mark_domain_verified(batch_id: UUID, tenant_id: UUID, db: AsyncSession = Depends(get_db)):
     """Mark domain as verified."""
+    _raise_wizard_only_step5_disabled("Manual domain verification")
     tenant = await db.get(Tenant, tenant_id)
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
@@ -2941,6 +2969,7 @@ async def mark_domain_verified(batch_id: UUID, tenant_id: UUID, db: AsyncSession
 @router.post("/batches/{batch_id}/step5/add-mail-dns/{tenant_id}")
 async def add_mail_dns(batch_id: UUID, tenant_id: UUID, db: AsyncSession = Depends(get_db)):
     """Add MX, SPF, Autodiscover records."""
+    _raise_wizard_only_step5_disabled("Manual mail DNS creation")
     tenant = await db.get(Tenant, tenant_id)
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
@@ -2993,6 +3022,7 @@ async def save_dkim_values(
     db: AsyncSession = Depends(get_db)
 ):
     """Save DKIM values and add CNAMEs to Cloudflare."""
+    _raise_wizard_only_step5_disabled("Manual DKIM CNAME creation")
     tenant = await db.get(Tenant, tenant_id)
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
@@ -3032,6 +3062,7 @@ async def get_enable_dkim_script(batch_id: UUID, tenant_id: UUID, db: AsyncSessi
 @router.post("/batches/{batch_id}/step5/mark-dkim-enabled/{tenant_id}")
 async def mark_dkim_enabled(batch_id: UUID, tenant_id: UUID, db: AsyncSession = Depends(get_db)):
     """Mark DKIM as enabled."""
+    _raise_wizard_only_step5_disabled("Manual DKIM enable marking")
     tenant = await db.get(Tenant, tenant_id)
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
@@ -3043,29 +3074,26 @@ async def mark_dkim_enabled(batch_id: UUID, tenant_id: UUID, db: AsyncSession = 
 
 @router.post("/batches/{batch_id}/step5/setup-m365", response_model=StepResult)
 async def batch_setup_m365(batch_id: UUID, db: AsyncSession = Depends(get_db)):
-    """Step 5a: Setup M365 for this batch (legacy placeholder)."""
-    return StepResult(
-        success=True,
-        message="Use the per-tenant endpoints for M365 setup",
-        details={"note": "See /step5/script/* and /step5/save-* endpoints"}
+    """Step 5a legacy placeholder disabled in favor of wizard automation."""
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            "This legacy Step 5 placeholder is disabled. Use "
+            "/api/v1/wizard/batches/{batch_id}/step5/start-automation "
+            "or the pipeline runner so the Admin Center setup wizard controls DNS/M365 truth."
+        ),
     )
 
 
 @router.post("/batches/{batch_id}/step5/setup-dkim", response_model=StepResult)
 async def batch_setup_dkim(batch_id: UUID, db: AsyncSession = Depends(get_db)):
-    """Step 5b: Setup DKIM for this batch (legacy placeholder)."""
-    batch = await db.get(SetupBatch, batch_id)
-    if not batch:
-        raise HTTPException(status_code=404, detail="Batch not found")
-    
-    if batch.current_step == 5:
-        batch.current_step = 6
-        await db.commit()
-    
-    return StepResult(
-        success=True,
-        message="Use the per-tenant endpoints for DKIM setup",
-        details={"note": "See /step5/script/get-dkim/* and /step5/save-dkim/* endpoints"}
+    """Step 5b legacy placeholder disabled in favor of wizard automation."""
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            "This legacy DKIM placeholder is disabled. Use the batch Step 5 "
+            "Admin Center wizard automation instead."
+        ),
     )
 
 
@@ -3085,15 +3113,12 @@ async def start_step5_automation(
     Start automated M365 domain verification and DKIM setup for all tenants in batch.
     
     This runs in the background and:
-    1. Adds domain to M365 tenant (via Graph API)
-    2. Adds verification TXT to Cloudflare
-    3. Waits for DNS propagation
-    4. Verifies domain in M365
-    5. Adds mail DNS records (MX, SPF, autodiscover)
-    6. Gets DKIM CNAME values (via Exchange Online PowerShell)
-    7. Adds DKIM CNAMEs to Cloudflare
-    8. Waits for propagation
-    9. Enables DKIM
+    1. Opens the Microsoft Admin Center domain setup wizard
+    2. Scrapes the wizard TXT value and verifies domain ownership
+    3. Scrapes wizard-provided MX/SPF/DKIM values
+    4. Writes MX/SPF/autodiscover/DKIM/DMARC to Cloudflare
+    5. Lets the wizard validate DNS and reach the completion page
+    6. Confirms the domain state with read-only Microsoft tenant readback
     
     Requires:
     - Tenants must have completed first login (Step 4)
@@ -3106,12 +3131,22 @@ async def start_step5_automation(
     
     # Count eligible tenants
     result = await db.execute(
-        select(Tenant).where(
+        select(Tenant)
+        .join(Domain, Domain.tenant_id == Tenant.id)
+        .where(
             Tenant.batch_id == batch_id,
             Tenant.domain_id.isnot(None),
             Tenant.first_login_completed == True,
-            Tenant.dkim_enabled.is_not(True),
+            or_(
+                Tenant.step5_complete.is_not(True),
+                Tenant.dkim_enabled.is_not(True),
+                Domain.step5_complete.is_not(True),
+                Domain.domain_verified_in_m365.is_not(True),
+                Domain.dkim_enabled.is_not(True),
+                Domain.dmarc_configured.is_not(True),
+            ),
         )
+        .distinct()
     )
     tenants = result.scalars().all()
     
@@ -3417,8 +3452,8 @@ async def get_step5_batch_status(
         if tenant.step5_complete:
             summary["step5_complete_count"] += 1
         
-        # Count statuses - prioritize dkim_enabled/step5_complete over errors
-        if tenant.dkim_enabled or tenant.step5_complete:
+        # Count statuses - only Step 5 complete is ready for the next stage.
+        if tenant.step5_complete:
             summary["dkim_enabled"] += 1
         elif tenant.setup_error and not tenant.dkim_cnames_added:
             # Only count as error if not partially complete
@@ -3435,7 +3470,9 @@ async def get_step5_batch_status(
             summary["not_started"] += 1
     
     # Determine if ready to advance to Step 6
-    summary["ready_for_step6"] = summary["dkim_enabled"] == summary["total"] and summary["total"] > 0
+    summary["ready_for_step6"] = (
+        summary["step5_complete_count"] == summary["total"] and summary["total"] > 0
+    )
     
     # Log summary for debugging
     logger.info(
@@ -3464,6 +3501,7 @@ async def mark_tenant_step5_complete(
     
     This sets ALL Step 5 related fields to complete state.
     """
+    _raise_wizard_only_step5_disabled("Manual Step 5 completion")
     tenant = await db.get(Tenant, tenant_id)
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
@@ -3540,6 +3578,7 @@ async def mark_bulk_tenants_step5_complete(
     Example request body:
         {"domains": ["domain1.com", "domain2.com"]}
     """
+    _raise_wizard_only_step5_disabled("Bulk manual Step 5 completion")
     if not domains:
         raise HTTPException(status_code=400, detail="No domains provided")
     
@@ -3695,6 +3734,7 @@ async def retry_dkim_for_tenant(
     
     Immediately attempts to enable DKIM via Exchange Admin Center UI.
     """
+    _raise_wizard_only_step5_disabled("Manual DKIM retry")
     from app.services.selenium.admin_portal import AdminPortalAutomation
     from datetime import datetime
     
@@ -3778,6 +3818,7 @@ async def start_step5_parallel(
     
     Much faster than sequential processing for batches with many domains.
     """
+    _raise_wizard_only_step5_disabled("Legacy parallel Step 5 automation")
     batch = await db.get(SetupBatch, batch_id)
     if not batch:
         raise HTTPException(status_code=404, detail="Batch not found")
@@ -3932,12 +3973,22 @@ async def retry_failed_tenants(
 ):
     """Retry Step 5 for all failed tenants in batch."""
     result = await db.execute(
-        select(Tenant).where(
+        select(Tenant)
+        .join(Domain, Domain.tenant_id == Tenant.id)
+        .where(
             Tenant.batch_id == batch_id,
             Tenant.domain_id.isnot(None),
             Tenant.setup_error.isnot(None),
-            Tenant.dkim_enabled.is_not(True),
+            or_(
+                Tenant.step5_complete.is_not(True),
+                Tenant.dkim_enabled.is_not(True),
+                Domain.step5_complete.is_not(True),
+                Domain.domain_verified_in_m365.is_not(True),
+                Domain.dkim_enabled.is_not(True),
+                Domain.dmarc_configured.is_not(True),
+            ),
         )
+        .distinct()
     )
     failed_tenants = result.scalars().all()
     
@@ -4108,7 +4159,7 @@ async def start_step6_automation(
     tenant_result = await db.execute(
         select(func.count(Tenant.id)).where(
             Tenant.batch_id == batch_id,
-            Tenant.domain_verified_in_m365 == True,
+            Tenant.step5_complete == True,
             Tenant.step6_complete.is_not(True),
         )
     )
@@ -4611,7 +4662,7 @@ async def rerun_step6_automation(
             Tenant.batch_id == batch_id,
             Tenant.step6_complete.is_not(True),
             # Step 5 complete check - either explicit flag or implied by dkim_enabled
-            ((Tenant.step5_complete == True) | (Tenant.dkim_enabled == True))
+            Tenant.step5_complete == True
         )
     )
     eligible_tenants = tenant_result.scalars().all()
@@ -4763,7 +4814,7 @@ async def resume_step6_processing(
             Tenant.batch_id == batch_id,
             Tenant.step6_complete.is_not(True),
             # Step 5 complete check
-            ((Tenant.step5_complete == True) | (Tenant.domain_verified_in_m365 == True))
+            Tenant.step5_complete == True
         )
     )
     eligible_tenants = tenant_result.scalars().all()
@@ -5747,7 +5798,7 @@ async def get_wizard_status(db: AsyncSession = Depends(get_db)):
     )).scalar() or 0
     
     tenants_dkim_enabled = (await db.execute(
-        select(func.count(Tenant.id)).where(Tenant.status == TenantStatus.DKIM_ENABLED)
+        select(func.count(Tenant.id)).where(Tenant.step5_complete == True)
     )).scalar() or 0
     
     # Count mailboxes
@@ -5919,6 +5970,7 @@ async def wizard_create_zones(db: AsyncSession = Depends(get_db)):
                     )
                     domain.phase1_cname_added = True
                     domain.phase1_dmarc_added = True
+                    domain.dmarc_configured = True
                     
                     success_count += 1
                     
@@ -6145,11 +6197,12 @@ async def wizard_setup_m365(db: AsyncSession = Depends(get_db)):
     Note: This is a placeholder - actual M365 integration requires
     the microsoft service and powershell service to be implemented.
     """
-    # TODO: Implement when microsoft_service is ready
-    return StepResult(
-        success=True,
-        message="M365 setup - implementation pending",
-        details={"note": "Requires Microsoft Graph API integration"}
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            "This legacy global Step 5 placeholder is disabled. Use the batch "
+            "setup wizard/pipeline so Admin Center supplies and validates DNS."
+        ),
     )
 
 
@@ -6161,11 +6214,12 @@ async def wizard_setup_dkim(db: AsyncSession = Depends(get_db)):
     Note: This is a placeholder - actual DKIM setup requires
     PowerShell scripts to be executed.
     """
-    # TODO: Implement when powershell_service is ready
-    return StepResult(
-        success=True,
-        message="DKIM setup - implementation pending",
-        details={"note": "Requires PowerShell integration"}
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            "This legacy global DKIM placeholder is disabled. Use the batch "
+            "Admin Center wizard automation instead."
+        ),
     )
 
 
@@ -6356,29 +6410,45 @@ async def get_step8_status(
     if not batch:
         raise HTTPException(404, "Batch not found")
     
-    # Count only setup-complete mailboxes. Historical batches can contain stale
-    # mailbox rows for domains that never objectively completed.
+    # Count only setup-complete mailboxes on domains that objectively completed
+    # M365 verification and DKIM.
+    instantly_domain_ready_join = and_(
+        Domain.batch_id == Mailbox.batch_id,
+        func.lower(Domain.name) == func.lower(func.split_part(Mailbox.email, "@", 2)),
+    )
     mailboxes_total = await db.scalar(
-        select(func.count(Mailbox.id)).where(
+        select(func.count(Mailbox.id)).join(Domain, instantly_domain_ready_join).where(
             Mailbox.batch_id == batch_id,
             Mailbox.setup_complete == True,
+            Domain.step5_complete == True,
+            Domain.domain_verified_in_m365 == True,
+            Domain.dkim_enabled == True,
+            Domain.dmarc_configured == True,
         )
     ) or 0
     
     mailboxes_uploaded = await db.scalar(
-        select(func.count(Mailbox.id)).where(
+        select(func.count(Mailbox.id)).join(Domain, instantly_domain_ready_join).where(
             Mailbox.batch_id == batch_id,
             Mailbox.setup_complete == True,
-            Mailbox.instantly_uploaded == True
+            Mailbox.instantly_uploaded == True,
+            Domain.step5_complete == True,
+            Domain.domain_verified_in_m365 == True,
+            Domain.dkim_enabled == True,
+            Domain.dmarc_configured == True,
         )
     ) or 0
     
     mailboxes_failed = await db.scalar(
-        select(func.count(Mailbox.id)).where(
+        select(func.count(Mailbox.id)).join(Domain, instantly_domain_ready_join).where(
             Mailbox.batch_id == batch_id,
             Mailbox.setup_complete == True,
             Mailbox.instantly_uploaded == False,
-            Mailbox.instantly_upload_error.isnot(None)
+            Mailbox.instantly_upload_error.isnot(None),
+            Domain.step5_complete == True,
+            Domain.domain_verified_in_m365 == True,
+            Domain.dkim_enabled == True,
+            Domain.dmarc_configured == True,
         )
     ) or 0
     
@@ -6474,10 +6544,19 @@ async def start_step8_upload(
             "started_at": step8_jobs[job_id].get("started_at")
         }
     
-    # Count only objectively setup-complete mailboxes.
-    mailboxes_query = select(func.count(Mailbox.id)).where(
+    # Count only objectively setup-complete mailboxes on completed M365/DKIM
+    # domains.
+    instantly_domain_ready_join = and_(
+        Domain.batch_id == Mailbox.batch_id,
+        func.lower(Domain.name) == func.lower(func.split_part(Mailbox.email, "@", 2)),
+    )
+    mailboxes_query = select(func.count(Mailbox.id)).join(Domain, instantly_domain_ready_join).where(
         Mailbox.batch_id == batch_id,
         Mailbox.setup_complete == True,
+        Domain.step5_complete == True,
+        Domain.domain_verified_in_m365 == True,
+        Domain.dkim_enabled == True,
+        Domain.dmarc_configured == True,
     )
     if request.skip_uploaded:
         mailboxes_query = mailboxes_query.where(Mailbox.instantly_uploaded == False)
@@ -6969,15 +7048,25 @@ async def get_step8_smartlead_status(
         )
     ) or 0
 
+    smartlead_domain_ready_join = and_(
+        Domain.batch_id == Mailbox.batch_id,
+        func.lower(Domain.name) == func.lower(func.split_part(Mailbox.email, "@", 2)),
+    )
+
     mailboxes_upload_ready = await db.scalar(
-        select(func.count(Mailbox.id)).where(
+        select(func.count(Mailbox.id)).join(Domain, smartlead_domain_ready_join).where(
             Mailbox.batch_id == batch_id,
+            Mailbox.setup_complete == True,
             Mailbox.smartlead_uploaded == False,
             Mailbox.created_in_exchange == True,
             Mailbox.delegated == True,
             Mailbox.password_set == True,
             Mailbox.account_enabled == True,
             or_(Mailbox.initial_password.isnot(None), Mailbox.password.isnot(None)),
+            Domain.step5_complete == True,
+            Domain.domain_verified_in_m365 == True,
+            Domain.dkim_enabled == True,
+            Domain.dmarc_configured == True,
         )
     ) or 0
     
@@ -7044,13 +7133,23 @@ async def start_step8_smartlead_upload(
     actual_num_workers = max(1, min(request.num_workers, smartlead_max_workers))
 
     # Count mailboxes that are actually ready for OAuth upload.
-    mailboxes_query = select(func.count(Mailbox.id)).where(
+    smartlead_domain_ready_join = and_(
+        Domain.batch_id == Mailbox.batch_id,
+        func.lower(Domain.name) == func.lower(func.split_part(Mailbox.email, "@", 2)),
+    )
+
+    mailboxes_query = select(func.count(Mailbox.id)).join(Domain, smartlead_domain_ready_join).where(
         Mailbox.batch_id == batch_id,
+        Mailbox.setup_complete == True,
         Mailbox.created_in_exchange == True,
         Mailbox.delegated == True,
         Mailbox.password_set == True,
         Mailbox.account_enabled == True,
         or_(Mailbox.initial_password.isnot(None), Mailbox.password.isnot(None)),
+        Domain.step5_complete == True,
+        Domain.domain_verified_in_m365 == True,
+        Domain.dkim_enabled == True,
+        Domain.dmarc_configured == True,
     )
     if request.skip_uploaded:
         mailboxes_query = mailboxes_query.where(Mailbox.smartlead_uploaded == False)

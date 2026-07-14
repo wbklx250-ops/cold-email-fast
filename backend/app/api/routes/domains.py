@@ -647,6 +647,14 @@ async def create_dns_records(
     Create MX, SPF, DMARC DNS records.
     Prerequisite: Zone must be active.
     """
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            "Legacy generic DNS creation is disabled. Use the batch setup wizard "
+            "so Microsoft Admin Center supplies and validates MX/SPF/DKIM records."
+        ),
+    )
+
     domain = await get_domain_or_404(domain_id, db)
 
     if not domain.cloudflare_zone_id:
@@ -818,6 +826,8 @@ async def bulk_create_zones(
             if cf_result.get("phase1_dns"):
                 domain_obj.phase1_cname_added = cf_result["phase1_dns"].get("cname_created", False)
                 domain_obj.phase1_dmarc_added = cf_result["phase1_dns"].get("dmarc_created", False)
+                if domain_obj.phase1_dmarc_added:
+                    domain_obj.dmarc_configured = True
             
             # Clear any previous error
             domain_obj.error_message = None
