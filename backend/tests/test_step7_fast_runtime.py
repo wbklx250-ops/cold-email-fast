@@ -1,10 +1,24 @@
 from app.services.step7_fast import (
+    _build_licensed_user_script,
     _effective_step7_parallel,
     _is_transient_license_error,
     _mailbox_objective_complete,
     _powershell_exit_error,
     _powershell_result_error,
 )
+
+
+def test_licensed_user_script_accepts_business_premium_trials():
+    script = _build_licensed_user_script(
+        escaped_email="admin@example.onmicrosoft.com",
+        escaped_password="password",
+        domain="example.com",
+        mailbox_password="mailbox-password",
+    )
+
+    assert '$businessPremiumSkuPartNumbers = @("SPB")' in script
+    assert 'SkuPartNumber -notlike "*TRIAL*"' not in script
+    assert "Business Premium (SPB, including trial)" in script
 
 
 def test_powershell_exit_error_identifies_sigkill():

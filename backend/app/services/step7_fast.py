@@ -338,11 +338,18 @@ try {{
         "Microsoft_365_Business_Basic_EEA_(no_Teams)",
         "Microsoft_365_Business_Basic_EEA_(no Teams)"
     )
-    $allowedSkuPartNumbers = @($businessBasicSkuPartNumbers + @("EXCHANGESTANDARD"))
+    # SPB is Microsoft 365 Business Premium, including trial subscriptions. It
+    # provides the Exchange mailbox required by this workflow and is commonly
+    # the only available SKU on newly provisioned reseller tenants.
+    $businessPremiumSkuPartNumbers = @("SPB")
+    $allowedSkuPartNumbers = @(
+        $businessBasicSkuPartNumbers +
+        $businessPremiumSkuPartNumbers +
+        @("EXCHANGESTANDARD")
+    )
     $allSkus = Get-MgSubscribedSku -ErrorAction Stop
     $allowedSkus = @($allSkus | Where-Object {{
         ($allowedSkuPartNumbers -contains $_.SkuPartNumber) -and
-        ($_.SkuPartNumber -notlike "*TRIAL*") -and
         ($_.AppliesTo -eq "User")
     }})
 
@@ -385,7 +392,7 @@ try {{
             $seenSkus = @($allSkus | ForEach-Object {{
                 "$($_.SkuPartNumber):$($_.ConsumedUnits)/$($_.PrepaidUnits.Enabled)"
             }}) -join ", "
-            throw "No available 'Microsoft 365 Business Basic' (accepted SKUs: $($businessBasicSkuPartNumbers -join ', ')) or 'Exchange Online Plan 1' (EXCHANGESTANDARD) license with a free seat in this tenant. Seen SKUs consumed/enabled: $seenSkus"
+            throw "No available Business Basic, Business Premium (SPB, including trial), or Exchange Online Plan 1 license with a free seat in this tenant. Seen SKUs consumed/enabled: $seenSkus"
         }}
     }}
 
@@ -413,7 +420,7 @@ async def ensure_licensed_user_for_domain(
 ) -> Dict[str, Any]:
     """
     Ensure the per-domain licensed user exists in Microsoft 365 and has one of
-    the allowed paid SKUs. This intentionally verifies Graph every time instead
+    an allowed Exchange-capable SKU. This intentionally verifies Graph every time instead
     of trusting cached DB flags.
     """
     domain = (domain_name or "").strip().lower()
