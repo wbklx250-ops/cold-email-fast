@@ -1,11 +1,18 @@
 from app.services.step7_fast import (
     _build_licensed_user_script,
+    _domain_error_message,
     _effective_step7_parallel,
     _is_transient_license_error,
     _mailbox_objective_complete,
     _powershell_exit_error,
     _powershell_result_error,
 )
+
+
+def test_domain_error_message_fits_database_column():
+    assert _domain_error_message(None) is None
+    assert _domain_error_message("short") == "short"
+    assert len(_domain_error_message("x" * 1200)) == 1000
 
 
 def test_licensed_user_script_accepts_business_premium_trials():

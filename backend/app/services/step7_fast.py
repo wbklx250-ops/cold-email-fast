@@ -33,6 +33,15 @@ from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
+DOMAIN_ERROR_MAX_LENGTH = 1000
+
+
+def _domain_error_message(error: str | None) -> str | None:
+    """Fit diagnostic text into domains.error_message (VARCHAR(1000))."""
+    if error is None:
+        return None
+    return str(error)[:DOMAIN_ERROR_MAX_LENGTH]
+
 
 def _cgroup_memory_limit_bytes() -> int | None:
     """Return the container memory limit when running under cgroup v1/v2."""
@@ -876,7 +885,9 @@ async def process_domain_fast(
                 d.step6_complete = step6_complete
                 d.step6_skipped = False
                 d.step6_mailboxes_created = ready_count
-                d.error_message = None if step6_complete else completion_error
+                d.error_message = _domain_error_message(
+                    None if step6_complete else completion_error
+                )
 
             await db.flush()
 
@@ -949,7 +960,7 @@ async def process_domain_fast(
                 if d:
                     d.step6_complete = False
                     d.step6_skipped = False
-                    d.error_message = error_msg
+                    d.error_message = _domain_error_message(error_msg)
 
             await save_to_db_with_retry(_save_error, description=f"{domain} error save")
         except Exception:
