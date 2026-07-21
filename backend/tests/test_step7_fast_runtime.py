@@ -23,7 +23,8 @@ def test_licensed_user_script_accepts_business_premium_trials():
         mailbox_password="mailbox-password",
     )
 
-    assert '$businessPremiumSkuPartNumbers = @("SPB")' in script
+    assert '"SPB"' in script
+    assert '"O365_BUSINESS_PREMIUM"' in script
     assert 'SkuPartNumber -notlike "*TRIAL*"' not in script
     assert "Business Premium (SPB, including trial)" in script
 

@@ -350,7 +350,10 @@ try {{
     # SPB is Microsoft 365 Business Premium, including trial subscriptions. It
     # provides the Exchange mailbox required by this workflow and is commonly
     # the only available SKU on newly provisioned reseller tenants.
-    $businessPremiumSkuPartNumbers = @("SPB")
+    $businessPremiumSkuPartNumbers = @(
+        "SPB",
+        "O365_BUSINESS_PREMIUM"
+    )
     $allowedSkuPartNumbers = @(
         $businessBasicSkuPartNumbers +
         $businessPremiumSkuPartNumbers +
