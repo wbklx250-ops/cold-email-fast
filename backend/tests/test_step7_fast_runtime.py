@@ -25,6 +25,8 @@ def test_licensed_user_script_accepts_business_premium_trials():
 
     assert '"SPB"' in script
     assert '"O365_BUSINESS_PREMIUM"' in script
+    assert 'users/$userId/assignLicense' in script
+    assert "Set-MgUserLicense -UserId" not in script
     assert 'SkuPartNumber -notlike "*TRIAL*"' not in script
     assert "Business Premium (SPB, including trial)" in script
 

@@ -396,7 +396,23 @@ try {{
         }} | Sort-Object @{{ Expression = {{ if ($businessBasicSkuPartNumbers -contains $_.SkuPartNumber) {{ 0 }} else {{ 1 }} }} }} | Select-Object -First 1
 
         if ($sku) {{
-            Set-MgUserLicense -UserId $userId -AddLicenses @(@{{SkuId=$sku.SkuId}}) -RemoveLicenses @() -ErrorAction Stop
+            # Use Graph REST directly. Some Microsoft.Graph.Users.Actions
+            # versions silently coerce the hashtable passed to
+            # Set-MgUserLicense into an empty addLicenses array.
+            $assignBody = @{{
+                addLicenses = @(@{{ skuId = [string]$sku.SkuId }})
+                removeLicenses = @()
+            }} | ConvertTo-Json -Depth 5
+            $assignHeaders = @{{
+                Authorization = "Bearer $($tok2.access_token)"
+                "Content-Type" = "application/json"
+            }}
+            Invoke-RestMethod `
+                -Method Post `
+                -Uri "https://graph.microsoft.com/v1.0/users/$userId/assignLicense" `
+                -Headers $assignHeaders `
+                -Body $assignBody `
+                -ErrorAction Stop | Out-Null
             $hasAllowedLicense = $true
             $licenseAction = "assigned"
             $licenseSku = $sku.SkuPartNumber
