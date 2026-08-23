@@ -52,6 +52,22 @@ interface BatchOption {
   tenant_count: number;
 }
 
+type TenantDisposition = "unreviewed" | "available" | "active" | "burned";
+
+interface TenantAudit {
+  id: string;
+  admin_email: string;
+  tenant_name: string;
+  disposition: TenantDisposition;
+  login_success: boolean;
+  login_error: string | null;
+  is_used: boolean | null;
+  verified_domains: DomainEntry[];
+  unverified_domains: DomainEntry[];
+  custom_domain_count: number;
+  last_checked_at: string;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -86,6 +102,7 @@ export default function DomainCheckerPage() {
   // Input state
   const [mode, setMode] = useState<"csv" | "batch">("csv");
   const [csvFile, setCsvFile] = useState<File | null>(null);
+  const [credentialsText, setCredentialsText] = useState("");
   const [batches, setBatches] = useState<BatchOption[]>([]);
   const [selectedBatchId, setSelectedBatchId] = useState<string>("");
   const [headless, setHeadless] = useState(true);
@@ -98,11 +115,31 @@ export default function DomainCheckerPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Persistent inventory state
+  const [inventory, setInventory] = useState<TenantAudit[]>([]);
+  const [inventoryLoading, setInventoryLoading] = useState(true);
+  const [usageFilter, setUsageFilter] = useState<"all" | "used" | "unused" | "unknown">("all");
+  const [inventorySearch, setInventorySearch] = useState("");
+
   // Drag state
   const [isDragging, setIsDragging] = useState(false);
 
+  const loadInventory = useCallback(async () => {
+    setInventoryLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/domain-checker/inventory`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setInventory(await res.json());
+    } catch (err) {
+      setError(`Could not load tenant inventory: ${(err as Error).message}`);
+    } finally {
+      setInventoryLoading(false);
+    }
+  }, []);
+
   // Fetch batches on mount
   useEffect(() => {
+    loadInventory();
     fetch(`${API_BASE}/api/v1/wizard/batches`)
       .then((res) => res.json())
       .then((data) => {
@@ -114,7 +151,7 @@ export default function DomainCheckerPage() {
         setBatches(batchList);
       })
       .catch(() => {});
-  }, []);
+  }, [loadInventory]);
 
   // Poll job status
   useEffect(() => {
@@ -129,6 +166,7 @@ export default function DomainCheckerPage() {
         if (data.status === "complete" || data.status === "error") {
           clearInterval(interval);
           setLoading(false);
+          if (data.status === "complete") loadInventory();
         }
       } catch {
         // ignore polling errors
@@ -136,11 +174,11 @@ export default function DomainCheckerPage() {
     }, 3000);
 
     return () => clearInterval(interval);
-  }, [jobId]);
+  }, [jobId, loadInventory]);
 
   // Start check from CSV
   const handleStartCSV = async () => {
-    if (!csvFile) return;
+    if (!csvFile && !credentialsText.trim()) return;
     setLoading(true);
     setError(null);
     setJobId(null);
@@ -148,7 +186,10 @@ export default function DomainCheckerPage() {
 
     try {
       const formData = new FormData();
-      formData.append("file", csvFile);
+      if (csvFile) formData.append("file", csvFile);
+      if (!csvFile && credentialsText.trim()) {
+        formData.append("credentials_text", credentialsText.trim());
+      }
       formData.append("headless", String(headless));
       formData.append("max_workers", parallelBrowsers.toString());
 
@@ -231,6 +272,24 @@ export default function DomainCheckerPage() {
     window.open(`${API_BASE}/api/v1/domain-checker/jobs/${jobId}/csv`, "_blank");
   };
 
+  const handleDispositionChange = async (auditId: string, disposition: TenantDisposition) => {
+    const previous = inventory;
+    setInventory((items) =>
+      items.map((item) => (item.id === auditId ? { ...item, disposition } : item))
+    );
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/domain-checker/inventory/${auditId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ disposition }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } catch (err) {
+      setInventory(previous);
+      setError(`Could not update tenant: ${(err as Error).message}`);
+    }
+  };
+
   // Computed
   const isRunning = jobStatus?.status === "running";
   const isComplete = jobStatus?.status === "complete";
@@ -241,6 +300,35 @@ export default function DomainCheckerPage() {
     : 0;
 
   const browserHelper = getBrowserHelperText(parallelBrowsers);
+
+  const inventoryCounts = useMemo(
+    () => ({
+      total: inventory.length,
+      used: inventory.filter((item) => item.is_used === true).length,
+      unused: inventory.filter((item) => item.is_used === false).length,
+      unknown: inventory.filter((item) => item.is_used === null).length,
+      burned: inventory.filter((item) => item.disposition === "burned").length,
+    }),
+    [inventory]
+  );
+
+  const filteredInventory = useMemo(() => {
+    const query = inventorySearch.trim().toLowerCase();
+    return inventory.filter((item) => {
+      const matchesUsage =
+        usageFilter === "all" ||
+        (usageFilter === "used" && item.is_used === true) ||
+        (usageFilter === "unused" && item.is_used === false) ||
+        (usageFilter === "unknown" && item.is_used === null);
+      const domains = [...item.verified_domains, ...item.unverified_domains]
+        .map((domain) => domain.name)
+        .join(" ");
+      const matchesSearch =
+        !query ||
+        `${item.tenant_name} ${item.admin_email} ${domains}`.toLowerCase().includes(query);
+      return matchesUsage && matchesSearch;
+    });
+  }, [inventory, inventorySearch, usageFilter]);
 
   // Build completion readout data
   const completionData = useMemo(() => {
@@ -280,10 +368,10 @@ export default function DomainCheckerPage() {
     <div className="space-y-6">
       {/* Header */}
       <div>
-        <h1 className="text-2xl font-bold text-gray-900">Domain Checker</h1>
+        <h1 className="text-2xl font-bold text-gray-900">Tenant Inventory</h1>
         <p className="text-sm text-gray-500 mt-1">
-          Check which custom domains are set up in M365 tenants by logging into
-          each tenant&apos;s admin portal
+          Audit tenant logins, discover their M365 domains, and track whether each
+          tenant is active, available, or burned
         </p>
       </div>
 
@@ -301,6 +389,143 @@ export default function DomainCheckerPage() {
           </div>
         </div>
       )}
+
+      {/* Persistent inventory */}
+      <section className="bg-white rounded-lg border border-gray-200 overflow-hidden">
+        <div className="p-5 border-b border-gray-200">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="font-semibold text-gray-900">Checked tenants</h2>
+              <p className="text-xs text-gray-500 mt-0.5">
+                Usage comes from discovered custom domains. Status is managed by you.
+              </p>
+            </div>
+            <button
+              onClick={loadInventory}
+              disabled={inventoryLoading}
+              className="px-3 py-2 border border-gray-300 rounded-lg text-sm text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+            >
+              {inventoryLoading ? "Refreshing…" : "↻ Refresh"}
+            </button>
+          </div>
+
+          <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 mt-4">
+            {([
+              ["all", "Total", inventoryCounts.total, "text-gray-900"],
+              ["used", "Used", inventoryCounts.used, "text-emerald-700"],
+              ["unused", "Unused", inventoryCounts.unused, "text-blue-700"],
+              ["unknown", "Unknown", inventoryCounts.unknown, "text-amber-700"],
+            ] as const).map(([filter, label, value, color]) => (
+              <button
+                key={filter}
+                onClick={() => setUsageFilter(filter)}
+                className={`text-left rounded-lg border p-3 transition-colors ${
+                  usageFilter === filter
+                    ? "border-blue-400 bg-blue-50"
+                    : "border-gray-200 hover:bg-gray-50"
+                }`}
+              >
+                <div className={`text-xl font-bold ${color}`}>{value}</div>
+                <div className="text-xs text-gray-500">{label}</div>
+              </button>
+            ))}
+            <div className="rounded-lg border border-red-200 bg-red-50 p-3">
+              <div className="text-xl font-bold text-red-700">{inventoryCounts.burned}</div>
+              <div className="text-xs text-red-600">Burned</div>
+            </div>
+          </div>
+
+          <input
+            value={inventorySearch}
+            onChange={(event) => setInventorySearch(event.target.value)}
+            placeholder="Search tenant, email, or domain…"
+            className="mt-4 w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+          />
+        </div>
+
+        {inventoryLoading && inventory.length === 0 ? (
+          <div className="p-8 text-center text-sm text-gray-500">Loading inventory…</div>
+        ) : filteredInventory.length === 0 ? (
+          <div className="p-8 text-center text-sm text-gray-500">
+            {inventory.length === 0
+              ? "No tenants checked yet. Paste credentials or upload a CSV below to begin."
+              : "No tenants match this filter."}
+          </div>
+        ) : (
+          <div className="overflow-x-auto max-h-[32rem] overflow-y-auto">
+            <table className="min-w-full divide-y divide-gray-200">
+              <thead className="bg-gray-50 sticky top-0 z-10">
+                <tr>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Tenant</th>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Usage</th>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Domains</th>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Status</th>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Last checked</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100">
+                {filteredInventory.map((item) => {
+                  const domains = [...item.verified_domains, ...item.unverified_domains];
+                  return (
+                    <tr key={item.id} className={item.disposition === "burned" ? "bg-red-50/50" : ""}>
+                      <td className="px-4 py-3 text-sm">
+                        <div className="font-medium text-gray-900">{item.tenant_name}</div>
+                        <div className="text-xs text-gray-500 font-mono">{item.admin_email}</div>
+                        {!item.login_success && item.login_error && (
+                          <div className="text-xs text-red-600 mt-1 max-w-xs truncate" title={item.login_error}>
+                            Login failed: {item.login_error}
+                          </div>
+                        )}
+                      </td>
+                      <td className="px-4 py-3 text-sm whitespace-nowrap">
+                        {item.is_used === true ? (
+                          <span className="px-2 py-1 rounded-full bg-emerald-100 text-emerald-700 text-xs font-medium">Used</span>
+                        ) : item.is_used === false ? (
+                          <span className="px-2 py-1 rounded-full bg-blue-100 text-blue-700 text-xs font-medium">Unused</span>
+                        ) : (
+                          <span className="px-2 py-1 rounded-full bg-amber-100 text-amber-700 text-xs font-medium">Unknown</span>
+                        )}
+                      </td>
+                      <td className="px-4 py-3 text-xs font-mono text-gray-700 min-w-60">
+                        {domains.length > 0 ? (
+                          <div className="space-y-1">
+                            {domains.map((domain, index) => (
+                              <div key={`${domain.name}-${index}`}>{domain.name}</div>
+                            ))}
+                          </div>
+                        ) : (
+                          <span className="text-gray-400">No custom domains</span>
+                        )}
+                      </td>
+                      <td className="px-4 py-3">
+                        <select
+                          value={item.disposition}
+                          onChange={(event) =>
+                            handleDispositionChange(item.id, event.target.value as TenantDisposition)
+                          }
+                          className={`border rounded-lg px-2 py-1.5 text-sm font-medium ${
+                            item.disposition === "burned"
+                              ? "border-red-300 bg-red-50 text-red-700"
+                              : "border-gray-300 bg-white text-gray-700"
+                          }`}
+                        >
+                          <option value="unreviewed">Unreviewed</option>
+                          <option value="available">Available</option>
+                          <option value="active">Active</option>
+                          <option value="burned">Burned</option>
+                        </select>
+                      </td>
+                      <td className="px-4 py-3 text-xs text-gray-500 whitespace-nowrap">
+                        {new Date(item.last_checked_at).toLocaleString()}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
 
       {/* Input Section */}
       {!isRunning && !isComplete && (
@@ -376,6 +601,25 @@ export default function DomainCheckerPage() {
                   </div>
                 )}
               </div>
+              <div className="flex items-center gap-3 my-4">
+                <div className="h-px bg-gray-200 flex-1" />
+                <span className="text-xs font-medium text-gray-400 uppercase">or paste credentials</span>
+                <div className="h-px bg-gray-200 flex-1" />
+              </div>
+              <textarea
+                value={credentialsText}
+                onChange={(event) => {
+                  setCredentialsText(event.target.value);
+                  if (event.target.value) setCsvFile(null);
+                }}
+                rows={6}
+                spellCheck={false}
+                placeholder={"admin@tenant.onmicrosoft.com,password,optional-totp\nadmin@another.onmicrosoft.com,password"}
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm font-mono focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+              />
+              <p className="text-xs text-gray-500 mt-1.5">
+                One tenant per line. Comma, tab, and pipe separators are supported. Passwords and TOTP secrets are used for this check only and are not saved in the inventory.
+              </p>
             </div>
           )}
 
@@ -448,7 +692,7 @@ export default function DomainCheckerPage() {
               onClick={mode === "csv" ? handleStartCSV : handleStartBatch}
               disabled={
                 loading ||
-                (mode === "csv" && !csvFile) ||
+                (mode === "csv" && !csvFile && !credentialsText.trim()) ||
                 (mode === "batch" && !selectedBatchId)
               }
               className="px-6 py-2.5 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-sm font-medium"
