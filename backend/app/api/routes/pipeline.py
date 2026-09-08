@@ -22,6 +22,10 @@ from app.models.domain import Domain, DomainStatus
 from app.models.tenant import Tenant, TenantStatus
 from app.models.mailbox import Mailbox
 from app.models.pipeline_log import PipelineLog
+from app.services.pipeline_readiness import (
+    PipelineBlocked, first_blocker, load_batch_state, refresh_nameservers,
+    require_ready, sync_manual_m365_setup, reconciliation_complete, refresh_counters,
+)
 from app.services.validation_service import (
     parse_domains_csv_content,
     parse_tenants_csv_content,
@@ -76,6 +80,10 @@ def _step5_incomplete_domain_filter():
         Domain.dkim_enabled.is_not(True),
         Domain.step5_complete.is_not(True),
         Domain.dmarc_configured.is_not(True),
+        Domain.dkim_cnames_added.is_not(True),
+        Domain.mx_record_added.is_not(True),
+        Domain.spf_record_added.is_not(True),
+        Domain.autodiscover_added.is_not(True),
     )
 
 
@@ -85,6 +93,10 @@ def _step5_ready_domain_filters():
         Domain.domain_verified_in_m365 == True,
         Domain.dkim_enabled == True,
         Domain.dmarc_configured == True,
+        Domain.dkim_cnames_added == True,
+        Domain.mx_record_added == True,
+        Domain.spf_record_added == True,
+        Domain.autodiscover_added == True,
     )
 
 
@@ -263,6 +275,8 @@ async def create_and_start(
             existing.dns_records_created = False
             existing.redirect_configured = False
             existing.cloudflare_zone_status = "pending"
+            existing.ns_propagated_at = None
+            existing.nameservers_updated = False
             existing.domain_index_in_tenant = 0  # Will be re-assigned by auto_link_domains
 
             imported_domain_count += 1
@@ -412,6 +426,16 @@ def _default_pipeline_steps(batch: SetupBatch) -> dict:
     steps["7"].update(completed=batch.mailboxes_completed_count or 0, total=total_domains)
     steps["8"].update(completed=batch.smtp_completed or 0, total=total_tenants)
     steps["10"].update(completed=batch.sequencer_uploaded_count or 0, total=total_domains)
+
+    for number in ("1", "3", "4", "5", "6", "7", "8"):
+        stage = steps[number]
+        if int(number) < current_step:
+            stage["status"] = (
+                "completed" if stage["total"] > 0 and stage["completed"] >= stage["total"]
+                else "pending"
+            )
+    if current_step > 2:
+        steps["2"]["status"] = steps["3"]["status"]
 
     if pipeline_status == "error" and 1 <= current_step <= 11:
         steps[str(current_step)]["failed"] = batch.errors_count or 0
@@ -1239,8 +1263,10 @@ async def restart_from_step(
     batch.pipeline_step_name = STEP_NAMES.get(step, f"Step {step}")
     batch.pipeline_status = "running"
     batch.pipeline_paused_at = None
-    if step >= 11:
-        batch.pipeline_completed_at = None
+    batch.pipeline_completed_at = None
+    batch.completed_at = None
+    batch.status = BatchStatus.IN_PROGRESS
+    batch.errors_count = 0
     await db.commit()
 
     # Clear stale in-memory job state so run_pipeline initializes fresh
@@ -1433,7 +1459,7 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
 
     Runs Steps 1-10 sequentially, pausing only at Step 2 (NS update).
     Each step calls existing service functions.
-    Errors on individual items don't block the pipeline — they're logged and the item is skipped.
+    Unfinished prerequisites block dependent work and are never counted as success.
     Supports resuming from any step via start_from_step parameter.
     """
     job_id = str(batch_id)
@@ -1470,6 +1496,32 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
     pipeline_jobs[job_id]["status"] = "running"
 
     try:
+        await _update_pipeline(batch_id, start_from_step, "running", "Checking batch prerequisites...")
+        if start_from_step > 3:
+            await refresh_nameservers(batch_id)
+        if start_from_step > 6:
+            await _update_pipeline(batch_id, start_from_step, "running", "Verifying manually completed M365 setup...")
+            try:
+                await sync_manual_m365_setup(batch_id)
+            except Exception as exc:
+                logger.warning("Could not verify manual setup: %s", _fmt_err(exc))
+        await refresh_counters(batch_id)
+        domains, tenants = await load_batch_state(batch_id)
+        blocker = first_blocker(domains, tenants, before_step=start_from_step)
+        if blocker:
+            if blocker.step == 1:
+                raise blocker
+            requested_step = start_from_step
+            start_from_step = min(start_from_step, blocker.step)
+            await log_activity(batch_id, start_from_step, STEP_NAMES[start_from_step],
+                status="info", message=f"Resume requested at step {requested_step}; recovering from step {start_from_step}: {blocker}")
+            # A deliberate recovery gets a fresh retry budget without claiming success.
+            async with SessionLocal() as db:
+                await db.execute(update(Domain).where(Domain.batch_id == batch_id).values(step5_retry_count=0, step5_skipped=False))
+                await db.execute(update(Tenant).where(Tenant.batch_id == batch_id).values(
+                    step4_retry_count=0, step6_retry_count=0, step7_retry_count=0))
+                await db.commit()
+
         # Reset retry counts only for fresh pipeline runs (step 1)
         if start_from_step <= 1:
             async with SessionLocal() as db:
@@ -1677,265 +1729,62 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
 
             logger.info(f"Step 1: {zones_created} new zones created, {total_with_zones} total zones ready")
 
+          except PipelineBlocked:
+            raise
           except Exception as step_error:
-            logger.error(f"Step 1 CRASHED (continuing to next step): {_fmt_err(step_error)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            await log_activity(batch_id, 1, STEP_NAMES[1], status="error", message=_fmt_err(step_error))
-            if job_id in pipeline_jobs:
-                pipeline_jobs[job_id]["steps"]["1"]["status"] = "error"
-                pipeline_jobs[job_id]["errors"].append({"step": 1, "error": _fmt_err(step_error)})
+            logger.exception("Step 1 failed")
+            raise PipelineBlocked(1, f"Step 1 failed: {_fmt_err(step_error)}") from step_error
         else:
             logger.info(f"Skipping Step 1 (starting from step {start_from_step})")
             if job_id in pipeline_jobs:
                 pipeline_jobs[job_id]["steps"]["1"]["status"] = "completed"
 
+        await require_ready(batch_id, 2)
+
         # ================================================================
-        # STEP 2-3: NS Update + Propagation (auto-skip if already done)
+        # STEP 2-3: Confirm nameservers, then verify EVERY current zone.
         # ================================================================
-        if start_from_step <= 2:
-          try:
-            # Check if NS already confirmed (re-used domains)
+        if start_from_step <= 3:
+            readiness = await refresh_nameservers(batch_id)
+            if not readiness:
+                raise PipelineBlocked(1, "Batch has no domains")
+            active = sum(r["active"] for r in readiness)
             async with SessionLocal() as db:
-                already_propagated = await db.scalar(
-                    select(func.count(Domain.id)).where(
-                        Domain.batch_id == batch_id,
-                        Domain.ns_propagated_at.isnot(None),
-                    )
-                ) or 0
-                total_domains = await db.scalar(
-                    select(func.count(Domain.id)).where(Domain.batch_id == batch_id)
-                ) or 0
+                batch = await db.get(SetupBatch, batch_id)
+                confirmed = bool(batch and batch.ns_confirmed_at)
+            if active < len(readiness) and start_from_step <= 2 and not confirmed:
+                await _update_pipeline(batch_id, 2, "paused", "Update nameservers, then confirm to check propagation")
+                pipeline_jobs[job_id]["steps"]["2"]["status"] = "waiting_for_user"
+                await log_activity(batch_id, 2, STEP_NAMES[2], status="started",
+                    message=f"{active}/{len(readiness)} zones active; waiting for nameserver confirmation")
+                return
 
-            skip_ns_wait = (total_domains > 0 and already_propagated >= total_domains * 0.95)
-
-            if skip_ns_wait:
-                logger.info(f"Step 2-3: {already_propagated}/{total_domains} domains already have NS propagated — skipping NS wait")
-                if job_id in pipeline_jobs:
-                    pipeline_jobs[job_id]["steps"]["2"]["status"] = "completed"
-                    pipeline_jobs[job_id]["steps"]["3"]["status"] = "completed"
-                    pipeline_jobs[job_id]["steps"]["3"]["completed"] = already_propagated
-                    pipeline_jobs[job_id]["steps"]["3"]["total"] = total_domains
-                await log_activity(batch_id, 2, STEP_NAMES[2], status="completed", message=f"Skipped — {already_propagated}/{total_domains} already propagated")
-                await log_activity(batch_id, 3, STEP_NAMES[3], status="completed", message=f"Skipped — {already_propagated}/{total_domains} already propagated")
-            else:
-                # STEP 2: Pause for Nameserver Update (ONLY MANUAL STEP)
-                await _update_pipeline(batch_id, 2, "paused", "Waiting for nameserver update confirmation...")
-                await log_activity(batch_id, 2, STEP_NAMES[2], status="started", message="Waiting for user to update nameservers at Porkbun")
-
-                if job_id in pipeline_jobs:
-                    pipeline_jobs[job_id]["steps"]["2"]["status"] = "waiting_for_user"
-
-                # Poll for NS confirmation with timeout and heartbeat
-                step2_start = datetime.utcnow()
-                STEP2_MAX_WAIT = 3600 * 24  # 24 hours max wait for user to update NS
-
-                while True:
-                    if await _check_paused_or_stopped(batch_id):
-                        return
-
-                    elapsed = (datetime.utcnow() - step2_start).total_seconds()
-                    if elapsed > STEP2_MAX_WAIT:
-                        logger.error("Step 2: Timed out waiting for NS confirmation after 24 hours")
-                        await log_activity(batch_id, 2, STEP_NAMES[2], status="error", message="Timed out waiting for NS confirmation")
-                        break
-
-                    # Check DB flag (survives container restarts)
-                    async with SessionLocal() as db:
-                        batch = await db.get(SetupBatch, batch_id)
-                        if batch and batch.ns_confirmed_at:
-                            logger.info("Step 2: NS confirmed via DB flag")
-                            break
-
-                    # Check in-memory flag (fast path)
-                    if job_id in pipeline_jobs and pipeline_jobs[job_id].get("ns_confirmed"):
-                        logger.info("Step 2: NS confirmed via in-memory flag")
-                        break
-
-                    # Update heartbeat so dashboard knows task is alive
-                    if job_id in pipeline_jobs:
-                        pipeline_jobs[job_id]["last_heartbeat"] = datetime.utcnow().isoformat()
-
-                    await asyncio.sleep(5)
-
-                await log_activity(batch_id, 2, STEP_NAMES[2], status="completed", message="Nameservers confirmed by user")
-                if job_id in pipeline_jobs:
-                    pipeline_jobs[job_id]["steps"]["2"]["status"] = "completed"
-
-                # ================================================================
-                # STEP 3: Verify NS Propagation
-                # ================================================================
-                await _update_pipeline(batch_id, 3, "running", "Checking nameserver propagation...")
-                await log_activity(batch_id, 3, STEP_NAMES[3], status="started")
-
-                total_zones = 0
-                total_propagated = 0
-                NS_PROPAGATION_TIMEOUT = 3600 * 4  # 4 hours max
-                ns_start_time = time.time()
-
-                while True:
-                    if await _check_paused_or_stopped(batch_id):
-                        return
-
-                    if time.time() - ns_start_time > NS_PROPAGATION_TIMEOUT:
-                        logger.error(f"Step 3: NS propagation timed out after 4 hours")
-                        await log_activity(batch_id, 3, STEP_NAMES[3], status="warning",
-                            message=f"Timed out — {total_propagated}/{total_zones} propagated. Proceeding anyway.")
-                        break
-
-                    async with SessionLocal() as db:
-                        # Find domains with zones that haven't propagated yet
-                        domains = (await db.execute(
-                            select(Domain).where(
-                                Domain.batch_id == batch_id,
-                                Domain.cloudflare_zone_id != None,
-                                Domain.ns_propagated_at == None,
-                            )
-                        )).scalars().all()
-
-                        if not domains:
-                            break  # All propagated
-
-                        for domain in domains:
-                            try:
-                                zone_status = await cloudflare_service.get_zone_status(domain.cloudflare_zone_id)
-                                if zone_status == "active":
-                                    domain.status = DomainStatus.NS_PROPAGATED
-                                    domain.ns_propagated_at = datetime.utcnow()
-                                    domain.nameservers_updated = True
-                                    await log_activity(batch_id, 3, STEP_NAMES[3], "domain", str(domain.id), domain.name, "completed", "NS propagated")
-                            except Exception as e:
-                                logger.warning(f"Propagation check failed for {domain.name}: {e}")
-
-                        await db.commit()
-
-                        total_zones = await db.scalar(
-                            select(func.count(Domain.id)).where(Domain.batch_id == batch_id, Domain.cloudflare_zone_id != None)
-                        ) or 0
-                        total_propagated = await db.scalar(
-                            select(func.count(Domain.id)).where(Domain.batch_id == batch_id, Domain.ns_propagated_at != None)
-                        ) or 0
-
-                        batch = await db.get(SetupBatch, batch_id)
-                        if batch:
-                            batch.ns_propagated_count = total_propagated
-                            await db.commit()
-
-                    if job_id in pipeline_jobs:
-                        pipeline_jobs[job_id]["steps"]["3"]["completed"] = total_propagated
-                        pipeline_jobs[job_id]["steps"]["3"]["total"] = total_zones
-                        pipeline_jobs[job_id]["message"] = f"NS propagation: {total_propagated}/{total_zones}"
-
-                    if total_zones and total_propagated and total_propagated >= total_zones * 0.95:
-                        logger.info(f"Step 3: {total_propagated}/{total_zones} propagated (≥95%), proceeding")
-                        break
-
-                    await asyncio.sleep(30)
-
-                if job_id in pipeline_jobs:
-                    pipeline_jobs[job_id]["steps"]["3"]["status"] = "completed"
-                await log_activity(batch_id, 3, STEP_NAMES[3], status="completed", message=f"{total_propagated}/{total_zones} propagated")
-
-          except Exception as step_error:
-            logger.error(f"Step 2-3 CRASHED (continuing to next step): {_fmt_err(step_error)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            await log_activity(batch_id, 2, STEP_NAMES[2], status="error", message=_fmt_err(step_error))
-            if job_id in pipeline_jobs:
-                pipeline_jobs[job_id]["steps"]["2"]["status"] = "error"
-                pipeline_jobs[job_id]["steps"]["3"]["status"] = "error"
-                pipeline_jobs[job_id]["errors"].append({"step": 2, "error": _fmt_err(step_error)})
-
-        elif start_from_step <= 3:
-            # Skipping step 2 but need step 3 (NS propagation check)
-            logger.info(f"Skipping Step 2 (starting from step {start_from_step})")
-            if job_id in pipeline_jobs:
-                pipeline_jobs[job_id]["steps"]["2"]["status"] = "completed"
-          
-            try:
-                await _update_pipeline(batch_id, 3, "running", "Checking nameserver propagation...")
-                await log_activity(batch_id, 3, STEP_NAMES[3], status="started")
-
-                total_zones = 0
-                total_propagated = 0
-                NS_PROPAGATION_TIMEOUT = 3600 * 4
-                ns_start_time = time.time()
-
-                while True:
-                    if await _check_paused_or_stopped(batch_id):
-                        return
-
-                    if time.time() - ns_start_time > NS_PROPAGATION_TIMEOUT:
-                        logger.error(f"Step 3: NS propagation timed out after 4 hours")
-                        await log_activity(batch_id, 3, STEP_NAMES[3], status="warning",
-                            message=f"Timed out — {total_propagated}/{total_zones} propagated. Proceeding anyway.")
-                        break
-
-                    async with SessionLocal() as db:
-                        domains = (await db.execute(
-                            select(Domain).where(
-                                Domain.batch_id == batch_id,
-                                Domain.cloudflare_zone_id != None,
-                                Domain.ns_propagated_at == None,
-                            )
-                        )).scalars().all()
-
-                        if not domains:
-                            break
-
-                        for domain in domains:
-                            try:
-                                zone_status = await cloudflare_service.get_zone_status(domain.cloudflare_zone_id)
-                                if zone_status == "active":
-                                    domain.status = DomainStatus.NS_PROPAGATED
-                                    domain.ns_propagated_at = datetime.utcnow()
-                                    domain.nameservers_updated = True
-                                    await log_activity(batch_id, 3, STEP_NAMES[3], "domain", str(domain.id), domain.name, "completed", "NS propagated")
-                            except Exception as e:
-                                logger.warning(f"Propagation check failed for {domain.name}: {e}")
-
-                        await db.commit()
-
-                        total_zones = await db.scalar(
-                            select(func.count(Domain.id)).where(Domain.batch_id == batch_id, Domain.cloudflare_zone_id != None)
-                        ) or 0
-                        total_propagated = await db.scalar(
-                            select(func.count(Domain.id)).where(Domain.batch_id == batch_id, Domain.ns_propagated_at != None)
-                        ) or 0
-
-                        batch = await db.get(SetupBatch, batch_id)
-                        if batch:
-                            batch.ns_propagated_count = total_propagated
-                            await db.commit()
-
-                    if job_id in pipeline_jobs:
-                        pipeline_jobs[job_id]["steps"]["3"]["completed"] = total_propagated
-                        pipeline_jobs[job_id]["steps"]["3"]["total"] = total_zones
-                        pipeline_jobs[job_id]["message"] = f"NS propagation: {total_propagated}/{total_zones}"
-
-                    if total_zones and total_propagated and total_propagated >= total_zones * 0.95:
-                        logger.info(f"Step 3: {total_propagated}/{total_zones} propagated (≥95%), proceeding")
-                        break
-
-                    await asyncio.sleep(30)
-
-                if job_id in pipeline_jobs:
-                    pipeline_jobs[job_id]["steps"]["3"]["status"] = "completed"
-                await log_activity(batch_id, 3, STEP_NAMES[3], status="completed", message=f"{total_propagated}/{total_zones} propagated")
-
-            except Exception as step_error:
-                logger.error(f"Step 3 CRASHED (continuing to next step): {_fmt_err(step_error)}")
-                import traceback
-                logger.error(traceback.format_exc())
-                await log_activity(batch_id, 3, STEP_NAMES[3], status="error", message=_fmt_err(step_error))
-                if job_id in pipeline_jobs:
-                    pipeline_jobs[job_id]["steps"]["3"]["status"] = "error"
-                    pipeline_jobs[job_id]["errors"].append({"step": 3, "error": _fmt_err(step_error)})
+            pipeline_jobs[job_id]["steps"]["2"]["status"] = "completed"
+            await _update_pipeline(batch_id, 3, "running", "Checking current Cloudflare activation...")
+            await log_activity(batch_id, 3, STEP_NAMES[3], status="started")
+            deadline = time.monotonic() + 4 * 3600
+            while True:
+                if await _check_paused_or_stopped(batch_id):
+                    return
+                active = sum(r["active"] for r in readiness)
+                pipeline_jobs[job_id]["steps"]["3"].update(completed=active, total=len(readiness), status="running")
+                pipeline_jobs[job_id]["message"] = f"NS propagation: {active}/{len(readiness)} active"
+                pipeline_jobs[job_id]["last_heartbeat"] = datetime.utcnow().isoformat()
+                if readiness and active == len(readiness):
+                    break
+                if time.monotonic() >= deadline:
+                    pending = ", ".join(r["domain"] for r in readiness if not r["active"])
+                    raise PipelineBlocked(3, f"Nameserver propagation timed out; inactive/unverified domains: {pending}")
+                await asyncio.sleep(30)
+                readiness = await refresh_nameservers(batch_id)
+            pipeline_jobs[job_id]["steps"]["3"]["status"] = "completed"
+            await log_activity(batch_id, 3, STEP_NAMES[3], status="completed",
+                message=f"Live verification: {active}/{len(readiness)} Cloudflare zones active")
         else:
-            logger.info(f"Skipping Steps 2-3 (starting from step {start_from_step})")
-            if job_id in pipeline_jobs:
-                pipeline_jobs[job_id]["steps"]["2"]["status"] = "completed"
-                pipeline_jobs[job_id]["steps"]["3"]["status"] = "completed"
+            for step in (2, 3):
+                pipeline_jobs[job_id]["steps"][str(step)]["status"] = "completed"
+
+        await require_ready(batch_id, 4)
 
         # ================================================================
         # STEP 4: Cloudflare redirects only
@@ -1998,14 +1847,11 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
 
             logger.info(f"Step 4: {dns_done} redirects configured, {total_dns_done} domains already have wizard DNS")
 
+          except PipelineBlocked:
+            raise
           except Exception as step_error:
-            logger.error(f"Step 4 CRASHED (continuing to next step): {_fmt_err(step_error)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            await log_activity(batch_id, 4, STEP_NAMES[4], status="error", message=_fmt_err(step_error))
-            if job_id in pipeline_jobs:
-                pipeline_jobs[job_id]["steps"]["4"]["status"] = "error"
-                pipeline_jobs[job_id]["errors"].append({"step": 4, "error": _fmt_err(step_error)})
+            logger.exception("Step 4 failed")
+            raise PipelineBlocked(4, f"Step 4 failed: {_fmt_err(step_error)}") from step_error
         else:
             logger.info(f"Skipping Step 4 (starting from step {start_from_step})")
             if job_id in pipeline_jobs:
@@ -2149,19 +1995,18 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
             kill_all_browsers()
             await asyncio.sleep(10)
 
+          except PipelineBlocked:
+            raise
           except Exception as step_error:
-            logger.error(f"Step 5 CRASHED: {_fmt_err(step_error)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            await log_activity(batch_id, 5, STEP_NAMES[5], status="error", message=_fmt_err(step_error))
-            if job_id in pipeline_jobs:
-                pipeline_jobs[job_id]["steps"]["5"]["status"] = "error"
-                pipeline_jobs[job_id]["errors"].append({"step": 5, "error": _fmt_err(step_error)})
-            kill_all_browsers()
+            logger.exception("Step 5 failed")
+            raise PipelineBlocked(5, f"Step 5 failed: {_fmt_err(step_error)}") from step_error
         else:
             logger.info(f"Skipping Step 5 (starting from step {start_from_step})")
             if job_id in pipeline_jobs:
                 pipeline_jobs[job_id]["steps"]["5"]["status"] = "completed"
+
+        await refresh_nameservers(batch_id)
+        await require_ready(batch_id, 6)
 
         # ================================================================
         # STEP 6: M365 Domain Setup + DKIM (WITH AUTO-RETRY, CHUNKED)
@@ -2229,10 +2074,9 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                         d.step5_retry_count = (d.step5_retry_count or 0) + 1
                         if d.step5_retry_count > MAX_PIPELINE_RETRIES:
                             # Use skip flag instead of lying about verification status
-                            d.step5_skipped = True
-                            d.error_message = f"SKIPPED M365 setup after {MAX_PIPELINE_RETRIES} retries"
+                            d.error_message = f"M365 setup failed after {MAX_PIPELINE_RETRIES + 1} attempts"
                             await log_activity(batch_id, 6, STEP_NAMES[6], "domain", str(d.id),
-                                d.name, "skipped", d.error_message)
+                                d.name, "failed", d.error_message)
                     await db.commit()
 
                 if attempt < MAX_PIPELINE_RETRIES:
@@ -2240,7 +2084,9 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                     kill_all_browsers()
                     await asyncio.sleep(15)  # Extra time for memory recovery
 
-            # Step 6 is complete when ALL domains are verified+dkim OR skipped
+            await require_ready(batch_id, 7)
+
+            # Only verified domains contribute to successful completion.
             async with SessionLocal() as db:
                 m365_ok = await db.scalar(
                     select(func.count(Domain.id)).where(
@@ -2271,18 +2117,17 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
             kill_all_browsers()
             await asyncio.sleep(5)
 
+          except PipelineBlocked:
+            raise
           except Exception as step_error:
-            logger.error(f"Step 6 CRASHED (continuing to next step): {_fmt_err(step_error)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            await log_activity(batch_id, 6, STEP_NAMES[6], status="error", message=_fmt_err(step_error))
-            if job_id in pipeline_jobs:
-                pipeline_jobs[job_id]["steps"]["6"]["status"] = "error"
-                pipeline_jobs[job_id]["errors"].append({"step": 6, "error": _fmt_err(step_error)})
+            logger.exception("Step 6 failed")
+            raise PipelineBlocked(6, f"Step 6 failed: {_fmt_err(step_error)}") from step_error
         else:
             logger.info(f"Skipping Step 6 (starting from step {start_from_step})")
             if job_id in pipeline_jobs:
                 pipeline_jobs[job_id]["steps"]["6"]["status"] = "completed"
+
+        await require_ready(batch_id, 7)
 
         # ================================================================
         # STEP 6.5: Disable Security Defaults (before mailbox creation)
@@ -2373,10 +2218,11 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
             kill_all_browsers()
             await asyncio.sleep(5)
 
+          except PipelineBlocked:
+            raise
           except Exception as step_error:
-            logger.error(f"Step 6.5 (Security Defaults) CRASHED (continuing): {_fmt_err(step_error)}")
-            import traceback
-            logger.error(traceback.format_exc())
+            logger.exception("Step 7 failed")
+            raise PipelineBlocked(7, f"Step 7 failed: {_fmt_err(step_error)}") from step_error
 
         # ================================================================
         # STEP 7: Create Mailboxes + Delegate (WITH AUTO-RETRY, DOMAIN-BASED)
@@ -2519,20 +2365,17 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
             kill_all_browsers()
             await asyncio.sleep(5)
 
+          except PipelineBlocked:
+            raise
           except Exception as step_error:
-            logger.error(f"Step 7 CRASHED: {_fmt_err(step_error)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            await log_activity(batch_id, 7, STEP_NAMES[7], status="error", message=_fmt_err(step_error))
-            if job_id in pipeline_jobs:
-                pipeline_jobs[job_id]["steps"]["7"]["status"] = "error"
-                pipeline_jobs[job_id]["errors"].append({"step": 7, "error": _fmt_err(step_error)})
-                pipeline_jobs[job_id]["status"] = "error"
-            return
+            logger.exception("Step 7 failed")
+            raise PipelineBlocked(7, f"Step 7 failed: {_fmt_err(step_error)}") from step_error
         else:
             logger.info(f"Skipping Step 7 (starting from step {start_from_step})")
             if job_id in pipeline_jobs:
                 pipeline_jobs[job_id]["steps"]["7"]["status"] = "completed"
+
+        await require_ready(batch_id, 8)
 
         # ================================================================
         # STEP 8: Enable SMTP Auth (WITH AUTO-RETRY)
@@ -2675,20 +2518,17 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
             kill_all_browsers()
             await asyncio.sleep(5)
 
+          except PipelineBlocked:
+            raise
           except Exception as step_error:
-            logger.error(f"Step 8 CRASHED: {_fmt_err(step_error)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            await log_activity(batch_id, 8, STEP_NAMES[8], status="error", message=_fmt_err(step_error))
-            if job_id in pipeline_jobs:
-                pipeline_jobs[job_id]["steps"]["8"]["status"] = "error"
-                pipeline_jobs[job_id]["errors"].append({"step": 8, "error": _fmt_err(step_error)})
-                pipeline_jobs[job_id]["status"] = "error"
-            return
+            logger.exception("Step 8 failed")
+            raise PipelineBlocked(8, f"Step 8 failed: {_fmt_err(step_error)}") from step_error
         else:
             logger.info(f"Skipping Step 8 (starting from step {start_from_step})")
             if job_id in pipeline_jobs:
                 pipeline_jobs[job_id]["steps"]["8"]["status"] = "completed"
+
+        await require_ready(batch_id, 9)
 
         # ================================================================
         # STEP 9: Export Credentials (auto-generated)
@@ -2700,11 +2540,11 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
             if job_id in pipeline_jobs:
                 pipeline_jobs[job_id]["steps"]["9"]["status"] = "completed"
             await log_activity(batch_id, 9, STEP_NAMES[9], status="completed", message="Credentials available for download")
+          except PipelineBlocked:
+            raise
           except Exception as step_error:
-            logger.error(f"Step 9 CRASHED: {_fmt_err(step_error)}")
-            if job_id in pipeline_jobs:
-                pipeline_jobs[job_id]["steps"]["9"]["status"] = "error"
-                pipeline_jobs[job_id]["errors"].append({"step": 9, "error": _fmt_err(step_error)})
+            logger.exception("Step 9 failed")
+            raise PipelineBlocked(9, f"Step 9 failed: {_fmt_err(step_error)}") from step_error
         else:
             logger.info(f"Skipping Step 9 (starting from step {start_from_step})")
             if job_id in pipeline_jobs:
@@ -2730,11 +2570,11 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                 logger.info("Step 10: No sequencer configured — skipping")
                 if job_id in pipeline_jobs:
                     pipeline_jobs[job_id]["steps"]["10"]["status"] = "skipped"
+          except PipelineBlocked:
+            raise
           except Exception as step_error:
-            logger.error(f"Step 10 CRASHED: {_fmt_err(step_error)}")
-            if job_id in pipeline_jobs:
-                pipeline_jobs[job_id]["steps"]["10"]["status"] = "error"
-                pipeline_jobs[job_id]["errors"].append({"step": 10, "error": _fmt_err(step_error)})
+            logger.exception("Step 10 failed")
+            raise PipelineBlocked(10, f"Step 10 failed: {_fmt_err(step_error)}") from step_error
         else:
             logger.info(f"Skipping Step 10 (starting from step {start_from_step})")
             if job_id in pipeline_jobs:
@@ -2751,6 +2591,8 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
             from app.services.batch_reconciliation import reconcile_batch
 
             recon_summary = await reconcile_batch(batch_id, auto_fix=True)
+            _, expected_tenants = await load_batch_state(batch_id)
+            recon_ok = reconciliation_complete(recon_summary, len(expected_tenants))
 
             if job_id in pipeline_jobs:
                 pipeline_jobs[job_id]["reconciliation"] = recon_summary
@@ -2764,19 +2606,12 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                 )
                 pipeline_jobs[job_id]["steps"]["11"]["total"] = recon_summary.get("total_tenants", 0)
                 pipeline_jobs[job_id]["steps"]["11"]["status"] = (
-                    "completed" if recon_summary.get("status") == "completed" else "error"
+                    "completed" if recon_ok else "error"
                 )
 
             await log_activity(
                 batch_id, 11, STEP_NAMES[11],
-                status=(
-                    "failed"
-                    if (
-                        recon_summary.get("sd_drift_unfixable", 0)
-                        or recon_summary.get("smtp_drift_unfixable", 0)
-                    )
-                    else "completed"
-                ),
+                status="completed" if recon_ok else "failed",
                 message=(
                     f"SD ok={recon_summary.get('sd_ok', 0)} "
                     f"fixed={recon_summary.get('sd_drift_fixed', 0)} "
@@ -2792,27 +2627,17 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                 recon_summary.get("sd_drift_unfixable", 0)
                 + recon_summary.get("smtp_drift_unfixable", 0)
             )
-            if reconciliation_unfixable:
+            if not recon_ok:
                 message = (
                     "Reconciliation incomplete: "
-                    f"{reconciliation_unfixable} tenant checks remain unverified"
+                    f"{reconciliation_unfixable} failed checks; all {len(expected_tenants)} tenants must be verified without errors"
                 )
-                await _update_pipeline(batch_id, 11, "error", message)
-                if job_id in pipeline_jobs:
-                    pipeline_jobs[job_id]["status"] = "error"
-                    pipeline_jobs[job_id]["error"] = message
-                logger.error(message)
-                return
+                raise PipelineBlocked(11, message)
+          except PipelineBlocked:
+            raise
           except Exception as step_error:
-            logger.error(f"Step 11 CRASHED: {_fmt_err(step_error)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            await log_activity(batch_id, 11, STEP_NAMES[11], status="error", message=_fmt_err(step_error))
-            if job_id in pipeline_jobs:
-                pipeline_jobs[job_id]["steps"]["11"]["status"] = "error"
-                pipeline_jobs[job_id]["errors"].append({"step": 11, "error": _fmt_err(step_error)})
-                pipeline_jobs[job_id]["status"] = "error"
-            return
+            logger.exception("Step 11 failed")
+            raise PipelineBlocked(11, f"Step 11 failed: {_fmt_err(step_error)}") from step_error
         else:
             logger.info(f"Skipping Step 11 (starting from step {start_from_step})")
             if job_id in pipeline_jobs:
@@ -2821,49 +2646,8 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
         # ================================================================
         # PIPELINE COMPLETE
         # ================================================================
-        async with SessionLocal() as db:
-            incomplete_domains = await db.scalar(
-                select(func.count(Domain.id)).where(
-                    Domain.batch_id == batch_id,
-                    Domain.tenant_id.isnot(None),
-                    *_step5_ready_domain_filters(),
-                    Domain.step6_complete.is_not(True),
-                    Domain.step6_skipped.is_not(True),
-                )
-            ) or 0
-            incomplete_smtp = await db.scalar(
-                select(func.count(Tenant.id)).where(
-                    Tenant.batch_id == batch_id,
-                    Tenant.step6_complete == True,
-                    Tenant.step7_smtp_auth_enabled.is_not(True),
-                )
-            ) or 0
-
-        if incomplete_domains or incomplete_smtp:
-            message = (
-                "Pipeline cannot complete: "
-                f"{incomplete_domains} domains require mailbox creation and "
-                f"{incomplete_smtp} tenants require SMTP auth"
-            )
-            blocking_step = 7 if incomplete_domains else 8
-            await _update_pipeline(batch_id, blocking_step, "error", message)
-            async with SessionLocal() as db:
-                batch = await db.get(SetupBatch, batch_id)
-                if batch:
-                    batch.pipeline_status = "error"
-                    batch.status = BatchStatus.IN_PROGRESS
-                    batch.errors_count = incomplete_domains + incomplete_smtp
-                    await db.commit()
-            if job_id in pipeline_jobs:
-                pipeline_jobs[job_id]["status"] = "error"
-                pipeline_jobs[job_id]["error"] = message
-            logger.error(message)
-            await log_activity(
-                batch_id, 11, "Pipeline Incomplete",
-                status="failed",
-                message=message,
-            )
-            return
+        await require_ready(batch_id, 12)
+        await refresh_counters(batch_id)
 
         await _update_pipeline(batch_id, 11, "completed", "Pipeline complete!")
 
@@ -2881,6 +2665,20 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
 
         logger.info(f"✅ Pipeline COMPLETE for batch {batch_id}")
         await log_activity(batch_id, 11, "Pipeline Complete", status="completed", message="All steps finished")
+
+    except PipelineBlocked as exc:
+        await _update_pipeline(batch_id, exc.step, "error", str(exc))
+        if job_id in pipeline_jobs:
+            pipeline_jobs[job_id]["steps"][str(exc.step)]["status"] = "error"
+            pipeline_jobs[job_id]["steps"][str(exc.step)]["failed"] = 1
+            pipeline_jobs[job_id]["errors"].append({"step": exc.step, "error": str(exc)})
+        async with SessionLocal() as db:
+            batch = await db.get(SetupBatch, batch_id)
+            if batch:
+                batch.errors_count = max(batch.errors_count or 0, 1)
+                await db.commit()
+        await log_activity(batch_id, exc.step, STEP_NAMES[exc.step], status="failed", message=str(exc))
+        logger.error("Pipeline blocked: %s", exc)
 
     except Exception as e:
         logger.error(f"💥 Pipeline CRASHED: {_fmt_err(e)}")

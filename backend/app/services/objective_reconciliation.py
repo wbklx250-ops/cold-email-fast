@@ -582,8 +582,11 @@ async def _ensure_cloudflare_truth(
             result["error"] = "Cloudflare zone not found"
             return result
 
-        result["zone_ok"] = True
+        result["zone_ok"] = zone.get("status") == "active"
         result["zone_id"] = zone.get("zone_id")
+        if not result["zone_ok"]:
+            result["error"] = "Cloudflare zone is not active"
+            return result
 
         if auto_fix:
             logger.info(
@@ -938,6 +941,8 @@ async def _save_domain_truth(
                 domain.dkim_enabled_at = now
             domain.step5_complete = bool(
                 m365.get("verified")
+                and m365.get("ok")
+                and cf.get("zone_ok")
                 and dkim.get("enabled")
                 and cf.get("mx")
                 and cf.get("spf")
@@ -1023,7 +1028,6 @@ async def _save_domain_truth(
                 select(func.count(Domain.id)).where(
                     Domain.tenant_id == tenant_id,
                     Domain.step6_complete.is_not(True),
-                    Domain.step6_skipped.is_not(True),
                 )
             ) or 0
             if remaining == 0:

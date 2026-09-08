@@ -86,12 +86,11 @@ def _tenant_token_domain(tenant: Tenant) -> str:
 
 
 async def _load_batch_tenants(batch_id) -> List[Tenant]:
-    """Load tenants with completed mailbox setup for reconciliation."""
+    """Load the whole batch so incomplete tenants cannot disappear from checks."""
     async with async_session_factory() as db:
         res = await db.execute(
             select(Tenant).where(
                 Tenant.batch_id == batch_id,
-                Tenant.step6_complete == True,
             )
         )
         return list(res.scalars().all())
@@ -133,7 +132,8 @@ async def _reconcile_sd_for_tenant(
         t_result["sd"]["error"] = sd_result.get("error")
 
         if actual_sd_disabled is None and os.getenv("PIPELINE_SKIP_SD_SELENIUM", "0") == "1":
-            summary["sd_ok"] += 1
+            summary["sd_drift_unfixable"] += 1
+            summary["errors"].append({"domain": domain, "stage": "sd_verify", "error": "Security Defaults could not be verified; Selenium fallback is disabled"})
             t_result["sd"]["action"] = "graph_unreadable_selenium_skipped"
             t_result["sd"]["error"] = sd_result.get("error")
             logger.warning(
@@ -374,7 +374,8 @@ async def reconcile_batch(batch_id, auto_fix: bool = True) -> Dict:
 
         if not tenants:
             logger.info("No tenants in batch %s — nothing to reconcile", batch_id)
-            summary["status"] = "completed"
+            summary["status"] = "error"
+            summary["errors"].append({"stage": "reconcile_batch", "error": "No tenants found; batch cannot be verified"})
             summary["completed_at"] = datetime.utcnow().isoformat()
             return summary
 
@@ -389,6 +390,11 @@ async def reconcile_batch(batch_id, auto_fix: bool = True) -> Dict:
                 or tenant.onmicrosoft_domain
                 or str(tenant.id)
             )
+            if not tenant.step6_complete:
+                summary["sd_drift_unfixable"] += 1
+                summary["smtp_drift_unfixable"] += 1
+                summary["errors"].append({"domain": domain, "stage": "prerequisites", "error": "Mailbox setup is incomplete"})
+                continue
             logger.info(
                 "[%s] Reconciling (%d/%d)", domain, idx, len(tenants)
             )
@@ -415,7 +421,10 @@ async def reconcile_batch(batch_id, auto_fix: bool = True) -> Dict:
             # Graph is fast — a short pause keeps us under AAD rate limits
             await asyncio.sleep(1)
 
+        from app.services.pipeline_readiness import reconciliation_complete
         summary["status"] = "completed"
+        if not reconciliation_complete(summary, len(tenants)):
+            summary["status"] = "error"
         summary["completed_at"] = datetime.utcnow().isoformat()
         logger.info(
             "Reconciliation for batch %s done: sd_ok=%d fixed=%d unfixable=%d | "
