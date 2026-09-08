@@ -578,6 +578,61 @@ def build_expected_mailbox_data(
     return deduped
 
 
+def _clear_mailbox_evidence(mailbox):
+    for field in ("created_in_exchange", "display_name_fixed", "account_enabled",
+                  "password_set", "upn_fixed", "delegated", "setup_complete"):
+        setattr(mailbox, field, False)
+    mailbox.setup_completed_at = None
+    mailbox.status = MailboxStatus.PENDING
+
+
+async def _prepare_expected_mailboxes(db, domain_id, tenant_id, batch_id, desired_mailboxes):
+    """Reuse globally unique addresses after a verified domain changes tenant."""
+    domain = await db.scalar(select(Domain).where(Domain.id == domain_id).with_for_update())
+    if not domain or domain.tenant_id != tenant_id or domain.batch_id != batch_id or not domain.domain_verified_in_m365:
+        raise RuntimeError("Mailbox destination must match the domain's verified tenant and batch")
+    desired = {item["email"].lower(): item for item in desired_mailboxes}
+    if not desired or any(email.rsplit("@", 1)[-1] != domain.name.lower() for email in desired):
+        raise RuntimeError("Expected mailbox addresses must belong to the verified domain")
+    rows = list((await db.execute(select(Mailbox).where(
+        func.lower(Mailbox.email).in_(list(desired))
+    ).with_for_update())).scalars().all())
+    existing = {row.email.lower(): row for row in rows}
+    inserted = 0
+    for email, item in desired.items():
+        row = existing.get(email)
+        if row is None:
+            row = Mailbox(email=email, local_part=item["local_part"], display_name=item["display_name"],
+                password=item["password"], tenant_id=tenant_id, batch_id=batch_id,
+                status=MailboxStatus.PENDING, warmup_stage="none")
+            db.add(row)
+            inserted += 1
+        elif row.tenant_id != tenant_id:
+            # Phase 1 has already verified/created the licensed user in the destination.
+            # These are local records; no mailbox is deleted from the previous tenant.
+            row.tenant_id = tenant_id
+            _clear_mailbox_evidence(row)
+            row.microsoft_object_id = None
+            row.upn = None
+            row.created_at_exchange = None
+            row.photo_set = False
+            row.uploaded_to_sequencer = False
+            row.uploaded_at = None
+            row.sequencer_name = None
+            row.instantly_uploaded = False
+            row.instantly_uploaded_at = None
+            row.smartlead_uploaded = False
+            row.smartlead_uploaded_at = None
+            row.warmup_stage = "none"
+        row.batch_id = batch_id
+        row.display_name = item["display_name"]
+        row.password = item["password"]
+        row.initial_password = item["password"]
+        row.error_message = None
+    await db.commit()
+    return inserted
+
+
 async def process_domain_fast(
     domain_name: str,
     domain_id: UUID,
@@ -686,39 +741,15 @@ async def process_domain_fast(
             raise Exception("No expected mailboxes could be generated")
 
         async with BackgroundSessionLocal() as db:
-            existing_rows = await db.execute(
-                select(Mailbox.email).where(
-                    Mailbox.tenant_id == tenant_id,
-                    Mailbox.email.in_(desired_emails),
-                )
+            inserted_count = await _prepare_expected_mailboxes(
+                db, domain_id, tenant_id, batch_id, desired_mailboxes
             )
-            existing_emails = {email.lower() for email in existing_rows.scalars().all()}
-
-        missing_mailboxes = [
-            mb for mb in desired_mailboxes
-            if mb["email"].lower() not in existing_emails
-        ]
-        if missing_mailboxes:
-            async with BackgroundSessionLocal() as gen_db:
-                for mb in missing_mailboxes:
-                    mailbox = Mailbox(
-                        email=mb["email"],
-                        local_part=mb["local_part"],
-                        display_name=mb["display_name"],
-                        password=mb["password"],
-                        tenant_id=tenant_id,
-                        batch_id=batch_id,
-                        status=MailboxStatus.PENDING,
-                        warmup_stage="none",
-                    )
-                    gen_db.add(mailbox)
-                await gen_db.commit()
 
         logger.info(
             "[%s] Expected mailbox rows: %s total, %s inserted (%.1fs)",
             domain,
             len(desired_mailboxes),
-            len(missing_mailboxes),
+            inserted_count,
             time.time() - start_time,
         )
 
@@ -819,7 +850,13 @@ async def process_domain_fast(
         async def _save_results(db):
             nonlocal step6_complete, ready_count, completion_error
 
-            # Update mailbox records
+            # Previous-tenant or previous-run flags are not current evidence.
+            await db.execute(update(Mailbox).where(
+                Mailbox.tenant_id == tenant_id, Mailbox.email.in_(desired_emails)
+            ).values(created_in_exchange=False, display_name_fixed=False, delegated=False,
+                password_set=False, account_enabled=False, upn_fixed=False,
+                setup_complete=False, setup_completed_at=None, status=MailboxStatus.PENDING))
+            # Apply only results confirmed during this PowerShell run.
             if created_emails:
                 await db.execute(
                     update(Mailbox)
@@ -914,12 +951,7 @@ async def process_domain_fast(
             incomplete_tenant_domains = await db.scalar(
                 select(func.count(Domain.id)).where(
                     Domain.tenant_id == tenant_id,
-                    Domain.step5_complete == True,
-                    Domain.domain_verified_in_m365 == True,
-                    Domain.dkim_enabled == True,
-                    Domain.dmarc_configured == True,
                     Domain.step6_complete.is_not(True),
-                    Domain.step6_skipped.is_not(True),
                 )
             ) or 0
 
