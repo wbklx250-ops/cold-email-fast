@@ -33,6 +33,7 @@ class TenantAudit(TimestampUUIDMixin, Base):
         String(32), nullable=False, default=TenantDisposition.UNREVIEWED.value, index=True
     )
     login_success: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    domain_check_success: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     login_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_used: Mapped[bool | None] = mapped_column(Boolean, nullable=True, index=True)
     verified_domains: Mapped[list[dict]] = mapped_column(JSON, nullable=False, default=list)

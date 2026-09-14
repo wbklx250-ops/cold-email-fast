@@ -2079,7 +2079,7 @@ def setup_domain_complete_via_admin_portal(
     IMPORTANT: Each step has individual error handling for better resilience.
     The retry wrapper closes this attempt's browser if an unhandled exception bubbles out.
     """
-    from app.services.cloudflare_sync import add_txt, add_mx, add_spf, add_cname, add_dmarc, cleanup_before_verification, cleanup_before_dns_setup, resolve_zone_id, verify_existing_m365_dns_setup
+    from app.services.cloudflare_sync import add_txt, add_mx, add_spf, add_cname, add_dmarc, cleanup_before_verification, cleanup_before_dns_setup, resolve_zone_id
     
     logger.info(f"[{domain}] ========== STARTING DOMAIN SETUP ==========")
     driver = None
@@ -2099,46 +2099,17 @@ def setup_domain_complete_via_admin_portal(
     expected_dns_values = expected_dns_values or {}
 
     def _complete_from_existing_microsoft_completion(context: str) -> dict:
-        logger.info(f"[{domain}] Microsoft reports setup complete during {context}; verifying Cloudflare DNS readback")
-        dns_results = verify_existing_m365_dns_setup(
-            zone_id=zone_id,
-            domain=domain,
-            mx_value=expected_dns_values.get("mx_value"),
-            spf_value=expected_dns_values.get("spf_value"),
-            dkim_selector1=(
-                expected_dns_values.get("dkim_selector1_cname")
-                or expected_dns_values.get("dkim_selector1")
-            ),
-            dkim_selector2=(
-                expected_dns_values.get("dkim_selector2_cname")
-                or expected_dns_values.get("dkim_selector2")
-            ),
-        )
+        # Incident safety rule: stored values, conventional Microsoft targets,
+        # and Cloudflare readback are not substitutes for values displayed by
+        # the live Microsoft domain setup wizard.
+        result["success"] = False
         result["verified"] = True
-        result["dns_configured"] = all(dns_results.values())
-        result["dmarc_configured"] = dns_results.get("dmarc", False)
-        result["mx_value"] = expected_dns_values.get("mx_value")
-        result["spf_value"] = expected_dns_values.get("spf_value")
-        result["dkim_selector1_cname"] = (
-            expected_dns_values.get("dkim_selector1_cname")
-            or expected_dns_values.get("dkim_selector1")
+        result["dns_configured"] = False
+        result["error"] = (
+            f"Microsoft reported setup complete during {context}, but the live setup wizard "
+            "did not expose its DNS records; refusing stored, inferred, or fallback values"
         )
-        result["dkim_selector2_cname"] = (
-            expected_dns_values.get("dkim_selector2_cname")
-            or expected_dns_values.get("dkim_selector2")
-        )
-        if result["dns_configured"]:
-            result["success"] = True
-            result["error"] = None
-            update_status_file(domain, "complete", "complete", "Microsoft setup complete and Cloudflare DNS verified")
-        else:
-            failed = [name for name, ok in dns_results.items() if not ok]
-            result["success"] = False
-            result["error"] = (
-                "Microsoft reports setup complete, but Cloudflare DNS readback failed for: "
-                + ", ".join(failed)
-            )
-            update_status_file(domain, "complete", "failed", result["error"])
+        update_status_file(domain, "dns_setup", "failed", result["error"])
         return result
     
     # ===== SETUP BROWSER WITH RETRY =====
@@ -2794,23 +2765,35 @@ def setup_domain_complete_via_admin_portal(
     # ===== STEP 8c: CHECK DKIM CHECKBOX =====
     logger.info(f"[{domain}] Step 8c: Checking DKIM checkbox")
     try:
-        # Find the DKIM checkbox by its label
-        dkim_checkbox = driver.find_element(By.XPATH, "//input[@type='checkbox' and following-sibling::*[contains(text(), 'DKIM')]] | //input[@type='checkbox' and ..//*[contains(text(), 'DKIM')]]")
-        if not dkim_checkbox.is_selected():
-            driver.execute_script("arguments[0].click();", dkim_checkbox)
-            logger.info(f"[{domain}] Checked DKIM checkbox")
-        else:
-            logger.info(f"[{domain}] DKIM already checked")
-        time.sleep(3)  # Wait for DKIM records to load
-    except:
-        # Try clicking the label instead
-        try:
-            dkim_label = driver.find_element(By.XPATH, "//*[contains(text(), 'DomainKeys Identified Mail')]")
+        current_dns_text = _safe_page_text(driver).lower()
+        dkim_is_open = (
+            "selector1-" in current_dns_text
+            or "48 hours to create dkim records" in current_dns_text
+        )
+        if not dkim_is_open:
+            labels = driver.find_elements(
+                By.XPATH,
+                "//*[normalize-space()='DomainKeys Identified Mail (DKIM)']",
+            )
+            visible_labels = [label for label in labels if label.is_displayed()]
+            if not visible_labels:
+                raise RuntimeError("visible Microsoft DKIM label was not found")
+            dkim_label = min(visible_labels, key=lambda label: len(label.get_attribute("outerHTML") or ""))
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", dkim_label)
+            time.sleep(0.5)
             driver.execute_script("arguments[0].click();", dkim_label)
-            logger.info(f"[{domain}] Clicked DKIM label")
-            time.sleep(3)
-        except Exception as e:
-            logger.warning(f"[{domain}] Could not check DKIM: {e}")
+            logger.info(f"[{domain}] Clicked exact visible DKIM wizard label")
+            WebDriverWait(driver, 15).until(
+                lambda active_driver: (
+                    "selector1-" in _safe_page_text(active_driver).lower()
+                    or "48 hours to create dkim records" in _safe_page_text(active_driver).lower()
+                )
+            )
+        else:
+            logger.info(f"[{domain}] DKIM records already enabled on the wizard page")
+        time.sleep(3)  # Wait for DKIM records to load
+    except Exception as e:
+        logger.warning(f"[{domain}] Could not enable the exact DKIM wizard option: {e}")
     
     screenshot(driver, "12_dkim_checked", domain)
     _clear_admin_center_interrupts(driver, domain, "after DKIM checkbox", recover_errors=True)
@@ -2819,16 +2802,10 @@ def setup_domain_complete_via_admin_portal(
     logger.info(f"[{domain}] Step 8d: Expanding DKIM CNAME Records")
     time.sleep(2)
     
-    try:
-        # Look for "CNAME Records (2)" which contains DKIM records
-        btn = driver.find_element(By.XPATH, "//button[contains(@aria-label, 'Expand') and contains(@aria-label, 'CNAME')]")
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
-        time.sleep(0.3)
-        driver.execute_script("arguments[0].click();", btn)
-        logger.info(f"[{domain}] Expanded DKIM CNAME section")
-        time.sleep(1)
-    except Exception as e:
-        logger.warning(f"[{domain}] Could not expand DKIM CNAME: {e}")
+    if "selector1-" not in _safe_page_text(driver).lower():
+        logger.warning(f"[{domain}] Microsoft has not exposed DKIM selector values after enabling DKIM")
+    else:
+        logger.info(f"[{domain}] DKIM CNAME values are visible")
     
     screenshot(driver, "13_all_expanded", domain)
     _clear_admin_center_interrupts(driver, domain, "after expanding DKIM CNAME", recover_errors=True)

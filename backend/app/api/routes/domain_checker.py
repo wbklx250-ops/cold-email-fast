@@ -60,6 +60,7 @@ class TenantAuditRead(BaseModel):
     tenant_name: str
     disposition: str
     login_success: bool
+    domain_check_success: bool = False
     login_error: Optional[str] = None
     is_used: Optional[bool] = None
     verified_domains: list[dict] = []
@@ -271,15 +272,17 @@ async def get_job_status(job_id: str):
     if results:
         auth_ok = sum(1 for r in results if r.get("login_success"))
         auth_fail = len(results) - auth_ok
-        has_verified = sum(1 for r in results if r.get("login_success") and r.get("verified_count", 0) > 0)
-        has_unverified = sum(1 for r in results if r.get("login_success") and r.get("unverified_count", 0) > 0)
-        no_domains = sum(1 for r in results if r.get("login_success") and r.get("custom_domain_count", 0) == 0)
+        checked = [r for r in results if r.get("login_success") and r.get("domain_check_success") and not r.get("login_error")]
+        has_verified = sum(1 for r in checked if r.get("verified_count", 0) > 0)
+        has_unverified = sum(1 for r in checked if r.get("unverified_count", 0) > 0)
+        no_domains = sum(1 for r in checked if r.get("custom_domain_count", 0) == 0)
         total_verified = sum(r.get("verified_count", 0) for r in results)
         total_unverified = sum(r.get("unverified_count", 0) for r in results)
 
         summary = {
             "auth_success": auth_ok,
             "auth_failed": auth_fail,
+            "domain_checks_failed": len(results) - len(checked),
             "tenants_with_verified_domains": has_verified,
             "tenants_with_unverified_domains": has_unverified,
             "tenants_no_domains": no_domains,
@@ -311,7 +314,7 @@ async def download_results_csv(job_id: str):
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow([
-        "Tenant", "Admin Email", "Login Success", "Login Error",
+        "Tenant", "Admin Email", "Login Success", "Check Error", "Domain Check Success",
         "Verified Domain Count", "Unverified Domain Count",
         "Verified Domains", "Unverified Domains",
     ])
@@ -325,8 +328,9 @@ async def download_results_csv(job_id: str):
             r.get("admin_email", ""),
             r.get("login_success", False),
             r.get("login_error", ""),
-            r.get("verified_count", 0),
-            r.get("unverified_count", 0),
+            r.get("domain_check_success", False),
+            r.get("verified_count", 0) if r.get("domain_check_success") else "",
+            r.get("unverified_count", 0) if r.get("domain_check_success") else "",
             verified_names,
             unverified_names,
         ])
@@ -461,12 +465,14 @@ async def _persist_audit_results(
                 db.add(audit)
 
             login_success = bool(data.get("login_success"))
+            domain_check_success = bool(login_success and data.get("domain_check_success") and not data.get("login_error"))
             custom_domain_count = int(data.get("custom_domain_count") or 0)
             audit.tenant_name = data.get("tenant_name") or audit.tenant_name
             audit.login_success = login_success
+            audit.domain_check_success = domain_check_success
             audit.login_error = data.get("login_error") or None
-            # A failed login is unknown, not "unused".
-            audit.is_used = custom_domain_count > 0 if login_success else None
+            # Authentication alone does not prove the domain list was read.
+            audit.is_used = custom_domain_count > 0 if domain_check_success else None
             audit.verified_domains = data.get("verified_domains") or []
             audit.unverified_domains = data.get("unverified_domains") or []
             audit.custom_domain_count = custom_domain_count

@@ -12,6 +12,14 @@ from app.core.config import get_settings
 logger = logging.getLogger(__name__)
 
 
+def quote_txt_content(content: str) -> str:
+    """Return Cloudflare TXT content with one explicit pair of quotes."""
+    value = content.strip()
+    if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+        return value
+    return f'"{value}"'
+
+
 class CloudflareError(Exception):
     """Custom exception for Cloudflare API errors."""
 
@@ -887,6 +895,10 @@ class CloudflareService:
         Returns:
             record_id
         """
+        record_type = record_type.upper()
+        if record_type == "TXT":
+            content = quote_txt_content(content)
+
         logger.info(
             "Creating DNS record: zone=%s type=%s name=%s content=%s priority=%s proxied=%s",
             zone_id,
