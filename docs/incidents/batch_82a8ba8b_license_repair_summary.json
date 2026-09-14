@@ -1,0 +1,119 @@
+{
+  "apply": true,
+  "results": [
+    {
+      "domain": "dunhill.finance",
+      "tenant": "orbitcorehub1696.onmicrosoft.com",
+      "old_user_id": "fa0ac3aa-aec1-4945-b9e1-8ee577ca0e38",
+      "new_user_id": "39e799e6-7777-48dc-9fa5-a79d7bfdb1b1",
+      "new_upn": "me1@dunhill.finance",
+      "subscription_status": "Enabled",
+      "status": "transferred_verified",
+      "old_license_released": true,
+      "new_licenses": [
+        {
+          "disabledPlans": [],
+          "skuId": "21502a13-c8dc-4744-be9c-177fd9d2eafc"
+        }
+      ],
+      "assignment_states": [
+        {
+          "skuId": "21502a13-c8dc-4744-be9c-177fd9d2eafc",
+          "disabledPlans": [],
+          "assignedByGroup": null,
+          "state": "Active",
+          "error": "None",
+          "lastUpdatedDateTime": null
+        }
+      ]
+    },
+    {
+      "domain": "dunhill.financial",
+      "tenant": "orionstackflow1701.onmicrosoft.com",
+      "old_user_id": "33733c7f-9db4-46b1-b0ab-07aa4773af6b",
+      "new_user_id": "f27a8b23-3222-4609-b346-70ee174a9eb8",
+      "new_upn": "me1@dunhill.financial",
+      "subscription_status": "Enabled",
+      "status": "transferred_verified",
+      "old_license_released": true,
+      "new_licenses": [
+        {
+          "disabledPlans": [],
+          "skuId": "21502a13-c8dc-4744-be9c-177fd9d2eafc"
+        }
+      ],
+      "assignment_states": [
+        {
+          "skuId": "21502a13-c8dc-4744-be9c-177fd9d2eafc",
+          "disabledPlans": [],
+          "assignedByGroup": null,
+          "state": "Active",
+          "error": "None",
+          "lastUpdatedDateTime": null
+        }
+      ]
+    },
+    {
+      "domain": "dunhill.investments",
+      "tenant": "orionstackhub1703.onmicrosoft.com",
+      "old_user_id": "a8ccde56-a502-408d-b5b8-f0cdc3b1785a",
+      "new_user_id": "2755c8cb-2f13-4b4e-8e60-d2eae22e5b59",
+      "new_upn": "me1@dunhill.investments",
+      "subscription_status": "Suspended",
+      "status": "blocked_subscription_suspended",
+      "old_license_released": true
+    },
+    {
+      "domain": "dunhill.ventures",
+      "tenant": "orionstackgrid1702.onmicrosoft.com",
+      "old_user_id": "92101762-5efa-4682-9707-626d890485ac",
+      "new_user_id": "81c1c01c-0746-48c2-b9fc-ae0204c35274",
+      "new_upn": "me1@dunhill.ventures",
+      "subscription_status": "Enabled",
+      "status": "transferred_verified",
+      "old_license_released": true,
+      "new_licenses": [
+        {
+          "disabledPlans": [],
+          "skuId": "21502a13-c8dc-4744-be9c-177fd9d2eafc"
+        }
+      ],
+      "assignment_states": [
+        {
+          "skuId": "21502a13-c8dc-4744-be9c-177fd9d2eafc",
+          "disabledPlans": [],
+          "assignedByGroup": null,
+          "state": "Active",
+          "error": "None",
+          "lastUpdatedDateTime": null
+        }
+      ]
+    },
+    {
+      "domain": "familyofficeforum.co",
+      "tenant": "orbitcoreworks1699.onmicrosoft.com",
+      "old_user_id": "40a1f6da-8b0c-40f0-a991-84f648c0fe0a",
+      "new_user_id": "1c1c99ff-c1a6-4c2d-afbd-788d6a2e0b5f",
+      "new_upn": "me1@familyofficeforum.co",
+      "subscription_status": "Enabled",
+      "status": "transferred_verified",
+      "old_license_released": true,
+      "new_licenses": [
+        {
+          "disabledPlans": [],
+          "skuId": "21502a13-c8dc-4744-be9c-177fd9d2eafc"
+        }
+      ],
+      "assignment_states": [
+        {
+          "skuId": "21502a13-c8dc-4744-be9c-177fd9d2eafc",
+          "disabledPlans": [],
+          "assignedByGroup": null,
+          "state": "Active",
+          "error": "None",
+          "lastUpdatedDateTime": null
+        }
+      ]
+    }
+  ]
+}
