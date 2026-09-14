@@ -243,6 +243,7 @@ class DomainRemovalService:
         skip_m365: bool,
         headless: bool,
         max_retries: int = 2,
+        licensed_user_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Core removal logic shared by both Mode 1 and Mode 2.
@@ -282,7 +283,8 @@ class DomainRemovalService:
                         admin_email=admin_email,
                         admin_password=admin_password,
                         totp_secret=totp_secret,
-                        headless=headless
+                        headless=headless,
+                        licensed_user_id=licensed_user_id,
                     )
                     
                     if m365_result.get("success"):
@@ -310,8 +312,13 @@ class DomainRemovalService:
                     break
             
             steps["m365_removal"] = m365_result or {"success": False, "error": "No result from M365 removal"}
+            steps["license_cleanup"] = steps["m365_removal"].get("license_cleanup", {})
+            if not steps["m365_removal"].get("success"):
+                steps["cloudflare_cleanup"] = {"skipped": True, "note": "M365 removal failed; DNS preserved for retry"}
+                return {"steps": steps}
         else:
             steps["m365_removal"] = {"skipped": True, "note": "M365 operations skipped"}
+            steps["license_cleanup"] = {"skipped": True, "note": "M365 operations skipped"}
         
         # ===== STEP 2: Clean up Cloudflare DNS records =====
         try:
@@ -456,7 +463,8 @@ class DomainRemovalService:
             cloudflare_zone_id=domain.cloudflare_zone_id,
             skip_m365=skip_m365,
             headless=headless,
-            max_retries=max_retries
+            max_retries=max_retries,
+            licensed_user_id=domain.licensed_user_id,
         )
         result["steps"] = removal["steps"]
         
@@ -536,6 +544,7 @@ class DomainRemovalService:
             domain.dkim_selector2_cname = None
             domain.verification_txt_value = None
             domain.verification_txt_added = False
+            self._reset_license_state(domain, skip_m365)
             domain.batch_id = None
             domain.error_message = f"Removed from tenant '{tenant.name}' at {datetime.utcnow().isoformat()}"
             
@@ -618,7 +627,8 @@ class DomainRemovalService:
             totp_secret=entry.get("totp_secret"),
             cloudflare_zone_id=cloudflare_zone_id,
             skip_m365=skip_m365,
-            headless=headless
+            headless=headless,
+            licensed_user_id=db_domain.licensed_user_id if db_domain else None,
         )
         result["steps"] = removal["steps"]
         
@@ -644,6 +654,7 @@ class DomainRemovalService:
                     db_domain.dkim_selector2_cname = None
                     db_domain.verification_txt_value = None
                     db_domain.verification_txt_added = False
+                    self._reset_license_state(db_domain, skip_m365)
                     db_domain.batch_id = None
                     db_domain.error_message = f"Removed via CSV at {datetime.utcnow().isoformat()}"
                     await db.commit()
@@ -682,6 +693,19 @@ class DomainRemovalService:
         result["success"] = m365_ok
         result["completed_at"] = datetime.utcnow().isoformat()
         return result
+
+    @staticmethod
+    def _reset_license_state(domain, skip_m365=False):
+        # Preserve the object ID for a later real cleanup if M365 was skipped.
+        if skip_m365:
+            return
+        domain.licensed_user_created = False
+        domain.licensed_user_upn = None
+        domain.licensed_user_id = None
+        domain.licensed_user_password = None
+        domain.domain_added_to_m365 = False
+        domain.domain_verified_in_m365 = False
+        domain.domain_verified_at = None
     
     # =========================================================
     # BULK OPERATIONS
