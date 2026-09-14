@@ -33,6 +33,7 @@ async def test_audit_upsert_detects_usage_and_preserves_disposition(test_engine)
         "admin_email": "Admin@One.onmicrosoft.com",
         "tenant_name": "one",
         "login_success": True,
+        "domain_check_success": True,
         "login_error": "",
         "verified_domains": [{"name": "example.com", "status": "Healthy"}],
         "unverified_domains": [],
@@ -43,6 +44,7 @@ async def test_audit_upsert_detects_usage_and_preserves_disposition(test_engine)
     async with session_factory() as db:
         audit = (await db.execute(select(TenantAudit))).scalar_one()
         assert audit.is_used is True
+        assert audit.domain_check_success is True
         assert audit.disposition == TenantDisposition.UNREVIEWED.value
         audit.disposition = TenantDisposition.BURNED.value
         await db.commit()
@@ -89,3 +91,70 @@ async def test_failed_login_has_unknown_usage_and_disposition_can_change(test_se
 
     assert updated.disposition == TenantDisposition.AVAILABLE.value
     assert updated.is_used is None
+
+
+async def test_successful_login_with_failed_domain_read_is_unknown(test_engine):
+    session_factory = async_sessionmaker(test_engine, expire_on_commit=False)
+    await _persist_audit_results("incomplete", [{
+        "admin_email": "admin@one.onmicrosoft.com",
+        "login_success": True,
+        "domain_check_success": False,
+        "login_error": "Domain table did not load",
+        "custom_domain_count": 0,
+    }], session_factory)
+    async with session_factory() as db:
+        audit = (await db.execute(select(TenantAudit))).scalar_one()
+        assert audit.login_success is True
+        assert audit.domain_check_success is False
+        assert audit.is_used is None
+
+
+async def test_legacy_result_without_domain_read_confirmation_is_unknown(test_engine):
+    session_factory = async_sessionmaker(test_engine, expire_on_commit=False)
+    await _persist_audit_results("legacy", [{
+        "admin_email": "admin@one.onmicrosoft.com",
+        "login_success": True,
+        "custom_domain_count": 0,
+    }], session_factory)
+    async with session_factory() as db:
+        audit = (await db.execute(select(TenantAudit))).scalar_one()
+        assert audit.is_used is None
+
+
+def test_migration_invalidates_legacy_empty_checks_and_preserves_disposition():
+    import importlib.util
+    from pathlib import Path
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+    from sqlalchemy import create_engine, text
+
+    path = Path(__file__).parents[1] / "alembic/versions/030_domain_check_success.py"
+    spec = importlib.util.spec_from_file_location("domain_check_migration", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    engine = create_engine("sqlite:///:memory:")
+    with engine.begin() as connection:
+        connection.execute(text("""
+            CREATE TABLE tenant_audits (
+                admin_email TEXT, login_success BOOLEAN, login_error TEXT,
+                is_used BOOLEAN, custom_domain_count INTEGER, disposition TEXT
+            )
+        """))
+        connection.execute(text("""
+            INSERT INTO tenant_audits VALUES
+                ('empty', true, '', false, 0, 'available'),
+                ('used', true, '', true, 1, 'burned'),
+                ('failed', true, 'Read failed', false, 0, 'unreviewed')
+        """))
+        with Operations.context(MigrationContext.configure(connection)):
+            migration.upgrade()
+        rows = {row.admin_email: row for row in connection.execute(text("SELECT * FROM tenant_audits"))}
+        assert rows["empty"].is_used is None
+        assert not rows["empty"].domain_check_success
+        assert "fresh tenant check" in rows["empty"].login_error
+        assert rows["empty"].disposition == "available"
+        assert rows["used"].domain_check_success
+        assert rows["used"].is_used
+        assert rows["used"].disposition == "burned"
+        assert rows["failed"].login_error == "Read failed"
+    engine.dispose()

@@ -537,6 +537,7 @@ async def _save_step6_result(domain_data: dict, selenium_result: dict):
 async def run_step5_for_batch(
     batch_id: UUID, on_progress=None,
     max_workers: int = None, chunk_size: int = None,
+    domain_names: set[str] | None = None,
 ) -> Dict[str, Any]:
     """
     WORKER QUEUE for Step 6 — N workers pick up domains as they finish.
@@ -571,7 +572,7 @@ async def run_step5_for_batch(
     
     async with get_fresh_db_session() as db:
         # Find all domains needing M365 setup for this batch
-        domains_result = await db.execute(
+        domains_stmt = (
             select(Domain)
             .join(Tenant, Domain.tenant_id == Tenant.id)
             .where(
@@ -588,6 +589,9 @@ async def run_step5_for_batch(
             )
             .order_by(Domain.domain_index_in_tenant)  # Process domain 0 before 1 before 2
         )
+        if domain_names:
+            domains_stmt = domains_stmt.where(Domain.name.in_(domain_names))
+        domains_result = await db.execute(domains_stmt)
         domains = list(domains_result.scalars().all())
     
     summary = {"batch_id": str(batch_id), "total": len(domains),

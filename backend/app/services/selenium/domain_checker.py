@@ -16,6 +16,7 @@ import logging
 from typing import Optional, List, Callable
 from dataclasses import dataclass, field, asdict
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlsplit
 
 import pyotp
 from selenium import webdriver
@@ -59,13 +60,14 @@ class TenantCheckResult:
     tenant_name: str = ""
     login_success: bool = False
     login_error: str = ""
+    domain_check_success: bool = False
     domains: List[DomainInfo] = field(default_factory=list)
     custom_domains: List[DomainInfo] = field(default_factory=list)
     screenshot_path: str = ""
 
     def to_dict(self) -> dict:
         # Filter out ALL .onmicrosoft.com domains from every list
-        custom = [d for d in self.domains if not d.name.endswith(".onmicrosoft.com")]
+        custom = [d for d in self.domains if not d.name.lower().endswith(".onmicrosoft.com")]
         verified = [d for d in custom if d.is_verified]
         unverified = [d for d in custom if not d.is_verified]
 
@@ -74,6 +76,7 @@ class TenantCheckResult:
             "tenant_name": self.tenant_name,
             "login_success": self.login_success,
             "login_error": self.login_error,
+            "domain_check_success": self.domain_check_success,
             "verified_domains": [{"name": d.name, "status": d.status_text or "Healthy"} for d in verified],
             "unverified_domains": [{"name": d.name, "status": d.status_text or "Setup incomplete"} for d in unverified],
             "verified_count": len(verified),
@@ -228,7 +231,7 @@ def check_tenant_domains(
         try:
             # === CREATE BROWSER ===
             driver = create_driver(headless=headless)
-            driver.implicitly_wait(8)
+            driver.implicitly_wait(0)
             driver.set_page_load_timeout(45)
 
             # === LOGIN ===
@@ -252,7 +255,10 @@ def check_tenant_domains(
 
             # === SCRAPE DOMAINS ===
             domains = _scrape_domains(driver, tenant_name)
+            if not domains:
+                raise RuntimeError("Microsoft 365 domain list could not be read; domain usage is unknown")
             result.domains = domains
+            result.domain_check_success = True
             result.custom_domains = [d for d in domains if not d.name.endswith(".onmicrosoft.com")]
 
             custom_count = len(result.custom_domains)
@@ -434,27 +440,65 @@ def _do_login(
     except Exception as e:
         logger.warning(f"[{tenant_name}] MFA setup interrupt dismiss raised: {e}")
 
-    # --- VERIFY WE'RE IN THE ADMIN PORTAL ---
-    # Microsoft can leave the browser on a login.microsoftonline.com reprocess
-    # URL after auth. Treat that as an intermediate login URL, not as the admin
-    # app itself, and explicitly navigate to Admin Center before continuing.
-    for attempt in range(3):
-        time.sleep(2 if attempt == 0 else 4)
-        current_url = driver.current_url.lower()
-        if "admin.cloud.microsoft" in current_url or "admin.microsoft.com" in current_url:
-            logger.info(f"[{tenant_name}] Login successful — URL: {current_url}")
-            return True
+    return _finish_admin_login(driver, tenant_name, totp_secret)
 
-        logger.info(f"[{tenant_name}] Login URL is not Admin Center yet; opening admin.cloud.microsoft")
-        driver.get("https://admin.cloud.microsoft")
 
-    current_url = driver.current_url.lower()
-    if "admin.cloud.microsoft" in current_url or "admin.microsoft.com" in current_url:
-        logger.info(f"[{tenant_name}] Login successful after explicit Admin Center navigation — URL: {current_url}")
-        return True
+def _is_admin_url(url: str) -> bool:
+    """Check the actual host, never an OAuth redirect_uri in the query string."""
+    parsed = urlsplit(url)
+    return parsed.scheme == "https" and parsed.hostname in {
+        "admin.cloud.microsoft", "admin.microsoft.com",
+    }
 
-    logger.warning(f"[{tenant_name}] Login did not reach Admin Center — URL: {current_url}")
+
+def _finish_admin_login(driver, tenant_name: str, totp_secret: Optional[str], timeout: int = 120) -> bool:
+    """Wait through redirects and MFA challenges that arrive after the password."""
+    deadline = time.monotonic() + timeout
+    last_code = None
+    while time.monotonic() < deadline:
+        current_url = driver.current_url
+        code_inputs = driver.find_elements(By.CSS_SELECTOR, "input[name='otc'], #idTxtBx_SAOTCC_OTC")
+        code_input = next((element for element in code_inputs if element.is_displayed()), None)
+        if code_input:
+            if not totp_secret:
+                logger.warning("[%s] MFA required but no TOTP secret provided", tenant_name)
+                return False
+            totp = pyotp.TOTP(totp_secret)
+            # Avoid submitting a code just before it expires or repeatedly in one window.
+            if totp.interval - time.time() % totp.interval < 5:
+                time.sleep(1)
+                continue
+            code = totp.now()
+            if code != last_code:
+                code_input.clear()
+                code_input.send_keys(code)
+                code_input.send_keys(Keys.RETURN)
+                last_code = code
+                logger.info("[%s] Submitted delayed MFA challenge", tenant_name)
+            time.sleep(2)
+            continue
+
+        page_text = driver.find_element(By.TAG_NAME, "body").text.lower()
+        if "stay signed in" in page_text:
+            for button in driver.find_elements(By.ID, "idSIButton9"):
+                if button.is_displayed():
+                    button.click()
+                    break
+            time.sleep(2)
+            continue
+
+        if _is_admin_url(current_url):
+            if "mfasetup" in urlsplit(current_url).path.lower():
+                from app.services.selenium.admin_portal import dismiss_mfa_setup_interrupt
+                dismiss_mfa_setup_interrupt(driver, tenant_name)
+            elif driver.find_elements(By.CSS_SELECTOR, "#O365_MainLink_NavMenu, [role='navigation'], nav"):
+                logger.info("[%s] Authenticated Admin Center loaded", tenant_name)
+                return True
+        time.sleep(2)
+
+    logger.warning("[%s] Login did not reach authenticated Admin Center (host: %s)", tenant_name, urlsplit(driver.current_url).hostname)
     return False
+
 
 
 def _get_domains_url(driver: webdriver.Chrome, tenant_name: str) -> str:
@@ -466,13 +510,13 @@ def _get_domains_url(driver: webdriver.Chrome, tenant_name: str) -> str:
     to avoid a broken redirect chain.
     """
     current_url = driver.current_url
-    if "admin.cloud.microsoft" in current_url:
+    if _is_admin_url(current_url) and urlsplit(current_url).hostname == "admin.cloud.microsoft":
         base = "https://admin.cloud.microsoft"
-    elif "admin.microsoft.com" in current_url:
+    elif _is_admin_url(current_url) and urlsplit(current_url).hostname == "admin.microsoft.com":
         base = "https://admin.microsoft.com"
     else:
         logger.warning(
-            f"[{tenant_name}] Current URL is not an Admin Center host ({current_url}); "
+            f"[{tenant_name}] Current URL is not an Admin Center host; "
             "using admin.cloud.microsoft for Domains page"
         )
         base = "https://admin.cloud.microsoft"
@@ -480,6 +524,20 @@ def _get_domains_url(driver: webdriver.Chrome, tenant_name: str) -> str:
     domains_url = f"{base}/#/Domains"
     logger.info(f"[{tenant_name}] Admin base URL: {base}")
     return domains_url
+
+
+def _has_domain_table(driver, tenant_name: str) -> bool:
+    """An account email outside the domain table is not evidence of a domain read."""
+    if not _is_admin_url(driver.current_url) or urlsplit(driver.current_url).fragment.lower().rstrip("/") != "/domains":
+        return False
+    expected = f"{tenant_name}.onmicrosoft.com".lower()
+    for row in driver.find_elements(By.CSS_SELECTOR, "[role='row'], tr, .ms-DetailsRow"):
+        if not row.is_displayed():
+            continue
+        lines = [line.strip().lower().removesuffix(" (default)") for line in row.text.splitlines()]
+        if expected in lines:
+            return True
+    return False
 
 
 def _wait_for_domains_page(
@@ -491,14 +549,12 @@ def _wait_for_domains_page(
     """Wait for the Domains page to fully load its domain list content."""
     logger.info(f"[{tenant_name}] Waiting for Domains page to load...")
 
-    # Phase 1: Wait for .onmicrosoft.com to appear in page text.
-    # This proves the actual domain TABLE data has rendered (every tenant has one).
+    # Phase 1: Wait for the tenant domain in the actual table.
+    # Require the tenant domain inside a real table row, never the account header.
     # Do NOT check for generic "domain" — that matches the page nav/header immediately.
     for attempt in range(timeout // 2):
         time.sleep(1.5)
-        page_text = driver.find_element(By.TAG_NAME, "body").text.lower()
-
-        if ".onmicrosoft.com" in page_text:
+        if _has_domain_table(driver, tenant_name):
             logger.info(f"[{tenant_name}] Domains page loaded — .onmicrosoft.com found (attempt {attempt + 1})")
             # Phase 2: Stabilization delay — let React finish rendering ALL rows
             time.sleep(2)
@@ -516,22 +572,20 @@ def _wait_for_domains_page(
     # Second wait — shorter, since we just reloaded
     for attempt in range(8):
         time.sleep(1.5)
-        page_text = driver.find_element(By.TAG_NAME, "body").text.lower()
-        if ".onmicrosoft.com" in page_text:
+        if _has_domain_table(driver, tenant_name):
             logger.info(f"[{tenant_name}] Domains page loaded after reload (attempt {attempt + 1})")
             time.sleep(2)
             return
 
-    logger.warning(f"[{tenant_name}] Domains page still not loaded after reload — proceeding anyway")
-    time.sleep(2)
+    raise RuntimeError("Microsoft 365 domain table did not load; domain usage is unknown")
 
 
 def _scrape_domains(driver: webdriver.Chrome, tenant_name: str) -> List[DomainInfo]:
     """
     Scrape the domain list from the M365 Admin Domains page.
 
-    The M365 admin portal domains page is a React SPA. The domain list typically
-    appears as rows with domain name + status. We extract using multiple strategies.
+    Read structured rows only after confirming this tenant's domain table.
+    Never infer domains from account names or other full-page text.
 
     Includes a retry loop: if 0 domains found, waits and retries up to 2 more times
     to handle slow React rendering.
@@ -554,8 +608,7 @@ def _scrape_domains(driver: webdriver.Chrome, tenant_name: str) -> List[DomainIn
                 EC.presence_of_element_located((By.CSS_SELECTOR, "[role='row']"))
             )
             # Validate: check if ANY row contains .onmicrosoft.com (proves domain table, not sidebar)
-            rows = driver.find_elements(By.CSS_SELECTOR, "[role='row']")
-            has_domain_rows = any(".onmicrosoft.com" in r.text.lower() for r in rows if r.text.strip())
+            has_domain_rows = _has_domain_table(driver, tenant_name)
             if has_domain_rows:
                 logger.info(f"[{tenant_name}] Domain table rows found (scrape attempt {scrape_attempt})")
             else:
@@ -573,14 +626,15 @@ def _scrape_domains(driver: webdriver.Chrome, tenant_name: str) -> List[DomainIn
                 time.sleep(5)
                 continue
 
-        page_text = driver.find_element(By.TAG_NAME, "body").text
+        if not _has_domain_table(driver, tenant_name):
+            raise RuntimeError("Microsoft 365 domain table was not confirmed; domain usage is unknown")
 
-        # --- STRATEGY 1: Look for table rows / list items with domain patterns ---
+        # Read domain rows from the confirmed table.
         try:
             # M365 admin uses FluentUI — look for domain entries in the list
             raw_rows = driver.find_elements(
                 By.CSS_SELECTOR,
-                "[role='row'], [role='listitem'], tr, .ms-DetailsRow",
+                "[role='row'], tr, .ms-DetailsRow",
             )
 
             # Collect row texts and sort by length (shortest first).
@@ -588,13 +642,15 @@ def _scrape_domains(driver: webdriver.Chrome, tenant_name: str) -> List[DomainIn
             # parent/container rows that aggregate multiple domains' text.
             row_texts = []
             for row in raw_rows:
+                if not row.is_displayed():
+                    continue
                 row_text = row.text.strip()
                 if row_text:
                     row_texts.append(row_text)
             row_texts.sort(key=len)
 
             for row_text in row_texts:
-                matches = domain_pattern.findall(row_text)
+                matches = set(domain_pattern.findall(row_text.lower()))
                 # Filter to real domain matches
                 real_matches = []
                 for match in matches:
@@ -616,8 +672,7 @@ def _scrape_domains(driver: webdriver.Chrome, tenant_name: str) -> List[DomainIn
 
                     domain_info = DomainInfo(name=match.lower())
 
-                    if match.lower().endswith(".onmicrosoft.com"):
-                        domain_info.is_default = True
+                    domain_info.is_default = "(default)" in row_text.lower()
 
                     row_lower = row_text.lower()
                     is_custom = not match.lower().endswith(".onmicrosoft.com")
@@ -637,7 +692,7 @@ def _scrape_domains(driver: webdriver.Chrome, tenant_name: str) -> List[DomainIn
                             "Setup in progress"
                         )
 
-                    if "healthy" in row_lower or "verified" in row_lower:
+                    elif "healthy" in row_lower or "verified" in row_lower:
                         domain_info.is_verified = True
                         domain_info.status_text = "Healthy"
 
@@ -647,53 +702,13 @@ def _scrape_domains(driver: webdriver.Chrome, tenant_name: str) -> List[DomainIn
                     logger.info(f"[{tenant_name}] Domain: {match.lower()} verified={domain_info.is_verified} status='{domain_info.status_text}' row='{safe_row}'")
 
         except Exception as e:
-            logger.warning(f"[{tenant_name}] Structured scraping failed: {e}")
-
-        # --- STRATEGY 2: Fallback — extract from full page text ---
-        if not domains:
-            logger.info(f"[{tenant_name}] Strategy 1 found 0, trying full page text scraping")
-            lines = page_text.split("\n")
-            for line in lines:
-                matches = domain_pattern.findall(line.strip())
-                for match in matches:
-                    if "." in match and len(match) > 4 and match.lower() not in found_domains:
-                        if any(
-                            skip in match.lower()
-                            for skip in [
-                                "microsoft.com/",
-                                "aka.ms",
-                                "office.com/",
-                                "learn.microsoft",
-                            ]
-                        ):
-                            continue
-
-                        domain_info = DomainInfo(name=match.lower())
-                        if match.lower().endswith(".onmicrosoft.com"):
-                            domain_info.is_default = True
-
-                        is_custom = not match.lower().endswith(".onmicrosoft.com")
-                        domain_info.is_verified = False if is_custom else True
-                        if is_custom:
-                            domain_info.status_text = "Status unknown"
-
-                        # Check adjacent text for explicit status overrides
-                        line_lower = line.lower()
-                        if any(kw in line_lower for kw in [
-                            "setup in progress", "incomplete", "action required",
-                            "not verified", "pending", "setup incomplete",
-                        ]):
-                            domain_info.is_verified = False
-                            domain_info.status_text = "Setup in progress"
-                        if "healthy" in line_lower or "verified" in line_lower:
-                            domain_info.is_verified = True
-                            domain_info.status_text = "Healthy"
-
-                        found_domains.add(match.lower())
-                        domains.append(domain_info)
+            raise RuntimeError("Microsoft 365 domain table read was interrupted; domain usage is unknown") from e
 
         # If we found domains, we're done
         if domains:
+            expected = f"{tenant_name}.onmicrosoft.com".lower()
+            if expected not in found_domains:
+                raise RuntimeError("Microsoft 365 domain list did not confirm the requested tenant")
             logger.info(f"[{tenant_name}] Scraped {len(domains)} domains total (attempt {scrape_attempt})")
             return domains
 
@@ -704,4 +719,4 @@ def _scrape_domains(driver: webdriver.Chrome, tenant_name: str) -> List[DomainIn
 
     # All scrape attempts exhausted
     logger.warning(f"[{tenant_name}] Scraped 0 domains after {max_scrape_attempts} attempts")
-    return domains
+    raise RuntimeError("Microsoft 365 domain table could not be read; domain usage is unknown")

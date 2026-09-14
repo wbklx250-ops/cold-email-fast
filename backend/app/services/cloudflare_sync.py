@@ -9,6 +9,14 @@ CF_API = "https://api.cloudflare.com/client/v4"
 _zone_account_cache: dict[str, int] = {}
 
 
+def _quote_txt_content(content: str) -> str:
+    """Return Cloudflare TXT content with one explicit pair of quotes."""
+    value = content.strip()
+    if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+        return value
+    return f'"{value}"'
+
+
 def _get_all_creds() -> list[tuple[str, str]]:
     """Get credentials for ALL configured Cloudflare accounts.
     
@@ -480,7 +488,7 @@ def add_txt(zone_id, value):
         
         # Add new
         resp = httpx.post(f"{CF_API}/zones/{zone_id}/dns_records", headers=headers,
-                          json={"type": "TXT", "name": "@", "content": value, "ttl": 1}, timeout=30)
+                          json={"type": "TXT", "name": "@", "content": _quote_txt_content(value), "ttl": 1}, timeout=30)
         
         if _cf_success(resp):
             record_id = resp.json().get("result", {}).get("id", "unknown")
@@ -567,7 +575,7 @@ def add_spf(zone_id, value):
         
         # Add new
         resp = httpx.post(f"{CF_API}/zones/{zone_id}/dns_records", headers=headers,
-                          json={"type": "TXT", "name": "@", "content": value, "ttl": 1}, timeout=30)
+                          json={"type": "TXT", "name": "@", "content": _quote_txt_content(value), "ttl": 1}, timeout=30)
         
         if _cf_success(resp):
             record_id = resp.json().get("result", {}).get("id", "unknown")
@@ -696,7 +704,7 @@ def add_dmarc(zone_id, domain, value="v=DMARC1; p=none;"):
         create_resp = httpx.post(
             f"{CF_API}/zones/{zone_id}/dns_records",
             headers=headers,
-            json={"type": "TXT", "name": "_dmarc", "content": value, "ttl": 1},
+            json={"type": "TXT", "name": "_dmarc", "content": _quote_txt_content(value), "ttl": 1},
             timeout=30,
         )
 

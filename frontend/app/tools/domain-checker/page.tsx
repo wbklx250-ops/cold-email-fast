@@ -17,6 +17,7 @@ interface TenantResult {
   admin_email: string;
   tenant_name: string;
   login_success: boolean;
+  domain_check_success: boolean;
   login_error: string;
   verified_domains: DomainEntry[];
   unverified_domains: DomainEntry[];
@@ -60,6 +61,7 @@ interface TenantAudit {
   tenant_name: string;
   disposition: TenantDisposition;
   login_success: boolean;
+  domain_check_success: boolean;
   login_error: string | null;
   is_used: boolean | null;
   verified_domains: DomainEntry[];
@@ -340,8 +342,8 @@ export default function DomainCheckerPage() {
     const noDomains: string[] = [];
 
     for (const r of jobStatus.results) {
-      if (!r.login_success) {
-        loginFailed.push({ tenant: r.tenant_name, error: r.login_error });
+      if (!r.login_success || !r.domain_check_success || r.login_error) {
+        loginFailed.push({ tenant: r.tenant_name, error: r.login_error || "Domain check incomplete" });
         continue;
       }
 
@@ -471,9 +473,9 @@ export default function DomainCheckerPage() {
                       <td className="px-4 py-3 text-sm">
                         <div className="font-medium text-gray-900">{item.tenant_name}</div>
                         <div className="text-xs text-gray-500 font-mono">{item.admin_email}</div>
-                        {!item.login_success && item.login_error && (
+                        {item.login_error && (
                           <div className="text-xs text-red-600 mt-1 max-w-xs truncate" title={item.login_error}>
-                            Login failed: {item.login_error}
+                            Check failed: {item.login_error}
                           </div>
                         )}
                       </td>
@@ -494,7 +496,7 @@ export default function DomainCheckerPage() {
                             ))}
                           </div>
                         ) : (
-                          <span className="text-gray-400">No custom domains</span>
+                          <span className="text-gray-400">{item.is_used === false ? "No custom domains" : "Domain check incomplete"}</span>
                         )}
                       </td>
                       <td className="px-4 py-3">
@@ -876,7 +878,7 @@ export default function DomainCheckerPage() {
             {completionData.loginFailed.length > 0 && (
               <div>
                 <h3 className="text-sm font-semibold text-red-700 uppercase tracking-wider mb-3">
-                  Login Failures ({completionData.loginFailed.length})
+                  Incomplete Checks ({completionData.loginFailed.length})
                 </h3>
                 <div className="bg-red-50 rounded-lg border border-red-200 max-h-48 overflow-y-auto">
                   <div className="p-3 space-y-1.5">
@@ -937,7 +939,7 @@ export default function DomainCheckerPage() {
                   <tr
                     key={i}
                     className={
-                      !r.login_success
+                      (!r.login_success || !r.domain_check_success || !!r.login_error)
                         ? "bg-red-50/50"
                         : r.custom_domain_count > 0
                           ? "bg-green-50/30"
@@ -967,9 +969,9 @@ export default function DomainCheckerPage() {
                       )}
                     </td>
                     <td className="px-4 py-3 text-sm align-top">
-                      {!r.login_success ? (
+                      {!r.login_success || !r.domain_check_success || r.login_error ? (
                         <span className="text-gray-400 text-xs">
-                          — Login failed
+                          {r.login_error || (!r.login_success ? "Login failed" : "Domain check incomplete")}
                         </span>
                       ) : r.verified_domains && r.verified_domains.length > 0 ? (
                         <div className="space-y-0.5">
@@ -988,9 +990,9 @@ export default function DomainCheckerPage() {
                       )}
                     </td>
                     <td className="px-4 py-3 text-sm align-top">
-                      {!r.login_success ? (
+                      {!r.login_success || !r.domain_check_success || r.login_error ? (
                         <span className="text-gray-400 text-xs">
-                          — Login failed
+                          {r.login_error || (!r.login_success ? "Login failed" : "Domain check incomplete")}
                         </span>
                       ) : r.unverified_domains &&
                         r.unverified_domains.length > 0 ? (
