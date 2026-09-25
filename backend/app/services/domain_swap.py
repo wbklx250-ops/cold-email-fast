@@ -1,6 +1,7 @@
 """Plan, reserve and resume domain swaps using the existing setup pipeline."""
 import asyncio
 from collections import Counter, defaultdict
+from contextlib import suppress
 import hashlib
 import json
 import logging
@@ -424,17 +425,34 @@ async def worker_tick():
     async with async_engine.begin() as connection:
         if not await connection.scalar(text("SELECT pg_try_advisory_xact_lock(731904225)")):
             return
-        async with SessionLocal() as db:
-            jobs = list((await db.scalars(select(DomainSwapJob).where(
-                DomainSwapJob.status.in_(["queued", "running", "attention"]),
-            ).order_by(DomainSwapJob.created_at))).all())
-            queued = [job.id for job in jobs if job.status in ("queued", "running")]
-            for job in jobs:
-                if job.status == "attention":
-                    await sync_progress(db, job)
-            await db.commit()
-        for job_id in queued:
-            await run_job(job_id)
+
+        async def keep_lock_alive():
+            # Unlike the checkpoint sessions, this connection intentionally
+            # owns a transaction for the worker's lifetime. Keep it active
+            # through long Microsoft operations instead of letting it expire.
+            while True:
+                await asyncio.sleep(30)
+                await connection.execute(text("SELECT 1"))
+
+        heartbeat = asyncio.create_task(keep_lock_alive())
+        try:
+            async with SessionLocal() as db:
+                jobs = list((await db.scalars(select(DomainSwapJob).where(
+                    DomainSwapJob.status.in_(["queued", "running", "attention"]),
+                ).order_by(DomainSwapJob.created_at))).all())
+                queued = [job.id for job in jobs if job.status in ("queued", "running")]
+                for job in jobs:
+                    if job.status == "attention":
+                        await sync_progress(db, job)
+                await db.commit()
+            for job_id in queued:
+                if heartbeat.done():
+                    await heartbeat  # Do not start another job after lock loss.
+                await run_job(job_id)
+        finally:
+            heartbeat.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat
 
 
 async def worker_loop():

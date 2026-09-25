@@ -330,3 +330,20 @@ async def test_replacement_preflight_failure_leaves_old_domain_untouched(test_se
     async with factory() as db:
         saved = await db.get(Domain, old.id)
         assert saved.tenant_id == tenant.id and saved.licensed_user_id == "old-user"
+
+
+async def test_no_checkpoint_transaction_held_during_microsoft_wait(test_session, monkeypatch):
+    old, _, _ = await seed(test_session)
+    job = await plan(test_session, [old.name], ["new.example"])
+    await swaps.start_plan(test_session, job)
+    monkeypatch.setattr(swaps, "check_replacement", AsyncMock())
+
+    async def external_cleanup(**kwargs):
+        assert not test_session.in_transaction()
+        return {"steps": {key: {"success": True} for key in
+                          ("license_cleanup", "m365_removal", "cloudflare_cleanup")}}
+
+    monkeypatch.setattr(domain_removal_service, "_execute_removal", external_cleanup)
+    await swaps._remove_one(test_session, job, 0)
+    assert job.mappings[0]["phase"] == "removed"
+    assert old.tenant_id is None

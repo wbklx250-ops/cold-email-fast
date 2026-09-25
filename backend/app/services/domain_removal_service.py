@@ -463,6 +463,11 @@ class DomainRemovalService:
                 result["error"] = f"Domain '{domain_name}' is not linked to any tenant"
                 return result
         result["tenant_name"] = tenant.name
+
+        # Microsoft/browser removal can take several minutes. Return the DB
+        # connection to the pool during that wait so its transaction cannot
+        # expire before we save the verified removal checkpoint.
+        await db.commit()
         
         # Execute the shared removal logic
         removal = await self._execute_removal(
