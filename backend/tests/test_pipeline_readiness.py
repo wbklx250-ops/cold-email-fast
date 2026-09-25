@@ -156,7 +156,6 @@ async def test_incomplete_tenant_cannot_disappear_from_reconciliation(monkeypatc
 @pytest.mark.parametrize("start_step", [6, 7])
 async def test_pipeline_does_not_complete_when_worker_query_returns_zero(monkeypatch, start_step):
     from app.api.routes import pipeline
-    monkeypatch.setattr("app.services.domain_swap.ensure_pipeline_available", AsyncMock())
     domains, tenants = ready_batch()
     domains[0].step5_complete = False
     batch_id = uuid4()
@@ -191,7 +190,6 @@ async def test_pipeline_does_not_complete_when_worker_query_returns_zero(monkeyp
 @pytest.mark.asyncio
 async def test_pipeline_stops_at_ns_timeout_without_advancing(monkeypatch):
     from app.api.routes import pipeline
-    monkeypatch.setattr("app.services.domain_swap.ensure_pipeline_available", AsyncMock())
     domains, tenants = ready_batch(20)
     domains[-1].cloudflare_zone_status = "pending"
     batch_id = uuid4()

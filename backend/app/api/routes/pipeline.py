@@ -40,14 +40,6 @@ from app.services.selenium.browser import kill_all_browsers
 router = APIRouter(prefix="/api/v1/pipeline", tags=["pipeline"])
 logger = logging.getLogger(__name__)
 
-
-async def _guard_domain_swap(batch_id: UUID, db: AsyncSession = Depends(get_db)):
-    from app.services.domain_swap import ensure_pipeline_available, SwapConflict
-    try:
-        await ensure_pipeline_available(db, batch_id)
-    except SwapConflict as exc:
-        raise HTTPException(409, str(exc))
-
 # In-memory pipeline job tracking
 pipeline_jobs = {}
 
@@ -580,7 +572,7 @@ async def get_pipeline_status(batch_id: UUID, db: AsyncSession = Depends(get_db)
     return await _build_db_pipeline_status(db, batch, batch_id)
 
 
-@router.post("/{batch_id}/confirm-nameservers", dependencies=[Depends(_guard_domain_swap)])
+@router.post("/{batch_id}/confirm-nameservers")
 async def confirm_nameservers(
     batch_id: UUID,
     background_tasks: BackgroundTasks,
@@ -919,7 +911,7 @@ async def get_failed_domains(
     }
 
 
-@router.post("/{batch_id}/retry-failed", dependencies=[Depends(_guard_domain_swap)])
+@router.post("/{batch_id}/retry-failed")
 async def retry_failed(
     batch_id: UUID,
     step: int = None,
@@ -1020,7 +1012,7 @@ async def pause_pipeline(batch_id: UUID, db: AsyncSession = Depends(get_db)):
     return {"success": True}
 
 
-@router.post("/{batch_id}/resume", dependencies=[Depends(_guard_domain_swap)])
+@router.post("/{batch_id}/resume")
 async def resume_pipeline(
     batch_id: UUID,
     background_tasks: BackgroundTasks,
@@ -1068,7 +1060,7 @@ class RestartFromStepRequest(BaseModel):
     force: bool = True
 
 
-@router.post("/{batch_id}/restart-from-step", dependencies=[Depends(_guard_domain_swap)])
+@router.post("/{batch_id}/restart-from-step")
 async def restart_from_step(
     batch_id: UUID,
     request: RestartFromStepRequest,
@@ -1296,7 +1288,7 @@ async def restart_from_step(
     }
 
 
-@router.post("/{batch_id}/reset-progress", dependencies=[Depends(_guard_domain_swap)])
+@router.post("/{batch_id}/reset-progress")
 async def reset_batch_progress(batch_id: UUID, db: AsyncSession = Depends(get_db)):
     """Reset all step progress for tenants in a batch so the pipeline re-processes them."""
     batch = await db.get(SetupBatch, batch_id)
@@ -1470,10 +1462,6 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
     Unfinished prerequisites block dependent work and are never counted as success.
     Supports resuming from any step via start_from_step parameter.
     """
-    from app.services.domain_swap import ensure_pipeline_available
-    async with SessionLocal() as swap_db:
-        await ensure_pipeline_available(swap_db, batch_id)
-
     job_id = str(batch_id)
 
     # Guard: if another instance is already running for this batch, exit immediately

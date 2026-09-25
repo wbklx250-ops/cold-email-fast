@@ -405,10 +405,7 @@ class DomainRemovalService:
         domain_name: str,
         skip_m365: bool = False,
         headless: bool = True,
-        max_retries: int = 2,
-        require_full_cleanup: bool = False,
-        on_removed=None,
-        licensed_user_id: Optional[str] = None,
+        max_retries: int = 2
     ) -> Dict[str, Any]:
         """
         Mode 1: Remove a domain using database records.
@@ -425,13 +422,6 @@ class DomainRemovalService:
             "error": None,
             "started_at": datetime.utcnow().isoformat()
         }
-
-        if on_removed is None:
-            from app.models.domain_swap import DomainSwapReservation
-            reserved = await db.get(DomainSwapReservation, f"domain:{domain_name}")
-            if reserved:
-                result["error"] = "Domain is reserved for a swap; use the swap's retry action"
-                return result
         
         # Look up domain and tenant from database
         domain_result = await db.execute(
@@ -463,11 +453,6 @@ class DomainRemovalService:
                 result["error"] = f"Domain '{domain_name}' is not linked to any tenant"
                 return result
         result["tenant_name"] = tenant.name
-
-        # Microsoft/browser removal can take several minutes. Return the DB
-        # connection to the pool during that wait so its transaction cannot
-        # expire before we save the verified removal checkpoint.
-        await db.commit()
         
         # Execute the shared removal logic
         removal = await self._execute_removal(
@@ -479,7 +464,7 @@ class DomainRemovalService:
             skip_m365=skip_m365,
             headless=headless,
             max_retries=max_retries,
-            licensed_user_id=licensed_user_id or domain.licensed_user_id,
+            licensed_user_id=domain.licensed_user_id,
         )
         result["steps"] = removal["steps"]
         
@@ -524,13 +509,6 @@ class DomainRemovalService:
             result["completed_at"] = datetime.utcnow().isoformat()
             return result
         
-        if require_full_cleanup and not all(
-            result["steps"].get(step, {}).get("success")
-            for step in ("license_cleanup", "m365_removal", "cloudflare_cleanup")
-        ):
-            result["error"] = "License release, Microsoft removal and DNS cleanup must all succeed before replacement"
-            return result
-
         # ===== STEP 3: Update database (only if M365 removal succeeded) =====
         try:
             logger.info(f"[{domain_name}] Step 3: Updating database (M365 removal confirmed)...")
@@ -575,9 +553,6 @@ class DomainRemovalService:
                 domain.m365_domain_added = False
             if hasattr(domain, 'm365_domain_verified'):
                 domain.m365_domain_verified = False
-
-            if on_removed is not None:
-                await on_removed(db, domain, tenant)
             
             await db.commit()
             result["steps"]["database_update"] = {

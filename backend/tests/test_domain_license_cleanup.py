@@ -169,7 +169,6 @@ async def test_both_removal_modes_preserve_identity_on_failure_and_reset_on_succ
     domain.tenant = tenant
     tenant.domain_id = domain.id
     db = AsyncMock()
-    db.get.return_value = None  # No active domain swap reservation.
     lookup = Mock()
     lookup.scalar_one_or_none.return_value = domain
     lookup.scalars.return_value.all.return_value = []

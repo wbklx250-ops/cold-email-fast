@@ -1216,8 +1216,6 @@ def _verify_domain_actually_removed(domain_name, admin_email=None, admin_passwor
             time.sleep(wait)
             elapsed += wait
         
-        # Evidence must come from this attempt, not an earlier partial response.
-        checks_done = {}
         still_in_tenant = False
         
         # CHECK 1: User Realm discovery (most reliable for "is domain in a tenant?")
@@ -1292,18 +1290,11 @@ def _verify_domain_actually_removed(domain_name, admin_email=None, admin_passwor
                 checks_done["graph_api"] = {"error": str(e)}
         
         # VERDICT
-        positive_removal_evidence = (
-            checks_done.get("graph_api", {}).get("removed") is True
-            or (
-                checks_done.get("user_realm", {}).get("namespace_type") == "unknown"
-                and checks_done.get("openid", {}).get("in_tenant") is False
-            )
-        )
-        if not still_in_tenant and positive_removal_evidence:
+        if not still_in_tenant:
             logger.info(f"[{domain_name}] ✓ VERIFIED: Domain is confirmed removed from M365 tenant")
             return {"verified_removed": True, "checks": checks_done, "error": None}
         
-        logger.warning(f"[{domain_name}] Removal not confirmed on attempt {attempt + 1}")
+        logger.warning(f"[{domain_name}] Domain still in tenant on attempt {attempt + 1}")
     
     # After all retries, domain is still in a tenant
     logger.error(f"[{domain_name}] ✗ VERIFICATION FAILED: Domain is STILL attached to a tenant after {elapsed}s of waiting")
@@ -1360,7 +1351,8 @@ def _remove_domain_after_license_cleanup(domain_name, admin_email, admin_passwor
     Returns: {"success": bool, "error": str|None, "method": str, "attempts": list, "verification": dict}
     """
     attempts = []
-    last_verification = None
+    tier_succeeded = False
+    success_method = None
     
     tiers = [
         ("TIER 1", "MSAL → Graph API", "msal_graph",
@@ -1379,41 +1371,60 @@ def _remove_domain_after_license_cleanup(domain_name, admin_email, admin_passwor
         try:
             logger.info(f"[{domain_name}] Trying {tier_name} ({tier_desc})...")
             result = tier_func()
-            attempt_record = {"tier": tier_name, "method": tier_method, "result": result}
-            attempts.append(attempt_record)
+            attempts.append({"tier": tier_name, "method": tier_method, "result": result})
             
             if result.get("success"):
                 logger.info(f"[{domain_name}] {tier_name} ({tier_desc}) reported success — proceeding to VERIFICATION")
-                verification = _verify_domain_actually_removed(
-                    domain_name, admin_email=admin_email, admin_password=admin_password, max_wait=90
-                )
-                attempt_record["verification"] = verification
-                last_verification = verification
-                if verification.get("verified_removed") is True:
-                    method = result.get("method", tier_method)
-                    logger.info(f"[{domain_name}] VERIFIED REMOVED via {method}")
-                    return {
-                        "success": True, "error": None, "method": method,
-                        "attempts": attempts, "verification": verification, "verified": True,
-                    }
-                # A 204 means Microsoft accepted the asynchronous request. If
-                # removal fails later (for example on an Exchange reference),
-                # keep trying the existing fallbacks, including Admin Center.
-                logger.warning(
-                    f"[{domain_name}] {tier_name} accepted removal but verification failed; "
-                    "continuing to the next removal method"
-                )
-                attempt_record["error"] = verification.get("error") or "Removal was not verified"
+                tier_succeeded = True
+                success_method = result.get("method", tier_method)
+                break
             else:
                 logger.warning(f"[{domain_name}] {tier_name} failed: {result.get('error', 'unknown')}")
         except Exception as e:
             logger.warning(f"[{domain_name}] {tier_name} exception: {e}")
             attempts.append({"tier": tier_name, "method": tier_method, "result": {"success": False, "error": str(e)}})
     
+    # ===== MANDATORY VERIFICATION =====
+    # Even if a tier reported success, we VERIFY externally that the domain is actually gone.
+    # This prevents false positives where the API accepted the request but didn't complete it.
+    
+    if tier_succeeded:
+        logger.info(f"[{domain_name}] === VERIFICATION PHASE: Confirming domain is actually removed ===")
+        verification = _verify_domain_actually_removed(
+            domain_name, admin_email=admin_email, admin_password=admin_password, max_wait=90
+        )
+        
+        if verification["verified_removed"]:
+            logger.info(f"[{domain_name}] ✓✓ VERIFIED REMOVED — {success_method} + external verification confirmed")
+            return {
+                "success": True,
+                "error": None,
+                "method": success_method,
+                "attempts": attempts,
+                "verification": verification,
+                "verified": True,
+            }
+        else:
+            # Tier said success but domain is STILL IN TENANT
+            logger.error(
+                f"[{domain_name}] ✗ VERIFICATION FAILED — {success_method} reported success but domain "
+                f"is STILL attached to a tenant. Checks: {verification.get('checks', {})}"
+            )
+            return {
+                "success": False,
+                "error": f"Removal method ({success_method}) reported success but external verification "
+                         f"shows domain is still in a tenant: {verification.get('error', 'still attached')}",
+                "method": success_method,
+                "attempts": attempts,
+                "verification": verification,
+                "verified": False,
+                "needs_retry": True,
+            }
+    
     # ===== ALL 4 TIERS FAILED =====
-    last_error = (attempts[-1].get("error") or attempts[-1]["result"].get("error") or "Removal was not verified") if attempts else "No attempts made"
+    last_error = attempts[-1]["result"].get("error", "Unknown error") if attempts else "No attempts made"
     tier_summary = ", ".join(
-        f"{a['tier']}:{(a.get('error') or a['result'].get('error') or 'unverified')[:50]}" for a in attempts
+        f"{a['tier']}:{a['result'].get('error', 'failed')[:50]}" for a in attempts
     )
     logger.error(f"[{domain_name}] ✗ ALL 4 TIERS FAILED: {tier_summary}")
     
@@ -1422,7 +1433,7 @@ def _remove_domain_after_license_cleanup(domain_name, admin_email, admin_passwor
         "error": f"All 4 removal tiers failed. Last error: {last_error}",
         "method": "none",
         "attempts": attempts,
-        "verification": last_verification,
+        "verification": None,
         "verified": False,
         "needs_retry": True,
     }
