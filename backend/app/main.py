@@ -1,4 +1,6 @@
 import logging
+import asyncio
+from contextlib import suppress
 import os
 import sys
 from contextlib import asynccontextmanager
@@ -99,9 +101,15 @@ async def lifespan(app: FastAPI):
     from app.api.routes.pipeline import resume_interrupted_pipelines
     await resume_interrupted_pipelines()
 
+    from app.services.domain_swap import worker_loop
+    swap_worker = asyncio.create_task(worker_loop())
+
     yield
 
     # Shutdown: Stop background scheduler
+    swap_worker.cancel()
+    with suppress(asyncio.CancelledError):
+        await swap_worker
     logger.info("Stopping background job scheduler...")
     stop_background_scheduler()
 
@@ -157,6 +165,8 @@ app.include_router(webhooks_router)
 app.include_router(step8_router)
 app.include_router(upload_router)
 app.include_router(domain_removal_router)
+from app.api.routes.domain_swap import router as domain_swap_router
+app.include_router(domain_swap_router)
 app.include_router(domain_lookup_router)
 app.include_router(pipeline_router)
 app.include_router(step8_endpoints_router)

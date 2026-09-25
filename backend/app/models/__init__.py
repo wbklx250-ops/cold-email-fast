@@ -6,6 +6,7 @@ from app.models.mailbox import Mailbox, MailboxStatus, WarmupStage
 from app.models.pipeline_log import PipelineLog
 from app.models.tenant import Tenant, TenantStatus
 from app.models.tenant_audit import TenantAudit, TenantDisposition
+from app.models.domain_swap import DomainSwapJob, DomainSwapReservation
 
 __all__ = [
     "Base",
@@ -14,6 +15,8 @@ __all__ = [
     "SetupBatch",
     "Domain",
     "DomainStatus",
+    "DomainSwapJob",
+    "DomainSwapReservation",
     "InstantlyAccount",
     "Tenant",
     "TenantStatus",
