@@ -586,6 +586,7 @@ async def run_step5_for_batch(
     batch_id: UUID, on_progress=None,
     max_workers: int = None, chunk_size: int = None,
     domain_names: set[str] | None = None,
+    should_stop=None,
 ) -> Dict[str, Any]:
     """
     WORKER QUEUE for Step 6 — N workers pick up domains as they finish.
@@ -828,6 +829,9 @@ async def run_step5_for_batch(
         total_chunks = (total + effective_chunk_size - 1) // effective_chunk_size
         
         for chunk_idx in range(0, total, effective_chunk_size):
+            if should_stop and await should_stop():
+                logger.info("Step 6 worker queue stopped before next domain for batch %s", batch_id)
+                break
             chunk = domains_data[chunk_idx:chunk_idx + effective_chunk_size]
             chunk_num = (chunk_idx // effective_chunk_size) + 1
             

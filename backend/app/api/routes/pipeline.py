@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 
 # In-memory pipeline job tracking
 pipeline_jobs = {}
+pipeline_active_tasks = {}
 
 MAX_PIPELINE_RETRIES = 4   # Max retries per tenant per step
 STEP5_MAX_WORKERS = 2      # Max parallel browsers for first login (Railway memory limit)
@@ -1025,6 +1026,9 @@ async def resume_pipeline(
 
     # === GUARD: Reject if pipeline is already running ===
     job_id = str(batch_id)
+    active_task = pipeline_active_tasks.get(job_id)
+    if active_task is not None and not active_task.done():
+        raise HTTPException(409, "The previous pipeline worker is still finishing. Retry Resume after it exits.")
     if batch.pipeline_status == "running":
         if job_id in pipeline_jobs and pipeline_jobs[job_id].get("status") == "running":
             logger.warning(f"Resume rejected for batch {batch_id} — pipeline already running")
@@ -1463,6 +1467,11 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
     Supports resuming from any step via start_from_step parameter.
     """
     job_id = str(batch_id)
+    current_task = asyncio.current_task()
+    active_task = pipeline_active_tasks.get(job_id)
+    if active_task is not None and not active_task.done():
+        logger.warning("Pipeline worker already active for batch %s — duplicate task exiting", batch_id)
+        return
 
     # Guard: if another instance is already running for this batch, exit immediately
     if job_id in pipeline_jobs and pipeline_jobs[job_id].get("status") == "running":
@@ -1494,6 +1503,7 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
             }
 
     pipeline_jobs[job_id]["status"] = "running"
+    pipeline_active_tasks[job_id] = current_task
 
     try:
         await _update_pipeline(batch_id, start_from_step, "running", "Checking batch prerequisites...")
@@ -2055,10 +2065,14 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                         batch_id,
                         max_workers=STEP6_MAX_WORKERS,
                         chunk_size=STEP6_CHUNK_SIZE,
+                        should_stop=lambda: _check_paused_or_stopped(batch_id),
                     )
                     logger.info(f"Step 6 attempt {attempt + 1} result: {m365_result.get('processed', 0)} processed, {m365_result.get('failed', 0)} failed")
                 except Exception as e:
                     logger.error(f"Step 6 attempt {attempt + 1} failed: {e}")
+
+                if await _check_paused_or_stopped(batch_id):
+                    return
 
                 # Increment retry counts on failed domains and skip if exceeded
                 async with SessionLocal() as db:
@@ -2696,6 +2710,10 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
             if batch:
                 batch.pipeline_status = "error"
                 await db.commit()
+
+    finally:
+        if pipeline_active_tasks.get(job_id) is current_task:
+            pipeline_active_tasks.pop(job_id, None)
 
 
 # Helper to log pipeline activity
