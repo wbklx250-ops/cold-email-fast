@@ -6,8 +6,8 @@ Supports two modes:
   Mode 2 (CSV): Given domain + tenant credentials directly, no DB lookup needed
 
 For both modes, the removal steps are:
-1. Remove domain from M365 (Graph API forceDelete primary, Selenium fallback)
-   - Graph API forceDelete automatically reassigns all UPNs, mailboxes, proxy addresses, etc.
+1. Delete the domain's shared mailboxes, release its application-user licenses,
+   delete that user, verify Exchange cleanup, then remove the M365 domain.
 2. Clean up Cloudflare DNS records
 3. Update database (Mode 1 only, or Mode 2 if domain happens to exist in DB)
 """
@@ -244,17 +244,14 @@ class DomainRemovalService:
         headless: bool,
         max_retries: int = 2,
         licensed_user_id: Optional[str] = None,
+        mailbox_ids: Optional[List[str]] = None,
+        mailbox_records: Optional[List[Dict[str, str]]] = None,
     ) -> Dict[str, Any]:
         """
         Core removal logic shared by both Mode 1 and Mode 2.
         
-        Uses the robust two-pronged approach:
-        1. Graph API forceDelete (primary) — handles ALL reassignment server-side
-        2. Selenium Admin Portal (fallback) — if Graph API fails
-        3. Clean up Cloudflare DNS records
-        
-        Graph API forceDelete automatically reassigns all UPNs, mailboxes,
-        proxy addresses, groups, etc. — no need for separate PowerShell steps.
+        Recipient cleanup must finish before domain removal. Cloudflare DNS is
+        preserved unless M365 removal is verified.
         
         Returns dict with "steps" key containing results of each step.
         """
@@ -285,6 +282,8 @@ class DomainRemovalService:
                         totp_secret=totp_secret,
                         headless=headless,
                         licensed_user_id=licensed_user_id,
+                        mailbox_ids=mailbox_ids,
+                        mailbox_records=mailbox_records,
                     )
                     
                     if m365_result.get("success"):
@@ -313,6 +312,9 @@ class DomainRemovalService:
             
             steps["m365_removal"] = m365_result or {"success": False, "error": "No result from M365 removal"}
             steps["license_cleanup"] = steps["m365_removal"].get("license_cleanup", {})
+            cleanup = steps["m365_removal"].get("recipient_cleanup", {})
+            for key in ("shared_mailboxes", "licensed_user_deletion", "group_addresses"):
+                steps[key] = cleanup.get(key, {"skipped": True})
             if not steps["m365_removal"].get("success"):
                 steps["cloudflare_cleanup"] = {"skipped": True, "note": "M365 removal failed; DNS preserved for retry"}
                 return {"steps": steps}
@@ -453,6 +455,10 @@ class DomainRemovalService:
                 result["error"] = f"Domain '{domain_name}' is not linked to any tenant"
                 return result
         result["tenant_name"] = tenant.name
+
+        mailbox_records = await self._mailbox_records(db, tenant.id, domain_name)
+        # Do not hold a database transaction during lengthy Microsoft operations.
+        await db.commit()
         
         # Execute the shared removal logic
         removal = await self._execute_removal(
@@ -465,6 +471,7 @@ class DomainRemovalService:
             headless=headless,
             max_retries=max_retries,
             licensed_user_id=domain.licensed_user_id,
+            mailbox_records=mailbox_records,
         )
         result["steps"] = removal["steps"]
         
@@ -604,6 +611,7 @@ class DomainRemovalService:
         
         # Check if domain also exists in DB (use its zone_id if available)
         db_domain = None
+        mailbox_records = []
         if db:
             try:
                 db_result = await db.execute(
@@ -612,8 +620,13 @@ class DomainRemovalService:
                 db_domain = db_result.scalar_one_or_none()
                 if db_domain and not cloudflare_zone_id:
                     cloudflare_zone_id = db_domain.cloudflare_zone_id
+                if db_domain and db_domain.tenant_id:
+                    mailbox_records = await self._mailbox_records(db, db_domain.tenant_id, domain_name)
+                await db.commit()
             except Exception as e:
-                logger.warning(f"[{domain_name}] Could not check DB for domain: {e}")
+                await db.rollback()
+                result['error'] = 'Could not load recorded mailbox identities; retry before cleanup'
+                return result
         
         # If still no zone_id, try Cloudflare API lookup by name
         if not cloudflare_zone_id:
@@ -629,6 +642,7 @@ class DomainRemovalService:
             skip_m365=skip_m365,
             headless=headless,
             licensed_user_id=db_domain.licensed_user_id if db_domain else None,
+            mailbox_records=mailbox_records,
         )
         result["steps"] = removal["steps"]
         
@@ -693,6 +707,12 @@ class DomainRemovalService:
         result["success"] = m365_ok
         result["completed_at"] = datetime.utcnow().isoformat()
         return result
+
+    @staticmethod
+    async def _mailbox_records(db, tenant_id, domain_name):
+        rows = await db.execute(select(Mailbox).where(Mailbox.tenant_id == tenant_id))
+        return [{'id': m.microsoft_object_id, 'email': m.email} for m in rows.scalars().all()
+                if m.email and m.email.lower().endswith(f"@{domain_name}")]
 
     @staticmethod
     def _reset_license_state(domain, skip_m365=False):

@@ -14,11 +14,18 @@ def _select_users(users, domain_name, licensed_user_id=None, admin_email=None):
     selected = []
     for user in users:
         upn = (user.get("userPrincipalName") or "").lower()
+        addresses = [(user.get("mail") or "").lower()] + [
+            a[5:].lower() for a in user.get("proxyAddresses", []) if a.lower().startswith("smtp:")
+        ]
+        is_domain_user = upn == f"me1@{domain}" or f"me1@{domain}" in addresses
         if admin_email and upn == admin_email.lower():
-            if user.get("id") == licensed_user_id or upn == f"me1@{domain}":
+            if user.get("id") == licensed_user_id or is_domain_user:
                 raise ValueError("Refusing to release licenses from the tenant administrator")
             continue
-        if upn == f"me1@{domain}":
+        if is_domain_user:
+            upn_domain = upn.rsplit("@", 1)[-1]
+            if upn_domain != domain and not upn_domain.endswith(".onmicrosoft.com"):
+                raise ValueError("Application user now belongs to another custom domain")
             selected.append(user)
         elif licensed_user_id and user.get("id") == licensed_user_id:
             upn_domain = upn.rsplit("@", 1)[-1]
@@ -28,7 +35,8 @@ def _select_users(users, domain_name, licensed_user_id=None, admin_email=None):
     return selected
 
 
-async def release_domain_user_licenses(access_token, domain_name, licensed_user_id=None, admin_email=None):
+async def release_domain_user_licenses(access_token, domain_name, licensed_user_id=None, admin_email=None,
+                                      expected_user_ids=None):
     """Fail closed on incomplete discovery, inherited licenses, or failed verification.
 
     Only the application's me1 user and the domain's recorded licensed user are
@@ -42,7 +50,7 @@ async def release_domain_user_licenses(access_token, domain_name, licensed_user_
             timeout=aiohttp.ClientTimeout(total=60),
         ) as session:
             users = []
-            url = (f"{GRAPH_ROOT}/users?$select=id,userPrincipalName,assignedLicenses,"
+            url = (f"{GRAPH_ROOT}/users?$select=id,userPrincipalName,mail,proxyAddresses,assignedLicenses,"
                    "licenseAssignmentStates&$top=999")
             while url:
                 async with session.get(url) as response:
@@ -53,6 +61,8 @@ async def release_domain_user_licenses(access_token, domain_name, licensed_user_
                     url = payload.get("@odata.nextLink")
 
             targets = _select_users(users, domain_name, licensed_user_id, admin_email)
+            if expected_user_ids is not None and not {u['id'] for u in targets}.issubset(set(expected_user_ids)):
+                raise RuntimeError("Application user changed during cleanup; rediscover before releasing licenses")
             # Check every target before making any change.
             for user in targets:
                 if any(state.get("assignedByGroup") for state in user.get("licenseAssignmentStates", [])):

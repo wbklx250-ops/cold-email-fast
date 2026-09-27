@@ -147,12 +147,14 @@ export default function DomainRemovalPage() {
     const confirmed = confirm(
       `Remove ${removable.length} domain(s) from their tenants?\n\n` +
         "This will:\n" +
-        "• Delete all mailboxes using these domains\n" +
-        "• Reset user UPNs back to onmicrosoft.com\n" +
+        "• Delete shared mailboxes belonging to these domains\n" +
+        "• Unassign licenses from the old application users\n" +
+        "• Delete those previously licensed users\n" +
+        "• Move Microsoft 365 group addresses off the old domains (preserve groups)\n" +
         "• Remove domains from M365 tenants\n" +
         "• Clean up Cloudflare DNS records\n" +
         "• Update the database\n\n" +
-        "This cannot be undone."
+        "Previously renamed mailboxes are matched against this domain's stored records. Other domains are preserved."
     );
     if (!confirmed) return;
 

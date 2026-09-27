@@ -1310,9 +1310,9 @@ def _verify_domain_actually_removed(domain_name, admin_email=None, admin_passwor
 # =====================================================================
 
 def remove_domain_robust(domain_name, admin_email, admin_password, totp_secret=None, headless=True,
-                         licensed_user_id=None):
-    """Release licenses before any removal method can rename the domain user."""
-    from app.services.domain_license_cleanup import release_domain_user_licenses
+                         licensed_user_id=None, mailbox_ids=None, mailbox_records=None):
+    """Remove shared mailboxes, release licenses, and delete the old user first."""
+    from app.services.domain_recipient_cleanup import cleanup_domain_recipients
 
     try:
         ok, token, error = _get_access_token_via_msal(admin_email, admin_password)
@@ -1321,21 +1321,25 @@ def remove_domain_robust(domain_name, admin_email, admin_password, totp_secret=N
                 admin_email, admin_password, totp_secret, headless=headless
             )
         if not ok:
-            cleanup = {"success": False, "error": error or "Could not authenticate license cleanup"}
+            cleanup = {"success": False, "error": error or "Could not authenticate recipient cleanup"}
         else:
-            cleanup = asyncio.run(release_domain_user_licenses(token, domain_name, licensed_user_id, admin_email))
+            cleanup = asyncio.run(cleanup_domain_recipients(
+                token, domain_name, admin_email, admin_password, licensed_user_id, mailbox_ids, mailbox_records
+            ))
     except Exception as exc:
         cleanup = {"success": False, "error": str(exc)}
     if not cleanup.get("success"):
         return {
-            "success": False, "verified": False, "method": "license_cleanup",
-            "error": f"License cleanup failed: {cleanup.get('error', 'unknown error')}",
-            "license_cleanup": cleanup, "needs_retry": True,
+            "success": False, "verified": False, "method": "recipient_cleanup",
+            "error": f"Recipient cleanup failed: {cleanup.get('error', 'unknown error')}",
+            "recipient_cleanup": cleanup, "license_cleanup": cleanup.get("license_cleanup", {}),
+            "needs_retry": True,
         }
     result = _remove_domain_after_license_cleanup(
         domain_name, admin_email, admin_password, totp_secret, headless
     )
-    result["license_cleanup"] = cleanup
+    result["recipient_cleanup"] = cleanup
+    result["license_cleanup"] = cleanup.get("license_cleanup", {})
     return result
 
 

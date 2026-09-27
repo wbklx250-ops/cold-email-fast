@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from app.services import domain_license_cleanup as cleanup
+from app.services import domain_recipient_cleanup as recipients
 from app.services.domain_removal_service import DomainRemovalService
 from app.services.selenium import domain_removal as removal
 
@@ -116,20 +117,20 @@ async def test_accepted_release_must_verify(monkeypatch):
 def test_all_removal_tiers_are_gated_by_cleanup(monkeypatch, success):
     monkeypatch.setattr(removal, '_get_access_token_via_msal', Mock(return_value=(True, 'token', None)))
     release = AsyncMock(return_value={'success': success, 'error': 'failed'})
-    monkeypatch.setattr(cleanup, 'release_domain_user_licenses', release)
+    monkeypatch.setattr(recipients, 'cleanup_domain_recipients', release)
     tiers = Mock(return_value={'success': True, 'verified': True})
     monkeypatch.setattr(removal, '_remove_domain_after_license_cleanup', tiers)
     result = removal.remove_domain_robust('old.example', 'admin@tenant.onmicrosoft.com', 'password', licensed_user_id='old')
     assert result['success'] == success
     assert tiers.call_count == int(success)
-    release.assert_awaited_once_with('token', 'old.example', 'old', 'admin@tenant.onmicrosoft.com')
+    release.assert_awaited_once_with('token', 'old.example', 'admin@tenant.onmicrosoft.com', 'password', 'old', None, None)
 
 
 def test_mfa_authentication_fallback_still_releases_licenses(monkeypatch):
     monkeypatch.setattr(removal, '_get_access_token_via_msal', Mock(return_value=(False, None, 'MFA')))
     monkeypatch.setattr(removal, '_get_access_token_via_selenium', Mock(return_value=(True, 'browser-token', None)))
     release = AsyncMock(return_value={'success': True})
-    monkeypatch.setattr(cleanup, 'release_domain_user_licenses', release)
+    monkeypatch.setattr(recipients, 'cleanup_domain_recipients', release)
     monkeypatch.setattr(removal, '_remove_domain_after_license_cleanup', Mock(return_value={'success': True}))
     assert removal.remove_domain_robust('old.example', 'admin@tenant.onmicrosoft.com', 'password')['success']
     assert release.await_args.args[0] == 'browser-token'
