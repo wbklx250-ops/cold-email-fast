@@ -1411,6 +1411,44 @@ def screenshot(driver, name, domain):
         pass
 
 
+def _get_exchange_dkim_targets(domain: str, admin_email: str, admin_password: str):
+    """Get the two exact DKIM targets from Exchange when the wizard omits them.
+
+    This runs in the dedicated Selenium worker thread. Exchange creates a
+    disabled signing configuration if one does not exist yet; it does not
+    enable signing or infer Microsoft's tenant-specific partition character.
+    """
+    import asyncio
+
+    from app.services.powershell.runner import powershell
+
+    try:
+        ok, selector1, selector2 = asyncio.run(
+            powershell.get_dkim_config_with_credentials(
+                admin_email, admin_password, domain
+            )
+        )
+    except Exception as exc:
+        logger.warning("[%s] Exchange DKIM lookup failed: %s", domain, exc)
+        return None
+
+    if not ok or not selector1 or not selector2:
+        logger.warning("[%s] Exchange has not published both DKIM targets", domain)
+        return None
+
+    targets = (selector1.strip().rstrip("."), selector2.strip().rstrip("."))
+    domain_label = domain.lower().replace(".", "-")
+    for index, target in enumerate(targets, start=1):
+        expected_prefix = f"selector{index}-{domain_label}._domainkey."
+        if not target.lower().startswith(expected_prefix) or not (
+            target.lower().endswith(".dkim.mail.microsoft")
+            or target.lower().endswith(".onmicrosoft.com")
+        ):
+            logger.error("[%s] Exchange returned an invalid DKIM selector%d target", domain, index)
+            return None
+    return targets
+
+
 def _save_screenshot(driver, domain: str, step: str):
     """Save screenshot for debugging."""
     try:
@@ -2856,17 +2894,25 @@ def setup_domain_complete_via_admin_portal(
         sel2_match = re.search(r'(selector2-[a-zA-Z0-9-]+\._domainkey\.[a-zA-Z0-9.-]+\.onmicrosoft\.com)', page_text)
     
     # Log what we found
-    if sel1_match:
-        logger.info(f"[{domain}] DKIM selector1 target: {sel1_match.group(1)}")
+    sel1_target = sel1_match.group(1) if sel1_match else None
+    sel2_target = sel2_match.group(1) if sel2_match else None
+    if not (sel1_target and sel2_target):
+        logger.info(f"[{domain}] Admin Center omitted DKIM targets; checking Exchange Online")
+        exchange_targets = _get_exchange_dkim_targets(domain, admin_email, admin_password)
+        if exchange_targets:
+            sel1_target, sel2_target = exchange_targets
+
+    if sel1_target:
+        logger.info(f"[{domain}] DKIM selector1 target: {sel1_target}")
     else:
         logger.warning(f"[{domain}] DKIM selector1 NOT FOUND")
         
-    if sel2_match:
-        logger.info(f"[{domain}] DKIM selector2 target: {sel2_match.group(1)}")
+    if sel2_target:
+        logger.info(f"[{domain}] DKIM selector2 target: {sel2_target}")
     else:
         logger.warning(f"[{domain}] DKIM selector2 NOT FOUND")
 
-    if not (mx_match and spf_match and sel1_match and sel2_match):
+    if not (mx_match and spf_match and sel1_target and sel2_target):
         logger.warning(f"[{domain}] DNS values are incomplete on the admin-center page; retrying Selenium flow")
         result["error"] = "Admin-center DNS page did not expose all required values"
         _cleanup_driver(driver)
@@ -2910,15 +2956,15 @@ def setup_domain_complete_via_admin_portal(
     dns_write_results["autodiscover"] = add_cname(zone_id, "autodiscover", "autodiscover.outlook.com")
     
     # Add DKIM CNAMEs with FULL target values
-    if sel1_match:
-        dkim1_target = sel1_match.group(1)
+    if sel1_target:
+        dkim1_target = sel1_target
         logger.info(f"[{domain}] Adding DKIM: selector1._domainkey -> {dkim1_target}")
         dns_write_results["dkim_selector1"] = add_cname(zone_id, "selector1._domainkey", dkim1_target)
         # Store in result for database update
         result["dkim_selector1_cname"] = dkim1_target
     
-    if sel2_match:
-        dkim2_target = sel2_match.group(1)
+    if sel2_target:
+        dkim2_target = sel2_target
         logger.info(f"[{domain}] Adding DKIM: selector2._domainkey -> {dkim2_target}")
         dns_write_results["dkim_selector2"] = add_cname(zone_id, "selector2._domainkey", dkim2_target)
         # Store in result for database update

@@ -407,6 +407,29 @@ async def _save_step6_result(domain_data: dict, selenium_result: dict):
                             "force_unsafe": True,
                             "error": "Admin Center wizard completed, but DMARC was not confirmed in Cloudflare",
                         }
+                    else:
+                        # The wizard completion screen does not prove Exchange
+                        # is actually signing for this custom domain.
+                        from app.services.objective_reconciliation import _read_dkim_truth
+
+                        dkim_truth = await _read_dkim_truth(
+                            {
+                                "name": domain_name,
+                                "tenant": {
+                                    "admin_email": domain_data["admin_email"],
+                                    "admin_password": domain_data["admin_password"],
+                                },
+                            },
+                            enable=True,
+                        )
+                        if not dkim_truth.get("enabled"):
+                            selenium_result = {
+                                **selenium_result,
+                                "success": False,
+                                "verified": True,
+                                "dkim_pending": True,
+                                "error": "Domain and DNS configured; Exchange DKIM signing is pending",
+                            }
                 error_msg = selenium_result.get("error", "Unknown error")
                 
                 if selenium_result.get("success"):
@@ -485,9 +508,34 @@ async def _save_step6_result(domain_data: dict, selenium_result: dict):
                     domain_obj.dkim_enabled = False
                     domain_obj.dkim_enabled_at = None
                     domain_obj.step5_complete = False
-                    domain_obj.status = DomainStatus.PROBLEM if selenium_result.get("force_unsafe") else DomainStatus.M365_VERIFIED
+                    domain_obj.status = (
+                        DomainStatus.PROBLEM if selenium_result.get("force_unsafe")
+                        else DomainStatus.PENDING_DKIM if selenium_result.get("dkim_pending")
+                        else DomainStatus.M365_VERIFIED
+                    )
                     domain_obj.m365_verified_at = now
-                    domain_obj.error_message = error_msg if selenium_result.get("force_unsafe") else "Domain verified but DNS setup incomplete"
+                    domain_obj.error_message = (
+                        error_msg if selenium_result.get("force_unsafe") or selenium_result.get("dkim_pending")
+                        else "Domain verified but DNS setup incomplete"
+                    )
+
+                    if selenium_result.get("dns_configured") and not selenium_result.get("force_unsafe"):
+                        domain_obj.mx_record_added = bool(selenium_result.get("mx_value"))
+                        domain_obj.spf_record_added = bool(selenium_result.get("spf_value"))
+                        domain_obj.autodiscover_added = True
+                        domain_obj.dkim_cnames_added = bool(
+                            selenium_result.get("dkim_selector1_cname")
+                            and selenium_result.get("dkim_selector2_cname")
+                        )
+                        domain_obj.dmarc_configured = bool(selenium_result.get("dmarc_configured"))
+                        domain_obj.dns_records_created = True
+                        domain_obj.mx_value = selenium_result.get("mx_value")
+                        domain_obj.spf_value = selenium_result.get("spf_value")
+                        if domain_obj.dkim_cnames_added:
+                            domain_obj.dkim_selector1 = selenium_result["dkim_selector1_cname"]
+                            domain_obj.dkim_selector1_cname = selenium_result["dkim_selector1_cname"]
+                            domain_obj.dkim_selector2 = selenium_result["dkim_selector2_cname"]
+                            domain_obj.dkim_selector2_cname = selenium_result["dkim_selector2_cname"]
                     
                     if selenium_result.get("verification_txt"):
                         domain_obj.m365_verification_txt = selenium_result["verification_txt"]
