@@ -1457,6 +1457,26 @@ def _get_exchange_dkim_targets(domain: str, admin_email: str, admin_password: st
     return targets
 
 
+def _graph_confirms_email_service(domain: str, admin_email: str, admin_password: str) -> bool:
+    """Check live Microsoft tenant truth after the Admin Center DNS wizard runs."""
+    import asyncio
+
+    from app.services.m365_setup import _read_post_wizard_domain_truth
+
+    try:
+        truth = asyncio.run(
+            _read_post_wizard_domain_truth(
+                domain,
+                None,
+                {"admin_email": admin_email, "admin_password": admin_password},
+            )
+        )
+    except Exception as exc:
+        logger.warning("[%s] Graph Email-service readback failed: %s", domain, exc)
+        return False
+    return bool(truth.get("ok"))
+
+
 def _save_screenshot(driver, domain: str, step: str):
     """Save screenshot for debugging."""
     try:
@@ -3067,6 +3087,18 @@ def setup_domain_complete_via_admin_portal(
             logger.info(f"[{domain}] SUCCESS - Setup complete on attempt {attempt + 1}!")
             result["success"] = True
             break
+
+        # Microsoft's DNS wizard can remain on its DNS page (or show a stale
+        # "no services enabled" modal) after it has already enabled Email.
+        # The DNS values above came from Microsoft and all six Cloudflare
+        # writes succeeded. Confirm the verified Email service through Graph;
+        # _save_step6_result independently checks Graph and Exchange DKIM.
+        if _graph_confirms_email_service(domain, admin_email, admin_password):
+            logger.info("[%s] Graph confirms verified Email service after wizard DNS setup", domain)
+            result["success"] = True
+            result["verified"] = True
+            result["graph_email_confirmed"] = True
+            break
         
         # Check for error messages
         if "error" in page_text or "failed" in page_text or "couldn't verify" in page_text:
@@ -3095,7 +3127,9 @@ def setup_domain_complete_via_admin_portal(
     _clear_admin_center_interrupts(driver, domain, "final setup result", recover_errors=True)
     page_text = _safe_page_text(driver).lower()
     
-    if _is_domain_setup_complete_page_text(page_text):
+    if result.get("graph_email_confirmed"):
+        logger.info("[%s] Microsoft Graph confirmed domain Email service despite stale wizard page", domain)
+    elif _is_domain_setup_complete_page_text(page_text):
         logger.info(f"[{domain}] Clicking Done button")
         try:
             btns = driver.find_elements(By.TAG_NAME, "button")

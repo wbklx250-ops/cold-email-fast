@@ -8,7 +8,10 @@ import pytest
 
 from app.services import m365_setup, objective_reconciliation
 from app.services.powershell.runner import powershell
-from app.services.selenium.admin_portal import _get_exchange_dkim_targets
+from app.services.selenium.admin_portal import (
+    _get_exchange_dkim_targets,
+    _graph_confirms_email_service,
+)
 
 
 def test_exchange_fallback_accepts_exact_new_format_targets(monkeypatch):
@@ -47,6 +50,18 @@ def test_exchange_fallback_rejects_missing_or_other_domain_targets(monkeypatch):
         "selector2-example-com._domainkey.Tenant.y-v1.dkim.mail.microsoft",
     )
     assert _get_exchange_dkim_targets("example.com", "admin@tenant", "password") is None
+
+
+def test_graph_completion_readback_requires_verified_email_service(monkeypatch):
+    readback = AsyncMock(return_value={"ok": False, "is_verified": True, "supported_services": []})
+    monkeypatch.setattr(m365_setup, "_read_post_wizard_domain_truth", readback)
+    assert not _graph_confirms_email_service("example.com", "admin@tenant", "password")
+
+    readback.return_value = {"ok": True, "is_verified": True, "supported_services": ["Email"]}
+    assert _graph_confirms_email_service("example.com", "admin@tenant", "password")
+    readback.assert_awaited_with(
+        "example.com", None, {"admin_email": "admin@tenant", "admin_password": "password"}
+    )
 
 
 class _FakeSession:
