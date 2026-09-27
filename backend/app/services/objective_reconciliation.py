@@ -631,7 +631,7 @@ async def _ensure_cloudflare_truth(
             (
                 r for r in records
                 if r.get("type") == "TXT" and _matches_name(r, "_dmarc")
-                and (r.get("content") or "").strip().lower().startswith("v=dmarc1")
+                and (r.get("content") or "").strip().strip('"').lower().startswith("v=dmarc1")
             ),
             None,
         )
