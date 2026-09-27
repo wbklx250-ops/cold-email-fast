@@ -194,7 +194,7 @@ try {{
     Import-Module ExchangeOnlineManagement -ErrorAction Stop
     Connect-ExchangeOnline -AccessToken "{access_token}" -Organization "{organization}" -ShowBanner:$false
     
-    # Check if DKIM config exists, create if not
+    # Initialize missing selectors even when an empty config already exists.
     $dkim = Get-DkimSigningConfig -Identity "{domain}" -ErrorAction SilentlyContinue
     
     if (-not $dkim) {{
@@ -571,9 +571,13 @@ try {{
     # Check if DKIM config exists, create if not
     $dkim = Get-DkimSigningConfig -Identity "{domain_name}" -ErrorAction SilentlyContinue
     
-    if (-not $dkim) {{
+    if (-not $dkim -or -not $dkim.Selector1CNAME -or -not $dkim.Selector2CNAME) {{
         Write-Host "Creating DKIM signing config..."
-        New-DkimSigningConfig -DomainName "{domain_name}" -Enabled $false -ErrorAction Stop | Out-Null
+        try {{
+            New-DkimSigningConfig -DomainName "{domain_name}" -Enabled $false -ErrorAction Stop | Out-Null
+        }} catch {{
+            if ($_.Exception.Message -notmatch "already|exist") {{ throw }}
+        }}
         Start-Sleep -Seconds 5
         $dkim = Get-DkimSigningConfig -Identity "{domain_name}" -ErrorAction Stop
     }}

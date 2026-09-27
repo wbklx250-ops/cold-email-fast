@@ -1437,15 +1437,23 @@ def _get_exchange_dkim_targets(domain: str, admin_email: str, admin_password: st
         return None
 
     targets = (selector1.strip().rstrip("."), selector2.strip().rstrip("."))
-    domain_label = domain.lower().replace(".", "-")
+    selector_suffixes = []
     for index, target in enumerate(targets, start=1):
-        expected_prefix = f"selector{index}-{domain_label}._domainkey."
-        if not target.lower().startswith(expected_prefix) or not (
+        match = re.fullmatch(
+            rf"selector{index}-([a-z0-9-]+\._domainkey\.[a-z0-9.-]+)",
+            target,
+            flags=re.IGNORECASE,
+        )
+        if not match or not (
             target.lower().endswith(".dkim.mail.microsoft")
             or target.lower().endswith(".onmicrosoft.com")
         ):
             logger.error("[%s] Exchange returned an invalid DKIM selector%d target", domain, index)
             return None
+        selector_suffixes.append(match.group(1).lower())
+    if selector_suffixes[0] != selector_suffixes[1]:
+        logger.error("[%s] Exchange returned DKIM targets for different selector roots", domain)
+        return None
     return targets
 
 
