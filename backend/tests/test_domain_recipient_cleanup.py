@@ -1,4 +1,5 @@
 from unittest.mock import AsyncMock
+import asyncio
 
 import pytest
 
@@ -237,3 +238,58 @@ async def test_exchange_failure_or_malformed_output_is_not_empty_inventory(monke
     run.return_value = SimpleNamespace(success=True, json_data={'recipients': None})
     with pytest.raises(RuntimeError, match='incomplete'):
         await cleanup.exchange_recipients('admin', 'secret')
+
+
+@pytest.mark.parametrize('fail', [False, True])
+async def test_shared_deletion_is_bounded_and_drains_before_failure(monkeypatch, fail):
+    active = 0
+    peak = 0
+    started, finished = [], []
+
+    async def delete(session, uid, *args):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        started.append(uid)
+        await asyncio.sleep(0)
+        active -= 1
+        finished.append(uid)
+        if fail and uid == '0':
+            raise RuntimeError('blocked')
+
+    monkeypatch.setattr(cleanup, 'delete_user', delete)
+    progress = {'removed': 0}
+    call = cleanup.delete_shared_users(None, [str(i) for i in range(9)], 'old.example', {'admin'}, 'admin', progress)
+    if fail:
+        with pytest.raises(RuntimeError, match='blocked'):
+            await call
+        assert started == ['0', '1', '2', '3'] and progress['removed'] == 3
+    else:
+        await call
+        assert progress['removed'] == 9
+    assert peak == 4 and active == 0 and len(finished) == len(started)
+
+
+async def test_graph_throttle_respects_retry_after_without_restarting_cleanup(monkeypatch):
+    throttle = Response(429)
+    throttle.headers = {'Retry-After': '7'}
+    session = Session([throttle, Response(200, {'id': 'user'})])
+    sleep = AsyncMock()
+    monkeypatch.setattr(cleanup.asyncio, 'sleep', sleep)
+    assert await cleanup.graph_get(session, 'users/user') == {'id': 'user'}
+    sleep.assert_awaited_once_with(7)
+
+
+async def test_delete_transient_failure_retries_same_id(monkeypatch):
+    session = Session([])
+    replies = iter([Response(503), Response(204)])
+    calls = []
+
+    def delete(url):
+        calls.append(url)
+        return next(replies)
+
+    session.delete = delete
+    monkeypatch.setattr(cleanup.asyncio, 'sleep', AsyncMock())
+    await cleanup.graph_request(session, 'delete', 'users/user', absent_ok=True)
+    assert calls == [cleanup.GRAPH_ROOT + '/users/user'] * 2

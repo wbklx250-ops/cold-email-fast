@@ -16,6 +16,14 @@ swap job, or replacement batch is created.
 5. Verify Exchange no longer references the deleted users or old domain. Only
    then run the existing verified domain removal and DNS cleanup.
 
+Domain verification uses authenticated Graph reads immediately: a 404 from the
+tenant confirms removal even while public OpenID/realm caches still resolve it.
+Pending deletions are polled with bounded backoff; timeouts and permission errors
+are never treated as success. The cleanup token is reused for verification.
+Shared mailbox deletion runs in groups of four, drains each group before moving
+on, and respects Graph throttling delays. License release still waits for all
+shared mailboxes to be verified absent from Graph and Exchange.
+
 Object IDs identify mailboxes renamed by prior force-delete attempts. Legacy DB
 records without IDs can match their original local part on the **same tenant's
 verified initial `.onmicrosoft.com` domain**. Display names and addresses on other

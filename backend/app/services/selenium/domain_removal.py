@@ -171,7 +171,7 @@ async def _graph_api_force_delete(access_token, domain_name):
                 body = await resp.text()
                 if resp.status == 404:
                     logger.info(f"[Graph API] Domain '{domain_name}' not found — already removed")
-                    return {"success": True, "error": None, "note": "Domain already removed"}
+                    return {"success": True, "verified": True, "error": None, "note": "Domain already removed"}
                 elif resp.status == 401:
                     return {"success": False, "error": "Access token expired or insufficient permissions"}
                 elif resp.status == 200:
@@ -207,7 +207,7 @@ async def _graph_api_force_delete(access_token, domain_name):
                 ) as resp:
                     body = await resp.text()
                     if resp.status in (200, 204):
-                        logger.info(f"[Graph API] forceDelete succeeded for '{domain_name}'")
+                        logger.info(f"[Graph API] forceDelete accepted for '{domain_name}'; verifying completion")
                         result = {"success": True, "error": None, "method": "forceDelete"}
                         if default_domain_reset_to:
                             result["default_domain_reset_to"] = default_domain_reset_to
@@ -349,9 +349,9 @@ async def _graph_api_verify_removed(access_token, domain_name):
         "Content-Type": "application/json"
     }
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
             async with session.get(
-                f"https://graph.microsoft.com/v1.0/domains/{domain_name}",
+                _graph_domain_url(domain_name),
                 headers=headers
             ) as resp:
                 if resp.status == 404:
@@ -382,7 +382,7 @@ def _run_async_graph_verify(token, domain_name):
         loop.close()
 
 
-def _remove_domain_tier1_graph_api(domain_name, admin_email, admin_password):
+def _remove_domain_tier1_graph_api(domain_name, admin_email, admin_password, access_token=None):
     """
     TIER 1: Remove domain via MSAL ROPC → Graph API forceDelete.
     
@@ -394,7 +394,8 @@ def _remove_domain_tier1_graph_api(domain_name, admin_email, admin_password):
     logger.info(f"[{domain_name}] TIER 1: MSAL ROPC → Graph API forceDelete")
     
     # Step 1: Get token via MSAL (no browser)
-    success, token, error = _get_access_token_via_msal(admin_email, admin_password)
+    success, token, error = ((True, access_token, None) if access_token else
+                             _get_access_token_via_msal(admin_email, admin_password))
     if not success or not token:
         logger.warning(f"[{domain_name}] TIER 1 token failed: {error}")
         return {"success": False, "error": f"MSAL token failed: {error}", "method": "tier1_msal_graph"}
@@ -412,19 +413,13 @@ def _remove_domain_tier1_graph_api(domain_name, admin_email, admin_password):
         result = _run_async_graph_delete(token, domain_name)
     
     if result.get("success"):
-        # Step 3: Verify removal
-        time.sleep(5)
-        try:
-            verified = _run_async_graph_verify(token, domain_name)
-        except Exception:
-            verified = None
-        
-        if verified is False:
-            logger.warning(f"[{domain_name}] TIER 1: Graph API reported success but domain still exists, may need propagation time")
-            time.sleep(10)
+        # Check immediately. The common verifier polls only when still pending.
+        if not result.get("verified"):
+            result["verified"] = _run_async_graph_verify(token, domain_name) is True
         
         result["method"] = "tier1_msal_graph"
-        logger.info(f"[{domain_name}] TIER 1 SUCCEEDED")
+        logger.info("[%s] TIER 1 removal %s", domain_name,
+                    "verified" if result.get("verified") else "accepted; awaiting confirmation")
         return result
     
     result["method"] = "tier1_msal_graph"
@@ -1182,127 +1177,40 @@ def remove_domain_from_m365(domain_name, admin_email, admin_password, totp_secre
 # EXTERNAL VERIFICATION: Confirm domain is actually removed
 # =====================================================================
 
-def _verify_domain_actually_removed(domain_name, admin_email=None, admin_password=None, max_wait=90):
-    """
-    Externally verify a domain is no longer attached to any M365 tenant.
-    Uses the same methods as saas-dance.deno.dev — pure HTTP, no browser.
-    
-    Checks:
-    1. OpenID Connect discovery endpoint → does domain resolve to a tenant?
-    2. User Realm discovery → is NameSpaceType still Managed/Federated?
-    3. Graph API (if we have credentials) → does domain still exist?
-    
-    Retries with propagation waits up to max_wait seconds.
-    
-    Returns: {"verified_removed": bool, "checks": dict, "error": str|None}
-    """
-    import requests
-    
-    logger.info(f"[{domain_name}] VERIFICATION: Checking if domain is actually removed from M365...")
-    
-    # Wait for M365 propagation before first check
-    logger.info(f"[{domain_name}] Waiting 20s for M365 propagation...")
-    time.sleep(20)
-    
-    checks_done = {}
-    elapsed = 20
-    
-    for attempt in range(3):
-        if attempt > 0:
-            wait = min(30, max_wait - elapsed)
-            if wait <= 0:
-                break
-            logger.info(f"[{domain_name}] VERIFICATION retry {attempt}: waiting {wait}s...")
-            time.sleep(wait)
-            elapsed += wait
-        
-        still_in_tenant = False
-        
-        # CHECK 1: User Realm discovery (most reliable for "is domain in a tenant?")
-        try:
-            realm_url = f"https://login.microsoftonline.com/getuserrealm.srf?login=test@{domain_name}&json=1"
-            resp = requests.get(realm_url, timeout=15)
-            if resp.status_code == 200:
-                realm_data = resp.json()
-                ns_type = realm_data.get("NameSpaceType", "").lower()
-                tenant_brand = realm_data.get("FederationBrandName", "")
-                
-                checks_done["user_realm"] = {
-                    "namespace_type": ns_type,
-                    "federation_brand": tenant_brand,
-                    "raw": realm_data
-                }
-                
-                if ns_type in ("managed", "federated"):
-                    still_in_tenant = True
-                    logger.warning(f"[{domain_name}] User Realm check: NameSpaceType={ns_type} — domain STILL in a tenant (brand: {tenant_brand})")
-                else:
-                    logger.info(f"[{domain_name}] User Realm check: NameSpaceType={ns_type} — domain appears FREE")
-            else:
-                checks_done["user_realm"] = {"error": f"HTTP {resp.status_code}"}
-        except Exception as e:
-            checks_done["user_realm"] = {"error": str(e)}
-            logger.warning(f"[{domain_name}] User Realm check error: {e}")
-        
-        # CHECK 2: OpenID Connect discovery
-        try:
-            oidc_url = f"https://login.microsoftonline.com/{domain_name}/.well-known/openid-configuration"
-            resp = requests.get(oidc_url, timeout=15)
-            if resp.status_code == 200:
-                oidc_data = resp.json()
-                tenant_id = oidc_data.get("issuer", "").split("/")[-2] if "issuer" in oidc_data else None
-                
-                # A domain not in a tenant returns a generic "common" tenant or error
-                if tenant_id and tenant_id not in ("common", "{tenantid}", "9188040d-6c67-4c5b-b112-36a304b66dad"):
-                    still_in_tenant = True
-                    checks_done["openid"] = {"tenant_id": tenant_id, "in_tenant": True}
-                    logger.warning(f"[{domain_name}] OpenID check: resolves to tenant {tenant_id}")
-                else:
-                    checks_done["openid"] = {"tenant_id": tenant_id, "in_tenant": False}
-                    logger.info(f"[{domain_name}] OpenID check: no specific tenant found")
-            elif resp.status_code == 400:
-                checks_done["openid"] = {"in_tenant": False, "note": "400 — domain not recognized"}
-                logger.info(f"[{domain_name}] OpenID check: 400 — domain not in any tenant")
-            else:
-                checks_done["openid"] = {"error": f"HTTP {resp.status_code}"}
-        except Exception as e:
-            checks_done["openid"] = {"error": str(e)}
-            logger.warning(f"[{domain_name}] OpenID check error: {e}")
-        
-        # CHECK 3: Graph API (if we have credentials and can get a token)
-        if admin_email and admin_password:
-            try:
-                token_ok, token, _ = _get_access_token_via_msal(admin_email, admin_password)
-                if token_ok and token:
-                    verified = _run_async_graph_verify(token, domain_name)
-                    if verified is True:
-                        checks_done["graph_api"] = {"domain_exists": False, "removed": True}
-                        logger.info(f"[{domain_name}] Graph API check: domain NOT found (404) — confirmed removed")
-                    elif verified is False:
-                        still_in_tenant = True
-                        checks_done["graph_api"] = {"domain_exists": True, "removed": False}
-                        logger.warning(f"[{domain_name}] Graph API check: domain STILL EXISTS in tenant")
-                    else:
-                        checks_done["graph_api"] = {"domain_exists": None, "note": "Inconclusive"}
-                else:
-                    checks_done["graph_api"] = {"skipped": True, "note": "Could not get token"}
-            except Exception as e:
-                checks_done["graph_api"] = {"error": str(e)}
-        
-        # VERDICT
-        if not still_in_tenant:
-            logger.info(f"[{domain_name}] ✓ VERIFIED: Domain is confirmed removed from M365 tenant")
-            return {"verified_removed": True, "checks": checks_done, "error": None}
-        
-        logger.warning(f"[{domain_name}] Domain still in tenant on attempt {attempt + 1}")
-    
-    # After all retries, domain is still in a tenant
-    logger.error(f"[{domain_name}] ✗ VERIFICATION FAILED: Domain is STILL attached to a tenant after {elapsed}s of waiting")
-    return {
-        "verified_removed": False,
-        "checks": checks_done,
-        "error": f"Domain still attached to tenant after {elapsed}s of verification checks"
-    }
+def _verify_domain_actually_removed(domain_name, admin_email=None, admin_password=None,
+                                    max_wait=90, access_token=None):
+    """Verify removal from the authenticated tenant, independent of discovery caches."""
+    checks = {}
+    token = access_token
+    if not token and admin_email and admin_password:
+        ok, token, _ = _get_access_token_via_msal(admin_email, admin_password)
+        if not ok:
+            token = None
+    if not token:
+        return {"verified_removed": False, "checks": checks,
+                "error": "Could not authenticate authoritative domain verification"}
+
+    deadline = time.monotonic() + max(0, max_wait)
+    attempt = 0
+    inconclusive = 0
+    while True:
+        removed = _run_async_graph_verify(token, domain_name)
+        checks["graph_api"] = {"domain_exists": None if removed is None else not removed,
+                               "removed": removed}
+        if removed is True:
+            logger.info("[%s] VERIFIED REMOVED: authenticated Graph returned 404", domain_name)
+            return {"verified_removed": True, "checks": checks, "error": None}
+        inconclusive = inconclusive + 1 if removed is None else 0
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or inconclusive >= 3:
+            break
+        wait = min(2 ** min(attempt + 1, 4), remaining)
+        logger.info("[%s] Graph removal not yet confirmed; checking again in %ss", domain_name, wait)
+        time.sleep(wait)
+        attempt += 1
+    error = ("Graph could not confirm domain removal; authentication, permissions or service may be unavailable"
+             if removed is None else "Domain still exists in the tenant after verification timeout")
+    return {"verified_removed": False, "checks": checks, "error": error}
 
 
 # =====================================================================
@@ -1336,111 +1244,53 @@ def remove_domain_robust(domain_name, admin_email, admin_password, totp_secret=N
             "needs_retry": True,
         }
     result = _remove_domain_after_license_cleanup(
-        domain_name, admin_email, admin_password, totp_secret, headless
+        domain_name, admin_email, admin_password, totp_secret, headless, access_token=token
     )
     result["recipient_cleanup"] = cleanup
     result["license_cleanup"] = cleanup.get("license_cleanup", {})
     return result
 
 
-def _remove_domain_after_license_cleanup(domain_name, admin_email, admin_password, totp_secret=None, headless=True):
-    """
-    Bulletproof 4-tier domain removal with MANDATORY external verification.
-    
-    Tries each removal method in order, then VERIFIES the domain is actually gone
-    using external Microsoft discovery endpoints (same as saas-dance.deno.dev).
-    
-    Only reports success if external verification confirms the domain is free.
-    
-    Returns: {"success": bool, "error": str|None, "method": str, "attempts": list, "verification": dict}
-    """
+def _remove_domain_after_license_cleanup(domain_name, admin_email, admin_password,
+                                         totp_secret=None, headless=True, access_token=None):
+    """Try existing removal methods until authenticated Graph confirms absence."""
     attempts = []
-    tier_succeeded = False
-    success_method = None
-    
     tiers = [
-        ("TIER 1", "MSAL → Graph API", "msal_graph",
-         lambda: _remove_domain_tier1_graph_api(domain_name, admin_email, admin_password)),
-        ("TIER 2", "PowerShell MSOnline", "powershell",
-         lambda: _remove_domain_tier2_powershell(domain_name, admin_email, admin_password)),
-        ("TIER 3", "Selenium → Graph API", "selenium_graph",
-         lambda: _remove_domain_tier3_selenium_graph(domain_name, admin_email, admin_password, totp_secret, headless=headless)),
-        ("TIER 4", "Selenium Admin Portal", "selenium_portal",
-         lambda: remove_domain_from_m365(domain_name, admin_email, admin_password, totp_secret, headless=headless)),
+        ("TIER 1", "msal_graph", lambda: _remove_domain_tier1_graph_api(
+            domain_name, admin_email, admin_password, access_token=access_token)),
+        ("TIER 2", "powershell", lambda: _remove_domain_tier2_powershell(
+            domain_name, admin_email, admin_password)),
+        ("TIER 3", "selenium_graph", lambda: _remove_domain_tier3_selenium_graph(
+            domain_name, admin_email, admin_password, totp_secret, headless=headless)),
+        ("TIER 4", "selenium_portal", lambda: remove_domain_from_m365(
+            domain_name, admin_email, admin_password, totp_secret, headless=headless)),
     ]
-    
-    logger.info(f"[{domain_name}] === ROBUST REMOVAL: Starting 4-tier approach with verification ===")
-    
-    for tier_name, tier_desc, tier_method, tier_func in tiers:
+    for tier_name, method, run in tiers:
         try:
-            logger.info(f"[{domain_name}] Trying {tier_name} ({tier_desc})...")
-            result = tier_func()
-            attempts.append({"tier": tier_name, "method": tier_method, "result": result})
-            
-            if result.get("success"):
-                logger.info(f"[{domain_name}] {tier_name} ({tier_desc}) reported success — proceeding to VERIFICATION")
-                tier_succeeded = True
-                success_method = result.get("method", tier_method)
-                break
-            else:
-                logger.warning(f"[{domain_name}] {tier_name} failed: {result.get('error', 'unknown')}")
-        except Exception as e:
-            logger.warning(f"[{domain_name}] {tier_name} exception: {e}")
-            attempts.append({"tier": tier_name, "method": tier_method, "result": {"success": False, "error": str(e)}})
-    
-    # ===== MANDATORY VERIFICATION =====
-    # Even if a tier reported success, we VERIFY externally that the domain is actually gone.
-    # This prevents false positives where the API accepted the request but didn't complete it.
-    
-    if tier_succeeded:
-        logger.info(f"[{domain_name}] === VERIFICATION PHASE: Confirming domain is actually removed ===")
-        verification = _verify_domain_actually_removed(
-            domain_name, admin_email=admin_email, admin_password=admin_password, max_wait=90
-        )
-        
-        if verification["verified_removed"]:
-            logger.info(f"[{domain_name}] ✓✓ VERIFIED REMOVED — {success_method} + external verification confirmed")
-            return {
-                "success": True,
-                "error": None,
-                "method": success_method,
-                "attempts": attempts,
-                "verification": verification,
-                "verified": True,
-            }
-        else:
-            # Tier said success but domain is STILL IN TENANT
-            logger.error(
-                f"[{domain_name}] ✗ VERIFICATION FAILED — {success_method} reported success but domain "
-                f"is STILL attached to a tenant. Checks: {verification.get('checks', {})}"
-            )
-            return {
-                "success": False,
-                "error": f"Removal method ({success_method}) reported success but external verification "
-                         f"shows domain is still in a tenant: {verification.get('error', 'still attached')}",
-                "method": success_method,
-                "attempts": attempts,
-                "verification": verification,
-                "verified": False,
-                "needs_retry": True,
-            }
-    
-    # ===== ALL 4 TIERS FAILED =====
-    last_error = attempts[-1]["result"].get("error", "Unknown error") if attempts else "No attempts made"
-    tier_summary = ", ".join(
-        f"{a['tier']}:{a['result'].get('error', 'failed')[:50]}" for a in attempts
-    )
-    logger.error(f"[{domain_name}] ✗ ALL 4 TIERS FAILED: {tier_summary}")
-    
-    return {
-        "success": False,
-        "error": f"All 4 removal tiers failed. Last error: {last_error}",
-        "method": "none",
-        "attempts": attempts,
-        "verification": None,
-        "verified": False,
-        "needs_retry": True,
-    }
+            logger.info("[%s] Trying %s (%s)", domain_name, tier_name, method)
+            result = run()
+            attempt = {"tier": tier_name, "method": method, "result": result}
+            attempts.append(attempt)
+            if not result.get("success"):
+                continue
+            verification = ({"verified_removed": True, "error": None,
+                             "checks": {"graph_api": {"domain_exists": False, "removed": True}}}
+                            if result.get("verified") else _verify_domain_actually_removed(
+                                domain_name, admin_email, admin_password, access_token=access_token))
+            attempt["verification"] = verification
+            if verification["verified_removed"]:
+                logger.info("[%s] VERIFIED REMOVED via %s", domain_name, method)
+                return {"success": True, "verified": True, "error": None,
+                        "method": result.get("method", method), "attempts": attempts,
+                        "verification": verification}
+            attempt["result"] = {**result, "success": False, "error": verification["error"]}
+            logger.warning("[%s] %s did not complete removal; trying next method", domain_name, tier_name)
+        except Exception as exc:
+            attempts.append({"tier": tier_name, "method": method,
+                             "result": {"success": False, "error": str(exc)}})
+    error = attempts[-1]["result"].get("error") or "No removal method confirmed deletion"
+    return {"success": False, "verified": False, "error": error, "method": "none",
+            "attempts": attempts, "verification": None, "needs_retry": True}
 
 
 # =====================================================================

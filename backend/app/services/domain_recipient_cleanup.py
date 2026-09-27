@@ -4,6 +4,8 @@ import asyncio
 import base64
 import json
 import logging
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from urllib.parse import quote
 
 import aiohttp
@@ -158,13 +160,34 @@ def recover_mailbox_ids(recipients, mailbox_records, domain, initial_domain):
     return ids
 
 
+def retry_delay(headers, attempt):
+    value = headers.get('Retry-After', '')
+    if value.isdigit():
+        return int(value)
+    try:
+        return max(0, (parsedate_to_datetime(value) - datetime.now(timezone.utc)).total_seconds())
+    except (TypeError, ValueError, OverflowError):
+        return 2 ** attempt
+
+
+async def graph_request(session, method, path, *, absent_ok=False):
+    for attempt in range(3):
+        async with getattr(session, method)(f"{GRAPH_ROOT}/{path}") as response:
+            if absent_ok and response.status == 404:
+                return None
+            if method == 'get' and response.status == 200:
+                return await response.json()
+            if method == 'delete' and response.status == 204:
+                return None
+            if response.status not in (429, 500, 502, 503, 504) or attempt == 2:
+                raise RuntimeError(f"Graph recipient {method} failed: HTTP {response.status}")
+            delay = retry_delay(getattr(response, 'headers', {}), attempt)
+        logger.info('Graph recipient %s temporarily unavailable; retrying in %ss', method, delay)
+        await asyncio.sleep(delay)
+
+
 async def graph_get(session, path, *, absent_ok=False):
-    async with session.get(f"{GRAPH_ROOT}/{path}") as response:
-        if absent_ok and response.status == 404:
-            return None
-        if response.status != 200:
-            raise RuntimeError(f"Recipient discovery/verification failed: HTTP {response.status}")
-        return await response.json()
+    return await graph_request(session, 'get', path, absent_ok=absent_ok)
 
 
 async def delete_user(session, uid, domain, protected_ids, admin_email):
@@ -175,15 +198,31 @@ async def delete_user(session, uid, domain, protected_ids, admin_email):
     check_user(user, domain, protected_ids, admin_email)
     if user.get("assignedLicenses"):
         raise RuntimeError("Refusing to delete a user whose license release has not been verified")
-    async with session.delete(f"{GRAPH_ROOT}/{path}") as response:
-        if response.status not in (204, 404):
-            raise RuntimeError(f"User deletion failed: HTTP {response.status}")
+    await graph_request(session, 'delete', path, absent_ok=True)
     for attempt in range(6):
         if await graph_get(session, f"{path}?$select=id", absent_ok=True) is None:
             return
         if attempt < 5:
             await asyncio.sleep(5)
     raise RuntimeError("Deleted user is still active in Microsoft; retry after propagation")
+
+
+async def delete_shared_users(session, ids, domain, protected_ids, admin_email, progress):
+    # Bound concurrency to avoid a burst of requests across a 100-mailbox tenant.
+    # Drain the whole group on error before proceeding or returning to the caller.
+    for offset in range(0, len(ids), 4):
+        results = await asyncio.gather(*(
+            delete_user(session, uid, domain, protected_ids, admin_email)
+            for uid in ids[offset:offset + 4]
+        ), return_exceptions=True)
+        failures = []
+        for outcome in results:
+            if isinstance(outcome, BaseException):
+                failures.append(outcome)
+            else:
+                progress['removed'] += 1
+        if failures:
+            raise failures[0]
 
 
 async def verify_exchange_absent(ids, domain, admin_email, admin_password, *, final=False):
@@ -233,9 +272,8 @@ async def cleanup_domain_recipients(access_token, domain_name, admin_email, admi
             shared, licensed = plan_cleanup(users, recipients, domain, licensed_user_id,
                                             mailbox_ids, protected, admin_email)
             logger.info("[%s] Recipient cleanup: %d shared mailboxes, %d application users", domain, len(shared), len(licensed))
-            for uid in shared:
-                await delete_user(session, uid, domain, protected, admin_email)
-                result["shared_mailboxes"]["removed"] += 1
+            await delete_shared_users(session, shared, domain, protected, admin_email,
+                                      result['shared_mailboxes'])
             if shared:
                 await verify_exchange_absent(set(shared), domain, admin_email, admin_password)
             result["shared_mailboxes"]["success"] = True
