@@ -90,6 +90,7 @@ def _step5_incomplete_domain_filter():
 
 def _step5_ready_domain_filters():
     return (
+        Domain.step5_skipped.is_not(True),
         Domain.step5_complete == True,
         Domain.domain_verified_in_m365 == True,
         Domain.dkim_enabled == True,
@@ -677,6 +678,40 @@ class SkipDomainsRequest(BaseModel):
     domain_names: Optional[List[str]] = None  # Specific domains to skip by name
     skip_all_failed: bool = False  # Or skip ALL failed domains for this step
     reason: str = "Cannot be released from old tenant"
+
+
+class UnskipDomainsRequest(BaseModel):
+    domain_names: List[str]
+
+
+@router.post("/{batch_id}/unskip-domains")
+async def unskip_domains(
+    batch_id: UUID,
+    request: UnskipDomainsRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Reselect named domains for M365 setup without changing other skipped rows."""
+    batch = await db.get(SetupBatch, batch_id)
+    if not batch:
+        raise HTTPException(404, "Batch not found")
+    if batch.pipeline_status == "running":
+        raise HTTPException(409, "Pause the pipeline before changing selected domains")
+    names = {name.strip().lower() for name in request.domain_names if name.strip()}
+    if not names:
+        raise HTTPException(400, "Provide at least one domain name")
+    domains = (await db.execute(select(Domain).where(
+        Domain.batch_id == batch_id, Domain.name.in_(names)
+    ))).scalars().all()
+    found = {domain.name.lower() for domain in domains}
+    if found != names:
+        raise HTTPException(404, f"Domains not in batch: {', '.join(sorted(names - found))}")
+    for domain in domains:
+        domain.step5_skipped = False
+        domain.step5_retry_count = 0
+        if (domain.error_message or "").startswith("SKIPPED:"):
+            domain.error_message = None
+    await db.commit()
+    return {"success": True, "reselected": sorted(found)}
 
 
 @router.post("/{batch_id}/skip-domains")
@@ -1527,7 +1562,7 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                 status="info", message=f"Resume requested at step {requested_step}; recovering from step {start_from_step}: {blocker}")
             # A deliberate recovery gets a fresh retry budget without claiming success.
             async with SessionLocal() as db:
-                await db.execute(update(Domain).where(Domain.batch_id == batch_id).values(step5_retry_count=0, step5_skipped=False))
+                await db.execute(update(Domain).where(Domain.batch_id == batch_id).values(step5_retry_count=0))
                 await db.execute(update(Tenant).where(Tenant.batch_id == batch_id).values(
                     step4_retry_count=0, step6_retry_count=0, step7_retry_count=0))
                 await db.commit()
@@ -2604,9 +2639,11 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
 
             from app.services.batch_reconciliation import reconcile_batch
 
-            recon_summary = await reconcile_batch(batch_id, auto_fix=True)
-            _, expected_tenants = await load_batch_state(batch_id)
-            recon_ok = reconciliation_complete(recon_summary, len(expected_tenants))
+            recon_summary = await reconcile_batch(batch_id, auto_fix=True, exclude_skipped=True)
+            selected_domains, _ = await load_batch_state(batch_id)
+            expected_count = len({d.tenant_id for d in selected_domains
+                                  if not d.step5_skipped and not d.step6_skipped})
+            recon_ok = reconciliation_complete(recon_summary, expected_count)
 
             if job_id in pipeline_jobs:
                 pipeline_jobs[job_id]["reconciliation"] = recon_summary
@@ -2644,7 +2681,7 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
             if not recon_ok:
                 message = (
                     "Reconciliation incomplete: "
-                    f"{reconciliation_unfixable} failed checks; all {len(expected_tenants)} tenants must be verified without errors"
+                    f"{reconciliation_unfixable} failed checks; all {expected_count} selected tenants must be verified without errors"
                 )
                 raise PipelineBlocked(11, message)
           except PipelineBlocked:

@@ -26,6 +26,7 @@ from sqlalchemy import select
 
 from app.db.session import SessionLocal as async_session_factory
 from app.models.tenant import Tenant
+from app.models.domain import Domain
 
 # Graph-first SD verify/repair. This import is cheap (httpx).
 from app.services.sd_graph import verify_or_repair_sd
@@ -85,14 +86,16 @@ def _tenant_token_domain(tenant: Tenant) -> str:
     return getattr(tenant, "custom_domain", None) or getattr(tenant, "name", "") or ""
 
 
-async def _load_batch_tenants(batch_id) -> List[Tenant]:
-    """Load the whole batch so incomplete tenants cannot disappear from checks."""
+async def _load_batch_tenants(batch_id, exclude_skipped: bool = False) -> List[Tenant]:
+    """Load all tenants, or those selected for mailbox setup in the pipeline."""
     async with async_session_factory() as db:
-        res = await db.execute(
-            select(Tenant).where(
-                Tenant.batch_id == batch_id,
-            )
-        )
+        query = select(Tenant).where(Tenant.batch_id == batch_id)
+        if exclude_skipped:
+            query = (query.join(Domain, Domain.tenant_id == Tenant.id)
+                     .where(Domain.batch_id == batch_id,
+                            Domain.step5_skipped.is_not(True),
+                            Domain.step6_skipped.is_not(True)).distinct())
+        res = await db.execute(query)
         return list(res.scalars().all())
 
 
@@ -349,7 +352,7 @@ async def _reconcile_smtp_for_tenant(
         t_result["smtp"]["error"] = str(e)
 
 
-async def reconcile_batch(batch_id, auto_fix: bool = True) -> Dict:
+async def reconcile_batch(batch_id, auto_fix: bool = True, exclude_skipped: bool = False) -> Dict:
     """
     Reconcile SD + SMTP state for every tenant in a batch.
 
@@ -369,7 +372,8 @@ async def reconcile_batch(batch_id, auto_fix: bool = True) -> Dict:
     )
 
     try:
-        tenants = await _load_batch_tenants(batch_id)
+        tenants = (await _load_batch_tenants(batch_id, exclude_skipped=True)
+                   if exclude_skipped else await _load_batch_tenants(batch_id))
         summary["total_tenants"] = len(tenants)
 
         if not tenants:

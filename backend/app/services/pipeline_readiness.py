@@ -1,4 +1,4 @@
-"""Prerequisite checks must include blocked items, not just eligible workers."""
+"""Prerequisite checks for the selected domains in a batch."""
 
 from datetime import datetime, timezone
 
@@ -26,7 +26,7 @@ def m365_ready(domain):
 
 
 def first_blocker(domains, tenants, before_step=12):
-    """Inspect the entire batch; failed/skipped/unlinked rows remain unfinished."""
+    """Check all early prerequisites and the domains selected for later steps."""
     if not domains or not tenants:
         return PipelineBlocked(1, "Batch requires at least one domain and one tenant")
     tenant_by_id = {t.id: t for t in tenants}
@@ -36,15 +36,23 @@ def first_blocker(domains, tenants, before_step=12):
     for tenant in tenants:
         if not any(d.tenant_id == tenant.id for d in domains):
             return PipelineBlocked(1, f"Tenant {tenant.id} has no domain in this batch")
+    m365_domains = [d for d in domains if not d.step5_skipped]
+    mailbox_domains = [d for d in m365_domains if not d.step6_skipped]
+    mailbox_tenant_ids = {d.tenant_id for d in mailbox_domains}
+    mailbox_tenants = [t for t in tenants if t.id in mailbox_tenant_ids]
+    if before_step > 6 and not m365_domains:
+        return PipelineBlocked(6, "No domains remain selected for M365 setup")
+    if before_step > 7 and not mailbox_domains:
+        return PipelineBlocked(7, "No domains remain selected for mailbox setup")
     checks = (
         (1, domains, lambda d: bool(d.cloudflare_zone_id), "Cloudflare zone is missing"),
         (3, domains, lambda d: d.cloudflare_zone_status == "active" and bool(d.ns_propagated_at),
          "nameservers are not verified against an active Cloudflare zone"),
         (5, tenants, lambda t: t.first_login_completed, "first login is incomplete"),
-        (6, domains, m365_ready, "M365 verification, DKIM or email DNS is incomplete"),
-        (7, domains, lambda d: d.step6_complete, "mailbox creation/delegation is incomplete"),
-        (7, tenants, lambda t: t.step6_complete, "tenant mailbox setup is incomplete"),
-        (8, tenants, lambda t: t.step7_smtp_auth_enabled, "SMTP authentication is incomplete"),
+        (6, m365_domains, m365_ready, "M365 verification, DKIM or email DNS is incomplete"),
+        (7, mailbox_domains, lambda d: d.step6_complete, "mailbox creation/delegation is incomplete"),
+        (7, mailbox_tenants, lambda t: t.step6_complete, "tenant mailbox setup is incomplete"),
+        (8, mailbox_tenants, lambda t: t.step7_smtp_auth_enabled, "SMTP authentication is incomplete"),
     )
     for step, items, ready, reason in checks:
         if step >= before_step:
@@ -120,7 +128,7 @@ async def sync_manual_m365_setup(batch_id):
     )
     domains, tenants = await load_batch_state(batch_id)
     logged_in = {t.id for t in tenants if t.first_login_completed}
-    incomplete = {d.id for d in domains if not m365_ready(d)
+    incomplete = {d.id for d in domains if not d.step5_skipped and not m365_ready(d)
                   and d.cloudflare_zone_status == "active" and d.tenant_id in logged_in}
     if not incomplete:
         return

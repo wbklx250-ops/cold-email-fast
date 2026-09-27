@@ -42,9 +42,17 @@ def test_95_percent_is_not_complete():
     assert readiness.first_blocker(domains, tenants).step == 3
 
 
-def test_skipped_failure_stays_incomplete():
-    domains, tenants = ready_batch()
+def test_skipped_failure_does_not_block_selected_domains():
+    domains, tenants = ready_batch(2)
     domains[0].step5_complete = False
+    domains[0].step5_skipped = True
+    tenants[0].step6_complete = False
+    tenants[0].step7_smtp_auth_enabled = False
+    assert readiness.first_blocker(domains, tenants) is None
+
+
+def test_all_skipped_domains_cannot_complete():
+    domains, tenants = ready_batch()
     domains[0].step5_skipped = True
     assert readiness.first_blocker(domains, tenants).step == 6
 
