@@ -422,6 +422,11 @@ _MFA_SWITCHES = (
     (By.XPATH, "//*[self::a or self::button][contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'different verification')]"),
 )
 
+_SECURITY_SETUP_LATER = (
+    (By.XPATH, "//*[self::a or self::button or @role='button'][translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')='not now']"),
+    (By.ID, "idBtn_Back"),
+)
+
 _TOTP_METHODS = (
     (By.CSS_SELECTOR, "[data-value='PhoneAppOTP']"),
     (By.XPATH, "//*[self::a or self::button or @role='button' or @role='option'][contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'verification code')]"),
@@ -461,6 +466,17 @@ def _finish_admin_login(driver, tenant_name: str, totp_secret: Optional[str], ti
         page_text = driver.find_element(By.TAG_NAME, "body").text.lower()
         host = urlsplit(current_url).hostname
         if host == "login.microsoftonline.com":
+            # Microsoft may interrupt an already enrolled account with an
+            # optional invitation to add another verification method.
+            if "not now" in page_text and any(marker in page_text for marker in (
+                "let's keep your account secure", "set up another way to verify",
+            )):
+                later = _visible_element(driver, _SECURITY_SETUP_LATER)
+                if later:
+                    later.click()
+                    logger.info("[%s] Skipped optional security method setup", tenant_name)
+                    time.sleep(2)
+                    continue
             if any(marker in page_text for marker in (
                 "password is incorrect", "account or password is incorrect",
                 "account has been locked", "update your password", "change password",

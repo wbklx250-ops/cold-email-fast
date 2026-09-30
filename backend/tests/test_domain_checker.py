@@ -127,9 +127,16 @@ def test_delayed_mfa_is_submitted_before_accepting_admin_center(monkeypatch):
     assert submitted
 
 
-def test_push_mfa_switches_to_authenticator_code(monkeypatch):
-    driver = make_driver(url="https://login.microsoftonline.com/common/SAS/ProcessAuth", body="Approve sign-in request")
-    stage = {"value": "push"}
+def test_optional_security_setup_then_push_mfa_switches_to_code(monkeypatch):
+    driver = make_driver(url="https://login.microsoftonline.com/common/SAS/ProcessAuth")
+    stage = {"value": "security"}
+    later = Mock()
+    later.is_displayed.return_value = True
+    later.click.side_effect = lambda: stage.update(value="push")
+    driver.find_element.side_effect = lambda *_: Mock(text=(
+        "Let's keep your account secure. We'll help you set up another way to verify it's you. Not now"
+        if stage["value"] == "security" else "Approve sign-in request"
+    ))
     switch = Mock()
     switch.is_displayed.return_value = True
     switch.click.side_effect = lambda: stage.update(value="methods")
@@ -147,6 +154,8 @@ def test_push_mfa_switches_to_authenticator_code(monkeypatch):
     code_input.send_keys.side_effect = send_keys
 
     def find_elements(by, selector):
+        if stage["value"] == "security" and (by, selector) == (By.ID, "idBtn_Back"):
+            return [later]
         if stage["value"] == "push" and (by, selector) == (By.ID, "signInAnotherWay"):
             return [switch]
         if stage["value"] == "methods" and (by, selector) == (By.CSS_SELECTOR, "[data-value='PhoneAppOTP']"):
@@ -162,6 +171,7 @@ def test_push_mfa_switches_to_authenticator_code(monkeypatch):
     monkeypatch.setattr(checker.time, "time", lambda: 60)
     assert checker._finish_admin_login(driver, "one", "JBSWY3DPEHPK3PXP")
     assert stage["value"] == "admin"
+    later.click.assert_called_once()
     switch.click.assert_called_once()
     method.click.assert_called_once()
 
