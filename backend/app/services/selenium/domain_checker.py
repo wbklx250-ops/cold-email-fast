@@ -24,7 +24,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 
 from app.services.selenium.browser import create_driver, cleanup_driver, kill_all_browsers
 
@@ -83,6 +83,10 @@ class TenantCheckResult:
             "unverified_count": len(unverified),
             "custom_domain_count": len(custom),
         }
+
+
+class TransientLoginError(RuntimeError):
+    """The login flow stalled without a definitive credential or setup error."""
 
 
 # =============================================================================
@@ -273,10 +277,10 @@ def check_tenant_domains(
 
             return result  # Success — return immediately
 
-        except (WebDriverException, ConnectionError, OSError) as e:
+        except (WebDriverException, ConnectionError, OSError, TransientLoginError) as e:
             error_msg = str(e)[:200]
             last_error = error_msg
-            logger.warning(f"[{tenant_name}] Attempt {attempt}/{_max_retries} failed (browser error): {error_msg}")
+            logger.warning(f"[{tenant_name}] Attempt {attempt}/{_max_retries} failed (transient): {error_msg}")
         except Exception as e:
             error_msg = str(e)[:200]
             last_error = error_msg
@@ -294,14 +298,11 @@ def check_tenant_domains(
                 except Exception:
                     pass
 
-        # Clean up zombie Chrome processes before retry
+        # cleanup_driver closed this worker's browser. Other tenants in the
+        # chunk may still be logged in, so never kill their browser processes.
         if attempt < _max_retries:
-            try:
-                kill_all_browsers()
-            except Exception:
-                pass
-            logger.info(f"[{tenant_name}] Retrying in 3s...")
-            time.sleep(3)
+            logger.info(f"[{tenant_name}] Retrying in 5s with a fresh browser...")
+            time.sleep(5)
 
     # All retries exhausted
     logger.error(f"[{tenant_name}] All {_max_retries} attempts failed: {last_error}")
@@ -386,60 +387,8 @@ def _do_login(
         logger.warning(f"[{tenant_name}] Password change required — needs first login")
         return False
 
-    # --- HANDLE MFA ---
-    try:
-        totp_input = WebDriverWait(driver, 8).until(
-            EC.presence_of_element_located((By.NAME, "otc"))
-        )
-        if not totp_secret:
-            logger.warning(f"[{tenant_name}] MFA required but no TOTP secret provided")
-            return False
-
-        totp = pyotp.TOTP(totp_secret)
-        code = totp.now()
-        logger.info(f"[{tenant_name}] MFA detected, entering TOTP code")
-        totp_input.clear()
-        totp_input.send_keys(code)
-        totp_input.send_keys(Keys.RETURN)
-        time.sleep(2.5)
-    except TimeoutException:
-        # No MFA prompt — either not required or different flow
-        logger.info(f"[{tenant_name}] No MFA prompt detected")
-
-        # Check if we're on MFA enrollment screen (fresh tenant)
-        page_text = driver.find_element(By.TAG_NAME, "body").text.lower()
-        if "more information required" in page_text or "set up your account" in page_text:
-            logger.warning(f"[{tenant_name}] MFA enrollment required — needs first login")
-            return False
-
-    # --- HANDLE "STAY SIGNED IN?" ---
-    time.sleep(1.5)
-    try:
-        yes_btn = driver.find_element(By.ID, "idSIButton9")
-        if yes_btn.is_displayed():
-            yes_btn.click()
-            logger.info(f"[{tenant_name}] Clicked 'Yes' on stay signed in")
-            time.sleep(1.5)
-    except (NoSuchElementException, Exception):
-        pass
-    try:
-        no_btn = driver.find_element(By.ID, "idBtn_Back")
-        if no_btn.is_displayed():
-            no_btn.click()
-            logger.info(f"[{tenant_name}] Clicked 'No' on stay signed in")
-            time.sleep(1.5)
-    except (NoSuchElementException, Exception):
-        pass
-
-    # --- DISMISS MFA SETUP INTERRUPT ---
-    # admin.cloud.microsoft/mfasetup?registered=false shows after every login
-    # even when TOTP is already enrolled via SSPR. We always click "Skip for now".
-    try:
-        from app.services.selenium.admin_portal import dismiss_mfa_setup_interrupt
-        dismiss_mfa_setup_interrupt(driver, tenant_name)
-    except Exception as e:
-        logger.warning(f"[{tenant_name}] MFA setup interrupt dismiss raised: {e}")
-
+    # Microsoft may show a push challenge before offering the TOTP input, and
+    # the challenge can arrive well after the password form disappears.
     return _finish_admin_login(driver, tenant_name, totp_secret)
 
 
@@ -451,14 +400,45 @@ def _is_admin_url(url: str) -> bool:
     }
 
 
+def _visible_element(driver, selectors):
+    """Find an actionable element without accepting a hidden MFA input."""
+    for by, selector in selectors:
+        for element in driver.find_elements(by, selector):
+            if element.is_displayed():
+                return element
+    return None
+
+
+_TOTP_INPUTS = (
+    (By.NAME, "otc"),
+    (By.ID, "idTxtBx_SAOTCC_OTC"),
+    (By.CSS_SELECTOR, "input[autocomplete='one-time-code']"),
+)
+
+_MFA_SWITCHES = (
+    (By.ID, "signInAnotherWay"),
+    (By.XPATH, "//*[self::a or self::button][contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'sign in another way')]"),
+    (By.XPATH, "//*[self::a or self::button][contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), \"can't use\")]"),
+    (By.XPATH, "//*[self::a or self::button][contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'different verification')]"),
+)
+
+_TOTP_METHODS = (
+    (By.CSS_SELECTOR, "[data-value='PhoneAppOTP']"),
+    (By.XPATH, "//*[self::a or self::button or @role='button' or @role='option'][contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'verification code')]"),
+    (By.XPATH, "//*[self::a or self::button or @role='button' or @role='option'][contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'code from your authenticator')]"),
+)
+
+
 def _finish_admin_login(driver, tenant_name: str, totp_secret: Optional[str], timeout: int = 120) -> bool:
     """Wait through redirects and MFA challenges that arrive after the password."""
     deadline = time.monotonic() + timeout
     last_code = None
+    last_mfa_action = 0.0
+    admin_seen_at = None
+    page_text = ""
     while time.monotonic() < deadline:
         current_url = driver.current_url
-        code_inputs = driver.find_elements(By.CSS_SELECTOR, "input[name='otc'], #idTxtBx_SAOTCC_OTC")
-        code_input = next((element for element in code_inputs if element.is_displayed()), None)
+        code_input = _visible_element(driver, _TOTP_INPUTS)
         if code_input:
             if not totp_secret:
                 logger.warning("[%s] MFA required but no TOTP secret provided", tenant_name)
@@ -479,6 +459,36 @@ def _finish_admin_login(driver, tenant_name: str, totp_secret: Optional[str], ti
             continue
 
         page_text = driver.find_element(By.TAG_NAME, "body").text.lower()
+        host = urlsplit(current_url).hostname
+        if host == "login.microsoftonline.com":
+            if any(marker in page_text for marker in (
+                "password is incorrect", "account or password is incorrect",
+                "account has been locked", "update your password", "change password",
+            )):
+                logger.warning("[%s] Microsoft rejected credentials or requires a password change", tenant_name)
+                return False
+            if any(marker in page_text for marker in ("more information required", "set up your account")):
+                logger.warning("[%s] MFA enrollment is required", tenant_name)
+                return False
+
+            # A push approval page has no code input. Open the alternate
+            # methods, then choose the authenticator *code* (never push/SMS).
+            if totp_secret and time.monotonic() - last_mfa_action >= 6:
+                method = _visible_element(driver, _TOTP_METHODS)
+                switch = _visible_element(driver, _MFA_SWITCHES) if not method else None
+                action = method or switch
+                if action:
+                    action.click()
+                    last_mfa_action = time.monotonic()
+                    logger.info("[%s] Selected %s MFA option", tenant_name, "TOTP" if method else "alternate")
+                    time.sleep(2)
+                    continue
+            if not totp_secret and any(marker in page_text for marker in (
+                "approve sign-in request", "verify your identity", "enter code", "verification code",
+            )):
+                logger.warning("[%s] MFA required but no TOTP secret provided", tenant_name)
+                return False
+
         if "stay signed in" in page_text:
             for button in driver.find_elements(By.ID, "idSIButton9"):
                 if button.is_displayed():
@@ -491,13 +501,31 @@ def _finish_admin_login(driver, tenant_name: str, totp_secret: Optional[str], ti
             if "mfasetup" in urlsplit(current_url).path.lower():
                 from app.services.selenium.admin_portal import dismiss_mfa_setup_interrupt
                 dismiss_mfa_setup_interrupt(driver, tenant_name)
-            elif driver.find_elements(By.CSS_SELECTOR, "#O365_MainLink_NavMenu, [role='navigation'], nav"):
-                logger.info("[%s] Authenticated Admin Center loaded", tenant_name)
-                return True
+                admin_seen_at = None
+            else:
+                if admin_seen_at is None:
+                    admin_seen_at = time.monotonic()
+                if driver.find_elements(By.CSS_SELECTOR, "#O365_MainLink_NavMenu, [role='navigation'], nav") or (
+                    time.monotonic() - admin_seen_at >= 5
+                    and page_text.strip()
+                    and not any(marker in page_text for marker in (
+                        "you need to set up multifactor authentication", "skip for now",
+                        "something went wrong", "try refreshing the page",
+                    ))
+                ):
+                    logger.info("[%s] Authenticated Admin Center loaded", tenant_name)
+                    return True
+        else:
+            admin_seen_at = None
         time.sleep(2)
 
-    logger.warning("[%s] Login did not reach authenticated Admin Center (host: %s)", tenant_name, urlsplit(driver.current_url).hostname)
-    return False
+    host = urlsplit(driver.current_url).hostname
+    stage = "MFA challenge" if any(marker in page_text for marker in (
+        "approve sign-in request", "verify your identity", "verification code",
+    )) else "unknown"
+    logger.warning("[%s] Login did not reach authenticated Admin Center (host: %s, stage: %s)",
+                   tenant_name, host, stage)
+    raise TransientLoginError(f"Microsoft login stalled on {host or 'unknown host'} ({stage})")
 
 
 

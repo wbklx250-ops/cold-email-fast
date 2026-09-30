@@ -1,3 +1,4 @@
+from itertools import count
 from unittest.mock import Mock
 
 import pytest
@@ -116,12 +117,91 @@ def test_delayed_mfa_is_submitted_before_accepting_admin_center(monkeypatch):
 
     code_input.send_keys.side_effect = send_keys
     driver.find_elements.side_effect = lambda by, selector: (
-        ([] if submitted else [code_input]) if "input[name=" in selector else [Mock()]
+        ([] if submitted else [code_input]) if (by, selector) == (By.NAME, "otc")
+        else [Mock()] if selector == "#O365_MainLink_NavMenu, [role='navigation'], nav" and submitted
+        else []
     )
     monkeypatch.setattr(checker.time, "sleep", lambda _: None)
     monkeypatch.setattr(checker.time, "time", lambda: 60)
     assert checker._finish_admin_login(driver, "one", "JBSWY3DPEHPK3PXP")
     assert submitted
+
+
+def test_push_mfa_switches_to_authenticator_code(monkeypatch):
+    driver = make_driver(url="https://login.microsoftonline.com/common/SAS/ProcessAuth", body="Approve sign-in request")
+    stage = {"value": "push"}
+    switch = Mock()
+    switch.is_displayed.return_value = True
+    switch.click.side_effect = lambda: stage.update(value="methods")
+    method = Mock()
+    method.is_displayed.return_value = True
+    method.click.side_effect = lambda: stage.update(value="code")
+    code_input = Mock()
+    code_input.is_displayed.return_value = True
+
+    def send_keys(value):
+        if value == checker.Keys.RETURN:
+            stage["value"] = "admin"
+            driver.current_url = "https://admin.cloud.microsoft/#/homepage"
+
+    code_input.send_keys.side_effect = send_keys
+
+    def find_elements(by, selector):
+        if stage["value"] == "push" and (by, selector) == (By.ID, "signInAnotherWay"):
+            return [switch]
+        if stage["value"] == "methods" and (by, selector) == (By.CSS_SELECTOR, "[data-value='PhoneAppOTP']"):
+            return [method]
+        if stage["value"] == "code" and (by, selector) == (By.NAME, "otc"):
+            return [code_input]
+        if stage["value"] == "admin" and selector == "#O365_MainLink_NavMenu, [role='navigation'], nav":
+            return [Mock()]
+        return []
+
+    driver.find_elements.side_effect = find_elements
+    monkeypatch.setattr(checker.time, "sleep", lambda _: None)
+    monkeypatch.setattr(checker.time, "time", lambda: 60)
+    assert checker._finish_admin_login(driver, "one", "JBSWY3DPEHPK3PXP")
+    assert stage["value"] == "admin"
+    switch.click.assert_called_once()
+    method.click.assert_called_once()
+
+
+def test_admin_shell_without_navigation_can_proceed_to_verified_domain_read(monkeypatch):
+    driver = make_driver(url="https://admin.cloud.microsoft/#/homepage", body="Microsoft 365 admin center")
+    driver.find_elements.return_value = []
+    ticks = count(100)
+    monkeypatch.setattr(checker.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(checker.time, "sleep", lambda _: None)
+    assert checker._finish_admin_login(driver, "one", None, timeout=20)
+
+
+def test_push_mfa_without_secret_fails_promptly(monkeypatch):
+    driver = make_driver(url="https://login.microsoftonline.com/common/SAS/ProcessAuth", body="Approve sign-in request")
+    driver.find_elements.return_value = []
+    monkeypatch.setattr(checker.time, "sleep", lambda _: None)
+    assert checker._finish_admin_login(driver, "one", None, timeout=1) is False
+
+
+def test_stalled_login_retries_in_fresh_browser(monkeypatch):
+    drivers = [make_driver(), make_driver()]
+    make_browser = Mock(side_effect=drivers)
+    login = Mock(side_effect=[checker.TransientLoginError("Microsoft login stalled"), True])
+    cleanup = Mock()
+    monkeypatch.setattr(checker, "create_driver", make_browser)
+    monkeypatch.setattr(checker, "_do_login", login)
+    monkeypatch.setattr(checker, "cleanup_driver", cleanup)
+    kill_browsers = Mock()
+    monkeypatch.setattr(checker, "kill_all_browsers", kill_browsers)
+    monkeypatch.setattr(checker, "_wait_for_domains_page", Mock())
+    monkeypatch.setattr(checker, "_scrape_domains", lambda *_: [checker.DomainInfo("one.onmicrosoft.com")])
+    monkeypatch.setattr(checker.time, "sleep", lambda _: None)
+
+    result = checker.check_tenant_domains("admin@one.onmicrosoft.com", "test-password")
+    assert result.login_success is True
+    assert result.domain_check_success is True
+    assert make_browser.call_count == 2
+    assert cleanup.call_count == 2
+    kill_browsers.assert_not_called()
 
 
 async def test_summary_and_csv_do_not_call_incomplete_check_empty():
