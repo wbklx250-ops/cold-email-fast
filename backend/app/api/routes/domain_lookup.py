@@ -20,9 +20,9 @@ import re
 import time
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 import pyotp
 
@@ -42,6 +42,10 @@ router = APIRouter(prefix="/api/v1/domain-lookup", tags=["domain-lookup"])
 
 class BulkLookupRequest(BaseModel):
     domains: list[str]  # List of domain names to check
+
+
+class TenantEmailLookupRequest(BaseModel):
+    email: str
 
 
 class TenantLoginDetails(BaseModel):
@@ -262,6 +266,33 @@ async def find_tenant_multi_strategy(
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+
+@router.post("/tenant-credentials", response_model=TenantLoginDetails)
+async def tenant_credentials_by_email(
+    request: TenantEmailLookupRequest,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+):
+    """Find one stored tenant by its admin email and generate its current TOTP."""
+    response.headers["Cache-Control"] = "no-store"
+    email = request.email.strip().lower()
+    if len(email) > 255 or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise HTTPException(status_code=400, detail="Enter a valid tenant admin email address")
+
+    result = await db.execute(
+        select(Tenant).where(func.lower(Tenant.admin_email) == email).limit(2)
+    )
+    tenants = result.scalars().all()
+    if not tenants:
+        raise HTTPException(status_code=404, detail="No tenant found for this admin email")
+    if len(tenants) > 1:
+        raise HTTPException(status_code=409, detail="Multiple tenants have this admin email")
+
+    credential_error = credential_error_for_tenant(tenants[0])
+    if credential_error:
+        raise HTTPException(status_code=409, detail=credential_error)
+    return build_tenant_login_details(tenants[0])
+
 
 @router.post("/check", response_model=BulkLookupResponse)
 async def bulk_domain_lookup(

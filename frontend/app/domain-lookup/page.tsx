@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef } from "react";
 import Link from "next/link";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -123,6 +123,12 @@ function maskValue(value: string) {
 // ---------------------------------------------------------------------------
 
 export default function DomainLookupPage() {
+  const [tenantEmail, setTenantEmail] = useState("");
+  const [tenantCredentials, setTenantCredentials] = useState<TenantLoginDetails | null>(null);
+  const [tenantEmailLoading, setTenantEmailLoading] = useState(false);
+  const [tenantEmailError, setTenantEmailError] = useState<string | null>(null);
+  const [tenantPasswordVisible, setTenantPasswordVisible] = useState(false);
+  const tenantLookupRequestId = useRef(0);
   const [domainInput, setDomainInput] = useState("");
   const [results, setResults] = useState<LookupResponse | null>(null);
   const [credentialResults, setCredentialResults] = useState<CredentialLookupResponse | null>(null);
@@ -182,6 +188,36 @@ export default function DomainLookupPage() {
       window.setTimeout(() => setCopiedKey((current) => (current === key ? null : current)), 1200);
     } catch {
       setError("Could not copy value to clipboard");
+    }
+  };
+
+  const handleTenantEmailLookup = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const email = tenantEmail.trim();
+    if (!email) return;
+
+    const requestId = ++tenantLookupRequestId.current;
+    setTenantEmailLoading(true);
+    setTenantEmailError(null);
+    setTenantCredentials(null);
+    setTenantPasswordVisible(false);
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/domain-lookup/tenant-credentials`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        cache: "no-store",
+        body: JSON.stringify({ email }),
+      });
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.detail || `HTTP ${res.status}`);
+      }
+      const details = (await res.json()) as TenantLoginDetails;
+      if (requestId === tenantLookupRequestId.current) setTenantCredentials(details);
+    } catch (err) {
+      if (requestId === tenantLookupRequestId.current) setTenantEmailError((err as Error).message);
+    } finally {
+      if (requestId === tenantLookupRequestId.current) setTenantEmailLoading(false);
     }
   };
 
@@ -417,6 +453,79 @@ export default function DomainLookupPage() {
           </div>
         </div>
       )}
+
+      {/* Direct tenant admin email lookup */}
+      <div className="bg-white rounded-lg border border-gray-200 p-6 space-y-4">
+        <div>
+          <h2 className="text-lg font-semibold text-gray-900">Find tenant login by admin email</h2>
+          <p className="text-sm text-gray-500 mt-1">Enter the tenant admin email to retrieve its stored login and current TOTP code.</p>
+        </div>
+        <form onSubmit={handleTenantEmailLookup} className="flex flex-col sm:flex-row gap-3">
+          <input
+            type="email"
+            required
+            maxLength={255}
+            autoComplete="off"
+            aria-label="Tenant admin email"
+            className="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm font-mono focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+            placeholder="admin@example.onmicrosoft.com"
+            value={tenantEmail}
+            onChange={(event) => {
+              tenantLookupRequestId.current += 1;
+              setTenantEmail(event.target.value);
+              setTenantCredentials(null);
+              setTenantEmailError(null);
+              setTenantEmailLoading(false);
+            }}
+          />
+          <button
+            type="submit"
+            disabled={tenantEmailLoading}
+            className="px-4 py-2 bg-slate-900 text-white rounded-lg hover:bg-slate-800 disabled:opacity-50 text-sm font-medium"
+          >
+            {tenantEmailLoading ? "Finding login..." : tenantCredentials ? "Refresh TOTP Code" : "Find Login Details"}
+          </button>
+        </form>
+        {tenantEmailError && <p role="alert" className="text-sm text-red-700">{tenantEmailError}</p>}
+        {tenantCredentials && (
+          <div className="border-t border-gray-200 pt-4 space-y-3 text-sm">
+            <div className="font-medium text-gray-900">{tenantCredentials.tenant_name}</div>
+            <div className="text-gray-500 font-mono">{tenantCredentials.onmicrosoft_domain}</div>
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-gray-500 w-20">Email</span>
+              <span className="font-mono break-all">{tenantCredentials.admin_email}</span>
+              <button onClick={() => copyToClipboard("tenant-email", tenantCredentials.admin_email)} className="text-blue-600 hover:text-blue-800">
+                {copiedKey === "tenant-email" ? "Copied" : "Copy"}
+              </button>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-gray-500 w-20">Password</span>
+              <span className="font-mono break-all">{tenantPasswordVisible ? tenantCredentials.admin_password : maskValue(tenantCredentials.admin_password)}</span>
+              <button onClick={() => setTenantPasswordVisible((visible) => !visible)} className="text-gray-600 hover:text-gray-900">
+                {tenantPasswordVisible ? "Hide" : "Show"}
+              </button>
+              <button onClick={() => copyToClipboard("tenant-password", tenantCredentials.admin_password)} className="text-blue-600 hover:text-blue-800">
+                {copiedKey === "tenant-password" ? "Copied" : "Copy"}
+              </button>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-gray-500 w-20">TOTP</span>
+              {tenantCredentials.totp_code ? (
+                <>
+                  <span className="font-mono text-lg font-semibold tracking-wider">{tenantCredentials.totp_code}</span>
+                  <span className="text-gray-500">{tenantCredentials.totp_seconds_remaining}s remaining</span>
+                  <button onClick={() => copyToClipboard("tenant-totp", tenantCredentials.totp_code!)} className="text-blue-600 hover:text-blue-800">
+                    {copiedKey === "tenant-totp" ? "Copied" : "Copy"}
+                  </button>
+                </>
+              ) : <span className="text-gray-600">{tenantCredentials.totp_error || "No TOTP secret stored"}</span>}
+            </div>
+            <a href={tenantCredentials.login_url} target="_blank" rel="noopener noreferrer" className="inline-block text-blue-600 hover:text-blue-800">
+              Open Microsoft admin login ↗
+            </a>
+          </div>
+        )}
+      </div>
 
       {/* Sync Result Banner */}
       {syncResult && (

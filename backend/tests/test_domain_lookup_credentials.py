@@ -2,6 +2,7 @@ import base64
 
 import pyotp
 import pytest
+from fastapi import HTTPException, Response
 
 from app.api.routes import domain_lookup
 from app.models.domain import Domain, DomainStatus
@@ -38,6 +39,53 @@ def test_maybe_decode_legacy_password_only_for_likely_base64():
     assert domain_lookup.maybe_decode_legacy_password(encoded) == "Password123!"
     assert domain_lookup.maybe_decode_legacy_password("abcd") == "abcd"
     assert domain_lookup.maybe_decode_legacy_password("Password123!") == "Password123!"
+
+
+@pytest.mark.asyncio
+async def test_tenant_credentials_by_email_uses_exact_case_insensitive_match(test_session, monkeypatch):
+    monkeypatch.setattr(domain_lookup.time, "time", lambda: 0)
+    test_session.add(Tenant(
+        microsoft_tenant_id="33333333-3333-3333-3333-333333333333",
+        name="Example Tenant",
+        onmicrosoft_domain="example.onmicrosoft.com",
+        provider="Provider",
+        admin_email="Admin@Example.onmicrosoft.com",
+        admin_password="CurrentPassword!",
+        totp_secret="JBSWY3DPEHPK3PXP",
+        status=TenantStatus.NEW,
+    ))
+    await test_session.commit()
+
+    response = Response()
+    details = await domain_lookup.tenant_credentials_by_email(
+        domain_lookup.TenantEmailLookupRequest(email="  ADMIN@example.onmicrosoft.com "),
+        response=response,
+        db=test_session,
+    )
+
+    assert details.admin_email == "Admin@Example.onmicrosoft.com"
+    assert details.admin_password == "CurrentPassword!"
+    assert details.totp_code == pyotp.TOTP("JBSWY3DPEHPK3PXP").at(0)
+    assert response.headers["Cache-Control"] == "no-store"
+
+    with pytest.raises(HTTPException) as missing:
+        await domain_lookup.tenant_credentials_by_email(
+            domain_lookup.TenantEmailLookupRequest(email="other@example.onmicrosoft.com"),
+            response=Response(),
+            db=test_session,
+        )
+    assert missing.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_tenant_credentials_by_email_rejects_invalid_email(test_session):
+    with pytest.raises(HTTPException) as invalid:
+        await domain_lookup.tenant_credentials_by_email(
+            domain_lookup.TenantEmailLookupRequest(email="example.onmicrosoft.com"),
+            response=Response(),
+            db=test_session,
+        )
+    assert invalid.value.status_code == 400
 
 
 @pytest.mark.asyncio
