@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
+from uuid import UUID
 
 from sqlalchemy import Boolean, DateTime, Integer, JSON, String, Text
+from sqlalchemy import ForeignKey
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampUUIDMixin
@@ -32,6 +35,7 @@ class TenantAudit(TimestampUUIDMixin, Base):
     disposition: Mapped[str] = mapped_column(
         String(32), nullable=False, default=TenantDisposition.UNREVIEWED.value, index=True
     )
+    assigned_custom_domain: Mapped[str | None] = mapped_column(String(255), unique=True, nullable=True)
     login_success: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     domain_check_success: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     login_error: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -39,5 +43,18 @@ class TenantAudit(TimestampUUIDMixin, Base):
     verified_domains: Mapped[list[dict]] = mapped_column(JSON, nullable=False, default=list)
     unverified_domains: Mapped[list[dict]] = mapped_column(JSON, nullable=False, default=list)
     custom_domain_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    last_checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_job_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+
+
+class TenantAuditCredential(TimestampUUIDMixin, Base):
+    """Opt-in saved credentials for checking an inventory tenant again."""
+
+    __tablename__ = "tenant_audit_credentials"
+
+    audit_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("tenant_audits.id", ondelete="CASCADE"),
+        unique=True, nullable=False,
+    )
+    password_ciphertext: Mapped[str] = mapped_column(Text, nullable=False)
+    totp_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)

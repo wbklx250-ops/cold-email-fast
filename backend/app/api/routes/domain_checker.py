@@ -14,20 +14,23 @@ import csv
 import io
 import uuid
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, UploadFile, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, ConfigDict
-from sqlalchemy import select
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db
 from app.db.session import SessionLocal
 from app.models.tenant import Tenant
-from app.models.tenant_audit import TenantAudit, TenantDisposition
+from app.models.tenant_audit import TenantAudit, TenantAuditCredential, TenantDisposition
+from app.services.inventory_credentials import decrypt_inventory_value, encrypt_inventory_value
 from app.services.selenium.domain_checker import (
     check_tenants_parallel,
     TenantCheckResult,
@@ -59,6 +62,8 @@ class TenantAuditRead(BaseModel):
     admin_email: str
     tenant_name: str
     disposition: str
+    assigned_custom_domain: Optional[str] = None
+    has_saved_credentials: bool = False
     login_success: bool
     domain_check_success: bool = False
     login_error: Optional[str] = None
@@ -66,12 +71,55 @@ class TenantAuditRead(BaseModel):
     verified_domains: list[dict] = []
     unverified_domains: list[dict] = []
     custom_domain_count: int
-    last_checked_at: datetime
+    last_checked_at: Optional[datetime] = None
     updated_at: datetime
 
 
 class TenantAuditUpdate(BaseModel):
-    disposition: TenantDisposition
+    disposition: Optional[TenantDisposition] = None
+    assigned_custom_domain: Optional[str] = None
+
+
+class TenantInventoryCreate(BaseModel):
+    admin_email: str
+    admin_password: str = Field(min_length=1)
+    totp_secret: Optional[str] = None
+    assigned_custom_domain: Optional[str] = None
+    disposition: Optional[TenantDisposition] = None
+
+
+def _normalize_assigned_domain(value: Optional[str]) -> Optional[str]:
+    domain = (value or "").strip().lower().rstrip(".")
+    if not domain:
+        return None
+    if domain.endswith(".onmicrosoft.com") or not re.fullmatch(
+        r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}", domain,
+    ):
+        raise HTTPException(422, "Enter a valid custom domain name")
+    return domain
+
+
+async def _set_assigned_domain(db: AsyncSession, audit: TenantAudit, value: Optional[str]) -> None:
+    domain = _normalize_assigned_domain(value)
+    if domain:
+        result = await db.execute(
+            select(TenantAudit.id).where(
+                TenantAudit.assigned_custom_domain == domain,
+                TenantAudit.id != audit.id,
+            )
+        )
+        if result.scalar_one_or_none() is not None:
+            raise HTTPException(409, "This domain is already assigned to another inventory tenant")
+    audit.assigned_custom_domain = domain
+
+
+async def _audit_read(db: AsyncSession, audit: TenantAudit) -> TenantAuditRead:
+    result = await db.execute(
+        select(TenantAuditCredential.id).where(TenantAuditCredential.audit_id == audit.id)
+    )
+    return TenantAuditRead.model_validate(audit).model_copy(
+        update={"has_saved_credentials": result.scalar_one_or_none() is not None}
+    )
 
 
 # === ENDPOINTS ===
@@ -83,11 +131,84 @@ async def list_inventory(
     db: AsyncSession = Depends(get_db),
 ):
     """List the latest persisted audit result for every checked tenant."""
-    query = select(TenantAudit).order_by(TenantAudit.last_checked_at.desc())
+    query = select(TenantAudit).order_by(TenantAudit.last_checked_at.desc().nullslast(), TenantAudit.created_at.desc())
     if disposition:
         query = query.where(TenantAudit.disposition == disposition.value)
     result = await db.execute(query)
-    return list(result.scalars().all())
+    audits = list(result.scalars().all())
+    saved = await db.execute(select(TenantAuditCredential.audit_id))
+    saved_ids = set(saved.scalars().all())
+    return [
+        TenantAuditRead.model_validate(audit).model_copy(
+            update={"has_saved_credentials": audit.id in saved_ids}
+        )
+        for audit in audits
+    ]
+
+
+@router.post("/inventory/tenants", response_model=TenantAuditRead, status_code=201)
+async def add_inventory_tenant(
+    tenant: TenantInventoryCreate,
+    db: AsyncSession = Depends(get_db),
+):
+    """Save a tenant for future checks without touching Microsoft 365."""
+    email = tenant.admin_email.strip().lower()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.onmicrosoft\.com", email):
+        raise HTTPException(422, "Use an admin email on the tenant's .onmicrosoft.com domain")
+    password = tenant.admin_password
+    if not password.strip():
+        raise HTTPException(422, "Admin password is required")
+    secret = "".join((tenant.totp_secret or "").split()).upper() or None
+    if secret:
+        import pyotp
+        try:
+            pyotp.TOTP(secret).now()
+        except (ValueError, TypeError):
+            raise HTTPException(422, "TOTP secret is not valid Base32")
+
+    result = await db.execute(select(TenantAudit).where(func.lower(TenantAudit.admin_email) == email))
+    audit = result.scalar_one_or_none()
+    if audit is None:
+        audit = TenantAudit(
+            admin_email=email,
+            tenant_name=email.split("@", 1)[1].removesuffix(".onmicrosoft.com"),
+            disposition=(tenant.disposition or TenantDisposition.UNREVIEWED).value,
+            is_used=None,
+            verified_domains=[],
+            unverified_domains=[],
+            custom_domain_count=0,
+        )
+        db.add(audit)
+        try:
+            await db.flush()
+        except IntegrityError:
+            await db.rollback()
+            raise HTTPException(409, "Tenant is already in the inventory")
+    elif tenant.disposition not in (None, TenantDisposition.UNREVIEWED):
+        audit.disposition = tenant.disposition.value
+    if tenant.assigned_custom_domain:
+        await _set_assigned_domain(db, audit, tenant.assigned_custom_domain)
+
+    result = await db.execute(
+        select(TenantAuditCredential).where(TenantAuditCredential.audit_id == audit.id)
+    )
+    credential = result.scalar_one_or_none()
+    is_new_credential = credential is None
+    if is_new_credential:
+        credential = TenantAuditCredential(audit_id=audit.id)
+        db.add(credential)
+    credential.password_ciphertext = encrypt_inventory_value(password)
+    if secret:
+        credential.totp_ciphertext = encrypt_inventory_value(secret)
+    elif is_new_credential:
+        credential.totp_ciphertext = None
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(409, "Tenant or custom domain is already in the inventory")
+    await db.refresh(audit)
+    return await _audit_read(db, audit)
 
 
 @router.patch("/inventory/{audit_id}", response_model=TenantAuditRead)
@@ -101,10 +222,53 @@ async def update_inventory_disposition(
     audit = result.scalar_one_or_none()
     if not audit:
         raise HTTPException(404, "Audited tenant not found")
-    audit.disposition = update.disposition.value
-    await db.commit()
+    if "disposition" in update.model_fields_set:
+        if update.disposition is None:
+            raise HTTPException(422, "Status is required")
+        audit.disposition = update.disposition.value
+    if "assigned_custom_domain" in update.model_fields_set:
+        await _set_assigned_domain(db, audit, update.assigned_custom_domain)
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(409, "This domain is already assigned to another inventory tenant")
     await db.refresh(audit)
-    return audit
+    return await _audit_read(db, audit)
+
+
+@router.post("/inventory/{audit_id}/check")
+async def check_saved_inventory_tenant(
+    audit_id: UUID,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    audit = (await db.execute(select(TenantAudit).where(TenantAudit.id == audit_id))).scalar_one_or_none()
+    if audit is None:
+        raise HTTPException(404, "Audited tenant not found")
+    credential = (await db.execute(
+        select(TenantAuditCredential).where(TenantAuditCredential.audit_id == audit_id)
+    )).scalar_one_or_none()
+    if credential is None:
+        raise HTTPException(409, "Save credentials for this tenant before checking it")
+    try:
+        password = decrypt_inventory_value(credential.password_ciphertext)
+        secret = decrypt_inventory_value(credential.totp_ciphertext) if credential.totp_ciphertext else None
+    except Exception:
+        logger.exception("Saved checker credentials could not be decrypted for audit %s", audit_id)
+        raise HTTPException(500, "Saved credentials could not be decrypted")
+
+    job_id = str(uuid.uuid4())
+    checker_jobs[job_id] = {
+        "status": "running", "total": 1, "processed": 0, "results": [],
+        "started_at": datetime.utcnow().isoformat(), "completed_at": None,
+    }
+    background_tasks.add_task(
+        _run_checker_job, job_id,
+        [{"admin_email": audit.admin_email, "admin_password": password, "totp_secret": secret}],
+        True, 1,
+    )
+    return {"job_id": job_id, "total_tenants": 1}
 
 
 @router.post("/check-csv")

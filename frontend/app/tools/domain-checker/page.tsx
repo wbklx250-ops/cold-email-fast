@@ -60,6 +60,8 @@ interface TenantAudit {
   admin_email: string;
   tenant_name: string;
   disposition: TenantDisposition;
+  assigned_custom_domain: string | null;
+  has_saved_credentials: boolean;
   login_success: boolean;
   domain_check_success: boolean;
   login_error: string | null;
@@ -67,7 +69,7 @@ interface TenantAudit {
   verified_domains: DomainEntry[];
   unverified_domains: DomainEntry[];
   custom_domain_count: number;
-  last_checked_at: string;
+  last_checked_at: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -120,8 +122,17 @@ export default function DomainCheckerPage() {
   // Persistent inventory state
   const [inventory, setInventory] = useState<TenantAudit[]>([]);
   const [inventoryLoading, setInventoryLoading] = useState(true);
-  const [usageFilter, setUsageFilter] = useState<"all" | "used" | "unused" | "unknown">("all");
+  const [usageFilter, setUsageFilter] = useState<"all" | "used" | "unused" | "unknown" | "burned">("all");
   const [inventorySearch, setInventorySearch] = useState("");
+  const [newEmail, setNewEmail] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [newTotp, setNewTotp] = useState("");
+  const [newDomain, setNewDomain] = useState("");
+  const [newDisposition, setNewDisposition] = useState<TenantDisposition>("unreviewed");
+  const [savingTenant, setSavingTenant] = useState(false);
+  const [savedMessage, setSavedMessage] = useState<string | null>(null);
+  const [domainDrafts, setDomainDrafts] = useState<Record<string, string>>({});
+  const [savingDomainId, setSavingDomainId] = useState<string | null>(null);
 
   // Drag state
   const [isDragging, setIsDragging] = useState(false);
@@ -292,6 +303,85 @@ export default function DomainCheckerPage() {
     }
   };
 
+  const handleSaveTenant = async (event: React.FormEvent) => {
+    event.preventDefault();
+    setSavingTenant(true);
+    setError(null);
+    setSavedMessage(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/domain-checker/inventory/tenants`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          admin_email: newEmail.trim(),
+          admin_password: newPassword,
+          totp_secret: newTotp.trim() || null,
+          assigned_custom_domain: newDomain.trim() || null,
+          disposition: newDisposition,
+        }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.detail || `HTTP ${res.status}`);
+      }
+      setSavedMessage("Tenant saved. Use Check in its inventory row to verify the Microsoft 365 domains.");
+      setNewEmail("");
+      setNewPassword("");
+      setNewTotp("");
+      setNewDomain("");
+      setNewDisposition("unreviewed");
+      await loadInventory();
+    } catch (err) {
+      setError(`Could not save tenant: ${(err as Error).message}`);
+    } finally {
+      setSavingTenant(false);
+    }
+  };
+
+  const handleAssignDomain = async (item: TenantAudit) => {
+    setSavingDomainId(item.id);
+    setError(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/domain-checker/inventory/${item.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ assigned_custom_domain: domainDrafts[item.id] ?? item.assigned_custom_domain ?? "" }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.detail || `HTTP ${res.status}`);
+      }
+      const updated: TenantAudit = await res.json();
+      setInventory((items) => items.map((current) => current.id === item.id ? updated : current));
+      setDomainDrafts((drafts) => ({ ...drafts, [item.id]: updated.assigned_custom_domain || "" }));
+    } catch (err) {
+      setError(`Could not assign domain: ${(err as Error).message}`);
+    } finally {
+      setSavingDomainId(null);
+    }
+  };
+
+  const handleCheckSaved = async (auditId: string) => {
+    setLoading(true);
+    setError(null);
+    setJobId(null);
+    setJobStatus(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/domain-checker/inventory/${auditId}/check`, {
+        method: "POST",
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.detail || `HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      setJobId(data.job_id);
+    } catch (err) {
+      setError(`Could not start tenant check: ${(err as Error).message}`);
+      setLoading(false);
+    }
+  };
+
   // Computed
   const isRunning = jobStatus?.status === "running";
   const isComplete = jobStatus?.status === "complete";
@@ -306,9 +396,9 @@ export default function DomainCheckerPage() {
   const inventoryCounts = useMemo(
     () => ({
       total: inventory.length,
-      used: inventory.filter((item) => item.is_used === true).length,
-      unused: inventory.filter((item) => item.is_used === false).length,
-      unknown: inventory.filter((item) => item.is_used === null).length,
+      used: inventory.filter((item) => item.disposition !== "burned" && item.is_used === true).length,
+      unused: inventory.filter((item) => item.disposition !== "burned" && item.is_used === false).length,
+      unknown: inventory.filter((item) => item.disposition !== "burned" && item.is_used === null).length,
       burned: inventory.filter((item) => item.disposition === "burned").length,
     }),
     [inventory]
@@ -319,15 +409,16 @@ export default function DomainCheckerPage() {
     return inventory.filter((item) => {
       const matchesUsage =
         usageFilter === "all" ||
-        (usageFilter === "used" && item.is_used === true) ||
-        (usageFilter === "unused" && item.is_used === false) ||
-        (usageFilter === "unknown" && item.is_used === null);
+        (usageFilter === "burned" && item.disposition === "burned") ||
+        (item.disposition !== "burned" && usageFilter === "used" && item.is_used === true) ||
+        (item.disposition !== "burned" && usageFilter === "unused" && item.is_used === false) ||
+        (item.disposition !== "burned" && usageFilter === "unknown" && item.is_used === null);
       const domains = [...item.verified_domains, ...item.unverified_domains]
         .map((domain) => domain.name)
         .join(" ");
       const matchesSearch =
         !query ||
-        `${item.tenant_name} ${item.admin_email} ${domains}`.toLowerCase().includes(query);
+        `${item.tenant_name} ${item.admin_email} ${item.assigned_custom_domain || ""} ${domains}`.toLowerCase().includes(query);
       return matchesUsage && matchesSearch;
     });
   }, [inventory, inventorySearch, usageFilter]);
@@ -392,6 +483,62 @@ export default function DomainCheckerPage() {
         </div>
       )}
 
+      {savedMessage && (
+        <div className="rounded-lg border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-800">
+          {savedMessage}
+        </div>
+      )}
+
+      <section id="add-inventory-tenant" className="bg-white rounded-lg border border-gray-200 p-5">
+        <h2 className="font-semibold text-gray-900">Add or update a tenant</h2>
+        <p className="text-xs text-gray-500 mt-1">
+          Save login details and optionally assign a custom domain in Sentinel before checking Microsoft 365.
+        </p>
+        <form onSubmit={handleSaveTenant} className="mt-4 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-3 items-end">
+          <label className="text-xs font-medium text-gray-700">
+            Admin login email
+            <input type="email" required value={newEmail} onChange={(event) => setNewEmail(event.target.value)}
+              placeholder="admin@tenant.onmicrosoft.com" autoComplete="off"
+              className="mt-1 w-full border border-gray-300 rounded-lg px-3 py-2 text-sm" />
+          </label>
+          <label className="text-xs font-medium text-gray-700">
+            Password
+            <input type="password" required value={newPassword} onChange={(event) => setNewPassword(event.target.value)}
+              autoComplete="new-password"
+              className="mt-1 w-full border border-gray-300 rounded-lg px-3 py-2 text-sm" />
+          </label>
+          <label className="text-xs font-medium text-gray-700">
+            TOTP secret (blank keeps saved secret)
+            <input type="password" value={newTotp} onChange={(event) => setNewTotp(event.target.value)}
+              autoComplete="off"
+              className="mt-1 w-full border border-gray-300 rounded-lg px-3 py-2 text-sm" />
+          </label>
+          <label className="text-xs font-medium text-gray-700">
+            Assigned custom domain (optional)
+            <input type="text" value={newDomain} onChange={(event) => setNewDomain(event.target.value)}
+              placeholder="example.com" autoComplete="off"
+              className="mt-1 w-full border border-gray-300 rounded-lg px-3 py-2 text-sm" />
+          </label>
+          <div className="flex gap-2 items-end">
+            <label className="text-xs font-medium text-gray-700 flex-1">
+              Status
+              <select value={newDisposition} onChange={(event) => setNewDisposition(event.target.value as TenantDisposition)}
+                className="mt-1 w-full border border-gray-300 rounded-lg px-3 py-2 text-sm">
+                <option value="unreviewed">Unreviewed</option>
+                <option value="available">Available</option>
+                <option value="active">Active</option>
+                <option value="burned">Burned</option>
+              </select>
+            </label>
+            <button type="submit" disabled={savingTenant}
+              className="px-4 py-2 rounded-lg bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 disabled:opacity-50 whitespace-nowrap">
+              {savingTenant ? "Saving…" : "Save tenant"}
+            </button>
+          </div>
+        </form>
+        <p className="text-xs text-gray-500 mt-2">The domain assignment stays in Sentinel; it does not add the domain to Microsoft 365.</p>
+      </section>
+
       {/* Persistent inventory */}
       <section className="bg-white rounded-lg border border-gray-200 overflow-hidden">
         <div className="p-5 border-b border-gray-200">
@@ -399,7 +546,7 @@ export default function DomainCheckerPage() {
             <div>
               <h2 className="font-semibold text-gray-900">Checked tenants</h2>
               <p className="text-xs text-gray-500 mt-0.5">
-                Usage comes from discovered custom domains. Status is managed by you.
+                M365 usage comes from discovered domains. Your status and Sentinel domain assignment are managed separately.
               </p>
             </div>
             <button
@@ -414,8 +561,8 @@ export default function DomainCheckerPage() {
           <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 mt-4">
             {([
               ["all", "Total", inventoryCounts.total, "text-gray-900"],
-              ["used", "Used", inventoryCounts.used, "text-emerald-700"],
-              ["unused", "Unused", inventoryCounts.unused, "text-blue-700"],
+              ["used", "Domains found", inventoryCounts.used, "text-emerald-700"],
+              ["unused", "No domains", inventoryCounts.unused, "text-blue-700"],
               ["unknown", "Unknown", inventoryCounts.unknown, "text-amber-700"],
             ] as const).map(([filter, label, value, color]) => (
               <button
@@ -431,10 +578,11 @@ export default function DomainCheckerPage() {
                 <div className="text-xs text-gray-500">{label}</div>
               </button>
             ))}
-            <div className="rounded-lg border border-red-200 bg-red-50 p-3">
+            <button onClick={() => setUsageFilter("burned")}
+              className={`text-left rounded-lg border p-3 ${usageFilter === "burned" ? "border-red-400 bg-red-100" : "border-red-200 bg-red-50 hover:bg-red-100"}`}>
               <div className="text-xl font-bold text-red-700">{inventoryCounts.burned}</div>
               <div className="text-xs text-red-600">Burned</div>
-            </div>
+            </button>
           </div>
 
           <input
@@ -450,7 +598,7 @@ export default function DomainCheckerPage() {
         ) : filteredInventory.length === 0 ? (
           <div className="p-8 text-center text-sm text-gray-500">
             {inventory.length === 0
-              ? "No tenants checked yet. Paste credentials or upload a CSV below to begin."
+              ? "No tenants in inventory yet. Add one above or run a CSV check below."
               : "No tenants match this filter."}
           </div>
         ) : (
@@ -459,10 +607,11 @@ export default function DomainCheckerPage() {
               <thead className="bg-gray-50 sticky top-0 z-10">
                 <tr>
                   <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Tenant</th>
-                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Usage</th>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">M365 usage</th>
                   <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Domains</th>
                   <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Status</th>
                   <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Last checked</th>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Check</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-100">
@@ -478,26 +627,53 @@ export default function DomainCheckerPage() {
                             Check failed: {item.login_error}
                           </div>
                         )}
+                        <button type="button" onClick={() => {
+                            setNewEmail(item.admin_email);
+                            setNewPassword("");
+                            setNewTotp("");
+                            setNewDomain(item.assigned_custom_domain || "");
+                            setNewDisposition(item.disposition);
+                            document.getElementById("add-inventory-tenant")?.scrollIntoView({ behavior: "smooth" });
+                          }} className="mt-1 text-xs text-blue-600 hover:underline">
+                            {item.has_saved_credentials ? "Update credentials" : "Add saved credentials"}
+                        </button>
                       </td>
                       <td className="px-4 py-3 text-sm whitespace-nowrap">
-                        {item.is_used === true ? (
-                          <span className="px-2 py-1 rounded-full bg-emerald-100 text-emerald-700 text-xs font-medium">Used</span>
+                        {item.disposition === "burned" ? (
+                          <span className="px-2 py-1 rounded-full bg-red-100 text-red-700 text-xs font-medium">Burned</span>
+                        ) : item.is_used === true ? (
+                          <span className="px-2 py-1 rounded-full bg-emerald-100 text-emerald-700 text-xs font-medium">Domains found</span>
                         ) : item.is_used === false ? (
-                          <span className="px-2 py-1 rounded-full bg-blue-100 text-blue-700 text-xs font-medium">Unused</span>
+                          <span className="px-2 py-1 rounded-full bg-blue-100 text-blue-700 text-xs font-medium">No domains</span>
                         ) : (
                           <span className="px-2 py-1 rounded-full bg-amber-100 text-amber-700 text-xs font-medium">Unknown</span>
                         )}
                       </td>
                       <td className="px-4 py-3 text-xs font-mono text-gray-700 min-w-60">
+                        <div className="text-xs font-sans font-medium text-gray-600 mb-1">
+                          Assigned in Sentinel: {item.assigned_custom_domain || "None"}
+                        </div>
                         {domains.length > 0 ? (
                           <div className="space-y-1">
+                            <div className="text-xs font-sans text-gray-400">Found in Microsoft 365:</div>
                             {domains.map((domain, index) => (
                               <div key={`${domain.name}-${index}`}>{domain.name}</div>
                             ))}
                           </div>
                         ) : (
-                          <span className="text-gray-400">{item.is_used === false ? "No custom domains" : "Domain check incomplete"}</span>
+                          <span className="text-gray-400">{item.is_used === false ? "None found in Microsoft 365" : "Domain check incomplete"}</span>
                         )}
+                        <form onSubmit={(event) => { event.preventDefault(); handleAssignDomain(item); }} className="flex gap-1 mt-2">
+                          <input type="text" aria-label={`Assigned domain for ${item.tenant_name}`}
+                            value={domainDrafts[item.id] ?? item.assigned_custom_domain ?? ""}
+                            onChange={(event) => setDomainDrafts((drafts) => ({ ...drafts, [item.id]: event.target.value }))}
+                            placeholder="Assign custom domain"
+                            className="min-w-0 w-40 border border-gray-300 rounded px-2 py-1 text-xs" />
+                          <button type="submit" disabled={savingDomainId === item.id || (domainDrafts[item.id] ?? item.assigned_custom_domain ?? "") === (item.assigned_custom_domain ?? "")}
+                            className="px-2 py-1 rounded bg-gray-100 text-gray-700 text-xs hover:bg-gray-200 disabled:opacity-40">
+                            Save
+                          </button>
+                        </form>
                       </td>
                       <td className="px-4 py-3">
                         <select
@@ -518,7 +694,15 @@ export default function DomainCheckerPage() {
                         </select>
                       </td>
                       <td className="px-4 py-3 text-xs text-gray-500 whitespace-nowrap">
-                        {new Date(item.last_checked_at).toLocaleString()}
+                        {item.last_checked_at ? new Date(item.last_checked_at).toLocaleString() : "Never"}
+                      </td>
+                      <td className="px-4 py-3 text-xs whitespace-nowrap">
+                        <button type="button" onClick={() => handleCheckSaved(item.id)}
+                          disabled={!item.has_saved_credentials || loading}
+                          title={item.has_saved_credentials ? "Check this tenant with saved credentials" : "Add saved credentials first"}
+                          className="px-3 py-1.5 rounded-lg border border-blue-300 text-blue-700 hover:bg-blue-50 disabled:opacity-40">
+                          Check
+                        </button>
                       </td>
                     </tr>
                   );
