@@ -122,7 +122,8 @@ export default function DomainCheckerPage() {
   // Persistent inventory state
   const [inventory, setInventory] = useState<TenantAudit[]>([]);
   const [inventoryLoading, setInventoryLoading] = useState(true);
-  const [usageFilter, setUsageFilter] = useState<"all" | "used" | "unused" | "unknown" | "burned">("all");
+  const [usageFilter, setUsageFilter] = useState<"all" | "used" | "unused" | "unknown">("all");
+  const [statusFilter, setStatusFilter] = useState<"all" | TenantDisposition>("all");
   const [inventorySearch, setInventorySearch] = useState("");
   const [newEmail, setNewEmail] = useState("");
   const [newPassword, setNewPassword] = useState("");
@@ -409,19 +410,19 @@ export default function DomainCheckerPage() {
     return inventory.filter((item) => {
       const matchesUsage =
         usageFilter === "all" ||
-        (usageFilter === "burned" && item.disposition === "burned") ||
         (item.disposition !== "burned" && usageFilter === "used" && item.is_used === true) ||
         (item.disposition !== "burned" && usageFilter === "unused" && item.is_used === false) ||
         (item.disposition !== "burned" && usageFilter === "unknown" && item.is_used === null);
+      const matchesStatus = statusFilter === "all" || item.disposition === statusFilter;
       const domains = [...item.verified_domains, ...item.unverified_domains]
         .map((domain) => domain.name)
         .join(" ");
       const matchesSearch =
         !query ||
         `${item.tenant_name} ${item.admin_email} ${item.assigned_custom_domain || ""} ${domains}`.toLowerCase().includes(query);
-      return matchesUsage && matchesSearch;
+      return matchesUsage && matchesStatus && matchesSearch;
     });
-  }, [inventory, inventorySearch, usageFilter]);
+  }, [inventory, inventorySearch, statusFilter, usageFilter]);
 
   // Build completion readout data
   const completionData = useMemo(() => {
@@ -567,9 +568,12 @@ export default function DomainCheckerPage() {
             ] as const).map(([filter, label, value, color]) => (
               <button
                 key={filter}
-                onClick={() => setUsageFilter(filter)}
+                onClick={() => {
+                  setUsageFilter(filter);
+                  if (filter === "all") setStatusFilter("all");
+                }}
                 className={`text-left rounded-lg border p-3 transition-colors ${
-                  usageFilter === filter
+                  usageFilter === filter && (filter !== "all" || statusFilter === "all")
                     ? "border-blue-400 bg-blue-50"
                     : "border-gray-200 hover:bg-gray-50"
                 }`}
@@ -578,19 +582,35 @@ export default function DomainCheckerPage() {
                 <div className="text-xs text-gray-500">{label}</div>
               </button>
             ))}
-            <button onClick={() => setUsageFilter("burned")}
-              className={`text-left rounded-lg border p-3 ${usageFilter === "burned" ? "border-red-400 bg-red-100" : "border-red-200 bg-red-50 hover:bg-red-100"}`}>
+            <button onClick={() => { setUsageFilter("all"); setStatusFilter("burned"); }}
+              className={`text-left rounded-lg border p-3 ${statusFilter === "burned" && usageFilter === "all" ? "border-red-400 bg-red-100" : "border-red-200 bg-red-50 hover:bg-red-100"}`}>
               <div className="text-xl font-bold text-red-700">{inventoryCounts.burned}</div>
               <div className="text-xs text-red-600">Burned</div>
             </button>
           </div>
 
-          <input
-            value={inventorySearch}
-            onChange={(event) => setInventorySearch(event.target.value)}
-            placeholder="Search tenant, email, or domain…"
-            className="mt-4 w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-          />
+          <div className="mt-4 flex flex-col sm:flex-row gap-3">
+            <label className="text-sm text-gray-700 sm:w-48">
+              Status
+              <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value as "all" | TenantDisposition)}
+                className="mt-1 w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500">
+                <option value="all">All statuses</option>
+                <option value="unreviewed">Unreviewed</option>
+                <option value="available">Available</option>
+                <option value="active">Active</option>
+                <option value="burned">Burned</option>
+              </select>
+            </label>
+            <label className="text-sm text-gray-700 flex-1">
+              Search
+              <input
+                value={inventorySearch}
+                onChange={(event) => setInventorySearch(event.target.value)}
+                placeholder="Search tenant, email, or domain…"
+                className="mt-1 w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+              />
+            </label>
+          </div>
         </div>
 
         {inventoryLoading && inventory.length === 0 ? (
