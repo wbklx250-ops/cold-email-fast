@@ -97,7 +97,7 @@ ENV HEADLESS_MODE=true
 EXPOSE 8000
 
 # start.sh is copied via `COPY . .` above (build context is backend/)
-RUN chmod +x start.sh
+RUN sed -i 's/\r$//' start.sh && chmod +x start.sh
 
 ENTRYPOINT ["dumb-init", "--"]
 CMD ["./start.sh"]
