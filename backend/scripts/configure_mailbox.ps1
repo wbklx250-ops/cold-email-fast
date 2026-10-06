@@ -67,7 +67,7 @@ try {
     
     # Import modules
     Import-Module ExchangeOnlineManagement -ErrorAction Stop
-    Import-Module Microsoft.Graph.Users -ErrorAction Stop
+    Import-Module Microsoft.Graph.Users -RequiredVersion 2.41.0 -ErrorAction Stop
     
     # Connect to Exchange Online
     Connect-ExchangeOnline -Credential $adminCredential -ShowBanner:$false -ErrorAction Stop

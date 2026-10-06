@@ -71,6 +71,10 @@ RUN curl -sSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor 
 RUN pwsh -Command "Set-PSRepository -Name PSGallery -InstallationPolicy Trusted" \
     && pwsh -Command "Install-Module -Name ExchangeOnlineManagement -RequiredVersion 3.1.0 -Force -Scope AllUsers -AcceptLicense -AllowClobber"
 
+# Install the entire Graph subset at one release before startup. Installing each
+# unpinned module at runtime can mix SDK releases when PSGallery publishes updates.
+RUN ["pwsh", "-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference = 'Stop'; Set-PSRepository -Name PSGallery -InstallationPolicy Trusted; foreach ($name in @('Microsoft.Graph.Authentication', 'Microsoft.Graph.Users', 'Microsoft.Graph.Users.Actions', 'Microsoft.Graph.Identity.DirectoryManagement')) { Install-Module -Name $name -RequiredVersion 2.41.0 -Force -Scope AllUsers -AllowClobber -AcceptLicense -ErrorAction Stop }; foreach ($name in @('Microsoft.Graph.Authentication', 'Microsoft.Graph.Users', 'Microsoft.Graph.Users.Actions', 'Microsoft.Graph.Identity.DirectoryManagement')) { Import-Module $name -RequiredVersion 2.41.0 -ErrorAction Stop }"]
+
 # Set environment paths
 ENV CHROME_PATH=/usr/bin/chromium
 ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver

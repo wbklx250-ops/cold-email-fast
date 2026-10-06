@@ -114,7 +114,7 @@ async def test_wizard_completion_keeps_dkim_pending_until_exchange_enables_it(mo
         "dkim_selector1_cname": "selector1-example-com._domainkey.tenant.y-v1.dkim.mail.microsoft",
         "dkim_selector2_cname": "selector2-example-com._domainkey.tenant.y-v1.dkim.mail.microsoft",
     }
-    await m365_setup._save_step6_result(
+    saved_result = await m365_setup._save_step6_result(
         {"domain": "example.com", "domain_id": str(domain_id), "tenant_id": str(tenant_id),
          "admin_email": "admin@tenant", "admin_password": "password"},
         result,
@@ -125,3 +125,66 @@ async def test_wizard_completion_keeps_dkim_pending_until_exchange_enables_it(mo
     assert domain.dkim_cnames_added
     assert domain.mx_record_added and domain.spf_record_added
     assert domain.status.value == "pending_dkim"
+    assert not saved_result["success"]
+    assert saved_result["dkim_pending"]
+    assert "signing is pending" in saved_result["error"]
+
+
+@pytest.mark.asyncio
+async def test_pending_dkim_retry_uses_live_dns_without_browser_or_dns_writes(monkeypatch):
+    values = {
+        "mx_value": "example-com.mail.protection.outlook.com",
+        "spf_value": "v=spf1 include:spf.protection.outlook.com -all",
+        "dkim_selector1_cname": "selector1-example-com._domainkey.tenant.dkim.mail.microsoft",
+        "dkim_selector2_cname": "selector2-example-com._domainkey.tenant.dkim.mail.microsoft",
+    }
+    data = {"domain": "example.com", "zone_id": "zone", "dkim_only_retry": True,
+            "expected_dns_values": values}
+    truth = {key: True for key in
+             ("zone_ok", "mx", "spf", "autodiscover", "dkim1", "dkim2", "dmarc")}
+    truth["zone_id"] = "zone"
+    readback = AsyncMock(return_value=truth)
+    monkeypatch.setattr(objective_reconciliation, "_ensure_cloudflare_truth", readback)
+    monkeypatch.setattr(m365_setup, "cloudflare_service", SimpleNamespace(list_dns_records=AsyncMock(return_value=[
+        {"type": "MX", "name": "example.com", "content": values["mx_value"]},
+        {"type": "TXT", "name": "example.com", "content": '"' + values["spf_value"] + '"'},
+    ])))
+    def unexpected_browser(*_):
+        raise AssertionError("DKIM-only retry must not start the domain wizard")
+    monkeypatch.setattr(m365_setup, "_sync_setup_domain", unexpected_browser)
+    result = await m365_setup._run_domain_setup(data)
+    assert result["dns_configured"] and result["dmarc_configured"]
+    assert result["dkim_selector1_cname"] == values["dkim_selector1_cname"]
+    assert readback.await_args.kwargs["auto_fix"] is False
+
+
+@pytest.mark.asyncio
+async def test_pending_dkim_retry_returns_to_wizard_when_dns_is_missing(monkeypatch):
+    from unittest.mock import Mock
+    data = {"domain": "example.com", "zone_id": "zone", "dkim_only_retry": True,
+            "expected_dns_values": {"mx_value": "mx", "spf_value": "spf",
+                                    "dkim_selector1": "selector1", "dkim_selector2": "selector2"}}
+    monkeypatch.setattr(objective_reconciliation, "_ensure_cloudflare_truth",
+                        AsyncMock(return_value={"zone_ok": True, "dkim1": False}))
+    wizard = Mock(return_value={"success": False, "error": "wizard retry"})
+    monkeypatch.setattr(m365_setup, "_sync_setup_domain", wizard)
+    result = await m365_setup._run_domain_setup(data)
+    wizard.assert_called_once_with(data)
+    assert result["error"] == "wizard retry"
+
+
+@pytest.mark.asyncio
+async def test_pending_dkim_retry_rejects_mx_from_another_domain(monkeypatch):
+    values = {"mx_value": "example-com.mail.protection.outlook.com", "spf_value": "spf",
+              "dkim_selector1": "selector1", "dkim_selector2": "selector2"}
+    data = {"domain": "example.com", "zone_id": "zone", "dkim_only_retry": True,
+            "expected_dns_values": values}
+    truth = {key: True for key in
+             ("zone_ok", "mx", "spf", "autodiscover", "dkim1", "dkim2", "dmarc")}
+    truth["zone_id"] = "zone"
+    monkeypatch.setattr(objective_reconciliation, "_ensure_cloudflare_truth", AsyncMock(return_value=truth))
+    monkeypatch.setattr(m365_setup, "cloudflare_service", SimpleNamespace(list_dns_records=AsyncMock(return_value=[
+        {"type": "MX", "name": "example.com", "content": "other-com.mail.protection.outlook.com"},
+        {"type": "TXT", "name": "example.com", "content": "spf"},
+    ])))
+    assert await m365_setup._pending_dkim_retry_result(data) is None

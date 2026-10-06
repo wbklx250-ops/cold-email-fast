@@ -350,7 +350,54 @@ async def _sync_tenant_step5_state(session: AsyncSession, tenant_obj: Tenant | N
             )
 
 
-async def _save_step6_result(domain_data: dict, selenium_result: dict):
+async def _pending_dkim_retry_result(domain_data: dict) -> Optional[dict]:
+    """Recheck existing wizard DNS before retrying only Exchange DKIM signing."""
+    if not domain_data.get("dkim_only_retry"):
+        return None
+    values = domain_data.get("expected_dns_values") or {}
+    selector1 = values.get("dkim_selector1_cname") or values.get("dkim_selector1")
+    selector2 = values.get("dkim_selector2_cname") or values.get("dkim_selector2")
+    if not all((values.get("mx_value"), values.get("spf_value"), selector1, selector2)):
+        return None
+    from app.services.objective_reconciliation import _ensure_cloudflare_truth
+
+    dns_truth = await _ensure_cloudflare_truth(
+        {"name": domain_data["domain"], "cloudflare_zone_id": domain_data["zone_id"]},
+        {"selector1": selector1, "selector2": selector2}, auto_fix=False,
+    )
+    if not all(dns_truth.get(key) for key in
+               ("zone_ok", "mx", "spf", "autodiscover", "dkim1", "dkim2", "dmarc")):
+        logger.warning("[%s] Existing DNS did not pass readback; returning to wizard", domain_data["domain"])
+        return None
+    # Confirm the captured MX and SPF values, rather than accepting any M365 record.
+    records = await cloudflare_service.list_dns_records(dns_truth["zone_id"])
+    domain_name = domain_data["domain"].lower()
+    for record_type, value_key in (("MX", "mx_value"), ("TXT", "spf_value")):
+        if not any(
+            record.get("type") == record_type
+            and (record.get("name") or "").rstrip(".").lower() == domain_name
+            and (record.get("content") or "").strip().strip('"').rstrip(".").lower()
+                == values[value_key].strip().strip('"').rstrip(".").lower()
+            for record in records
+        ):
+            return None
+    logger.info("[%s] DNS is already configured; retrying Exchange DKIM signing without browser or DNS writes", domain_data["domain"])
+    return {
+        "success": True, "verified": True, "dns_configured": True,
+        "dmarc_configured": True, "mx_value": values["mx_value"],
+        "spf_value": values["spf_value"], "dkim_selector1_cname": selector1,
+        "dkim_selector2_cname": selector2, "error": None,
+    }
+
+
+async def _run_domain_setup(domain_data: dict) -> dict:
+    result = await _pending_dkim_retry_result(domain_data)
+    if result is not None:
+        return result
+    return await asyncio.to_thread(_sync_setup_domain, domain_data)
+
+
+async def _save_step6_result(domain_data: dict, selenium_result: dict) -> dict:
     """
     Save Selenium result using a FRESH database session (BackgroundSessionLocal).
     
@@ -372,7 +419,7 @@ async def _save_step6_result(domain_data: dict, selenium_result: dict):
                 
                 if not domain_obj:
                     logger.error(f"[{domain_name}] Domain not found for DB save!")
-                    return
+                    return {"success": False, "error": "Domain not found for DB save"}
                 
                 # Handle exceptions from gather(return_exceptions=True)
                 if isinstance(selenium_result, Exception):
@@ -544,7 +591,7 @@ async def _save_step6_result(domain_data: dict, selenium_result: dict):
                     
                     await _sync_tenant_step5_state(session, tenant_obj, now)
                     await session.commit()
-                    logger.info(f"[{domain_name}] ✓ DB SAVED: PARTIAL (verified only)")
+                    logger.info(f"[{domain_name}] DB SAVED: status={domain_obj.status.value}, reason={domain_obj.error_message}")
                 
                 else:
                     # Complete failure
@@ -566,7 +613,7 @@ async def _save_step6_result(domain_data: dict, selenium_result: dict):
                     await session.commit()
                     logger.error(f"[{domain_name}] ✗ DB SAVED error: {error_msg}")
                 
-                return  # Success — exit retry loop
+                return selenium_result  # Return the validated result to the worker.
                 
         except Exception as e:
             logger.error(f"[{domain_name}] DB save attempt {db_attempt + 1}/{DB_RETRY_COUNT} FAILED: {e}")
@@ -576,6 +623,8 @@ async def _save_step6_result(domain_data: dict, selenium_result: dict):
             else:
                 logger.error(f"[{domain_name}] ✗✗ FAILED TO SAVE TO DB after {DB_RETRY_COUNT} attempts!")
                 logger.error(traceback.format_exc())
+
+    return {"success": False, "error": f"Failed to save validated domain result after {DB_RETRY_COUNT} attempts"}
 
 
 # ============================================================
@@ -698,6 +747,7 @@ async def run_step5_for_batch(
             "admin_password": tenant.admin_password,
             "totp_secret": tenant.totp_secret,
             "already_verified": domain.domain_verified_in_m365,
+            "dkim_only_retry": domain.status == DomainStatus.PENDING_DKIM,
             "expected_dns_values": {
                 "mx_value": domain.mx_value,
                 "spf_value": domain.spf_value,
@@ -745,11 +795,7 @@ async def run_step5_for_batch(
             
             try:
                 # Run Selenium in thread pool (synchronous)
-                selenium_future = asyncio.get_event_loop().run_in_executor(
-                    None,
-                    _sync_setup_domain,
-                    domain_data
-                )
+                selenium_future = asyncio.create_task(_run_domain_setup(domain_data))
                 try:
                     selenium_result = await asyncio.wait_for(
                         selenium_future,
@@ -776,7 +822,7 @@ async def run_step5_for_batch(
                     }
                 
                 # Save to DB with FRESH session immediately
-                await _save_step6_result(domain_data, selenium_result)
+                selenium_result = await _save_step6_result(domain_data, selenium_result)
                 
                 # Update counters
                 async with lock:
@@ -946,6 +992,7 @@ async def run_step5_for_tenant(db: AsyncSession, tenant_id: UUID, on_progress=No
             "admin_email": tenant.admin_email,
             "admin_password": tenant.admin_password,
             "totp_secret": tenant.totp_secret,
+            "dkim_only_retry": domain.status == DomainStatus.PENDING_DKIM,
             "expected_dns_values": {
                 "mx_value": domain.mx_value,
                 "spf_value": domain.spf_value,
@@ -959,7 +1006,7 @@ async def run_step5_for_tenant(db: AsyncSession, tenant_id: UUID, on_progress=No
         # PHASE 2: Run Selenium in thread
         logger.info(f"[{result.domain_name}] Starting Selenium automation...")
         loop = asyncio.get_event_loop()
-        selenium_future = loop.run_in_executor(None, _sync_setup_domain, tenant_data)
+        selenium_future = asyncio.create_task(_run_domain_setup(tenant_data))
         try:
             selenium_result = await asyncio.wait_for(
                 selenium_future,
@@ -988,7 +1035,7 @@ async def run_step5_for_tenant(db: AsyncSession, tenant_id: UUID, on_progress=No
         
         # PHASE 3: Save to DB using fresh session
         tenant_data["domain_id"] = str(domain.id)
-        await _save_step6_result(tenant_data, selenium_result)
+        selenium_result = await _save_step6_result(tenant_data, selenium_result)
         
         if selenium_result.get("success"):
             result.success = True
@@ -1001,7 +1048,7 @@ async def run_step5_for_tenant(db: AsyncSession, tenant_id: UUID, on_progress=No
         elif selenium_result.get("verified"):
             result.domain_added = True
             result.domain_verified = True
-            result.error = "Domain verified but DNS setup incomplete"
+            result.error = selenium_result.get("error") or "Domain verified but DNS setup incomplete"
             result.error_step = "dns_setup"
         else:
             result.error = selenium_result.get("error", "Unknown error")

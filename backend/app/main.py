@@ -87,7 +87,7 @@ async def lifespan(app: FastAPI):
         if ensure_powershell_modules():
             logger.info("PowerShell environment ready - M365 automation enabled")
         else:
-            logger.error("Failed to setup PowerShell modules - M365 automation will not work")
+            raise RuntimeError("PowerShell module installation/import verification failed; refusing an unusable automation deployment")
     else:
         logger.warning("PowerShell not available - M365 automation will not work")
 

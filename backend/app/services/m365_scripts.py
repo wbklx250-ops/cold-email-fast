@@ -23,8 +23,8 @@ class M365ScriptGenerator:
 
 $ErrorActionPreference = "Stop"
 
-Import-Module Microsoft.Graph.Authentication
-Import-Module Microsoft.Graph.Identity.DirectoryManagement
+Import-Module Microsoft.Graph.Authentication -RequiredVersion 2.41.0
+Import-Module Microsoft.Graph.Identity.DirectoryManagement -RequiredVersion 2.41.0
 
 Disconnect-MgGraph -ErrorAction SilentlyContinue
 
@@ -63,8 +63,8 @@ Disconnect-MgGraph
 # Domain: {domain}
 # Generated: {datetime.utcnow().isoformat()}
 
-Import-Module Microsoft.Graph.Authentication
-Import-Module Microsoft.Graph.Identity.DirectoryManagement
+Import-Module Microsoft.Graph.Authentication -RequiredVersion 2.41.0
+Import-Module Microsoft.Graph.Identity.DirectoryManagement -RequiredVersion 2.41.0
 
 Disconnect-MgGraph -ErrorAction SilentlyContinue
 Connect-MgGraph -TenantId "{tenant_id}" -Scopes "Domain.ReadWrite.All" -NoWelcome

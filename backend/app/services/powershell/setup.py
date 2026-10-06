@@ -13,6 +13,10 @@ import sys
 
 logger = logging.getLogger(__name__)
 
+# Keep the SDK modules on one release: mixed Authentication dependencies load
+# different assemblies with the same name into the same PowerShell process.
+GRAPH_MODULE_VERSION = "2.41.0"
+
 # Required PowerShell modules for current M365 operations
 REQUIRED_MODULES = [
     "ExchangeOnlineManagement",
@@ -85,6 +89,8 @@ def ensure_powershell_modules() -> bool:
             logger.info(f"Optional module already installed: {module}")
     
     if all_success:
+        all_success = _verify_graph_imports()
+    if all_success:
         _modules_verified = True
         logger.info("All PowerShell modules verified and ready")
     
@@ -101,7 +107,11 @@ def _is_module_installed(module_name: str) -> bool:
     Returns:
         True if module is installed, False otherwise
     """
-    script = f'Get-Module -ListAvailable -Name {module_name} | Select-Object -First 1'
+    version_filter = (
+        f" | Where-Object {{ $_.Version -eq [version]'{GRAPH_MODULE_VERSION}' }}"
+        if module_name.startswith("Microsoft.Graph.") else ""
+    )
+    script = f'Get-Module -ListAvailable -Name {module_name}{version_filter} | Select-Object -First 1'
     
     try:
         result = subprocess.run(
@@ -114,7 +124,7 @@ def _is_module_installed(module_name: str) -> bool:
         )
         
         # Module is installed if its name appears in the output
-        return module_name.lower() in result.stdout.lower()
+        return result.returncode == 0 and module_name.lower() in result.stdout.lower()
         
     except subprocess.TimeoutExpired:
         logger.warning(f"Timeout checking module {module_name}")
@@ -138,6 +148,10 @@ def _install_module(module_name: str) -> bool:
         True if installation succeeded, False otherwise
     """
     # PowerShell script to install module
+    required_version = (
+        f"-RequiredVersion {GRAPH_MODULE_VERSION}"
+        if module_name.startswith("Microsoft.Graph.") else ""
+    )
     script = f'''
 # Enable TLS 1.2 for PSGallery (required on older systems)
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -147,7 +161,7 @@ $null = Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorActio
 
 # Install the module
 try {{
-    Install-Module -Name {module_name} -Force -AllowClobber -Scope CurrentUser -ErrorAction Stop
+    Install-Module -Name {module_name} {required_version} -Force -AllowClobber -Scope CurrentUser -ErrorAction Stop
     Write-Output "MODULE_INSTALLED_SUCCESSFULLY"
 }} catch {{
     Write-Error "Installation failed: $($_.Exception.Message)"
@@ -179,6 +193,26 @@ try {{
         return False
     except Exception as e:
         logger.error(f"Exception installing module {module_name}: {e}")
+        return False
+
+
+def _verify_graph_imports() -> bool:
+    """Actually load the SDK together; installed files alone do not prove readiness."""
+    script = "$ErrorActionPreference = 'Stop'; " + "; ".join(
+        f"Import-Module {name} -RequiredVersion {GRAPH_MODULE_VERSION} -ErrorAction Stop"
+        for name in REQUIRED_MODULES if name.startswith("Microsoft.Graph.")
+    )
+    try:
+        result = subprocess.run(
+            [PWSH_PATH, "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, timeout=120,
+            encoding="utf-8", errors="replace",
+        )
+        if result.returncode != 0:
+            logger.error("Graph SDK import verification failed: %s", result.stderr[-2000:])
+        return result.returncode == 0
+    except Exception as exc:
+        logger.error("Graph SDK import verification failed: %s", exc)
         return False
 
 

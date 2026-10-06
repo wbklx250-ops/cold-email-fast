@@ -66,8 +66,8 @@ $mailboxes = $csvData | ConvertFrom-Csv
 Write-Host "Mailboxes to create: $($mailboxes.Count)" -ForegroundColor Cyan
 
 # Connect to services
-Import-Module Microsoft.Graph.Authentication
-Import-Module Microsoft.Graph.Users
+Import-Module Microsoft.Graph.Authentication -RequiredVersion 2.41.0
+Import-Module Microsoft.Graph.Users -RequiredVersion 2.41.0
 Import-Module ExchangeOnlineManagement
 
 Disconnect-MgGraph -ErrorAction SilentlyContinue

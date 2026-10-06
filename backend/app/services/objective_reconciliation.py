@@ -259,7 +259,7 @@ async def _repair_m365_domain_with_selenium(
                 "error": f"Selenium M365 setup timed out after {STEP6_DOMAIN_TIMEOUT_SECONDS}s",
             }
 
-        await _save_step6_result(selenium_input, selenium_result)
+        selenium_result = await _save_step6_result(selenium_input, selenium_result)
         verified = bool(selenium_result.get("success") or selenium_result.get("verified"))
         result.update(
             {
@@ -726,8 +726,8 @@ $out = @{
 }
 try {
     Import-Module ExchangeOnlineManagement -ErrorAction Stop
-    Import-Module Microsoft.Graph.Users -ErrorAction Stop
-    Import-Module Microsoft.Graph.Identity.DirectoryManagement -ErrorAction SilentlyContinue
+    Import-Module Microsoft.Graph.Users -RequiredVersion 2.41.0 -ErrorAction Stop
+    Import-Module Microsoft.Graph.Identity.DirectoryManagement -RequiredVersion 2.41.0 -ErrorAction SilentlyContinue
 
     $sp = ConvertTo-SecureString '__PASSWORD_SINGLE__' -AsPlainText -Force
     $cred = New-Object System.Management.Automation.PSCredential('__ADMIN__', $sp)

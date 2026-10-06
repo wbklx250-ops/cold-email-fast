@@ -1046,7 +1046,7 @@ try {{
 
         connect_graph_cmd = f'''
 try {{
-    Import-Module Microsoft.Graph.Users -ErrorAction Stop
+    Import-Module Microsoft.Graph.Users -RequiredVersion 2.41.0 -ErrorAction Stop
     $securePassword = ConvertTo-SecureString "{escaped_admin_password}" -AsPlainText -Force
     $credential = New-Object System.Management.Automation.PSCredential("{escaped_admin_email}", $securePassword)
     Connect-MgGraph -Credential $credential -NoWelcome -ErrorAction Stop
@@ -1225,7 +1225,7 @@ Start-Sleep -Milliseconds 300
             )
 
         full_script = f'''
-Import-Module Microsoft.Graph.Users -ErrorAction Stop
+Import-Module Microsoft.Graph.Users -RequiredVersion 2.41.0 -ErrorAction Stop
 Write-Output "MG_MODULE_LOADED"
 
 Disconnect-MgGraph -ErrorAction SilentlyContinue

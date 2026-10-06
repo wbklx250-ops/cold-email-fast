@@ -290,9 +290,9 @@ def _build_licensed_user_script(
     return f'''
 $ErrorActionPreference = "Stop"
 try {{
-    Import-Module Microsoft.Graph.Users -ErrorAction Stop
-    Import-Module Microsoft.Graph.Users.Actions -ErrorAction Stop
-    Import-Module Microsoft.Graph.Identity.DirectoryManagement -ErrorAction SilentlyContinue
+    Import-Module Microsoft.Graph.Users -RequiredVersion 2.41.0 -ErrorAction Stop
+    Import-Module Microsoft.Graph.Users.Actions -RequiredVersion 2.41.0 -ErrorAction Stop
+    Import-Module Microsoft.Graph.Identity.DirectoryManagement -RequiredVersion 2.41.0 -ErrorAction SilentlyContinue
 
     $body2 = @{{
         grant_type = "password"
@@ -1229,7 +1229,7 @@ Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue
 # === STEP 5: GRAPH — Enable accounts + set passwords ===
 Write-Host "STEP5_GRAPH"
 try {{
-    Import-Module Microsoft.Graph.Users -ErrorAction Stop
+    Import-Module Microsoft.Graph.Users -RequiredVersion 2.41.0 -ErrorAction Stop
     $body = @{{
         grant_type = "password"
         client_id = "1b730954-1685-4b74-9bfd-dac224a7b894"
