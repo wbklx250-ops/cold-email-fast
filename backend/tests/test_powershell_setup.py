@@ -21,6 +21,12 @@ def test_sdk_import_failure_does_not_mark_installed_modules_ready(monkeypatch):
     assert not setup._modules_verified
 
 
+def test_long_module_names_do_not_depend_on_powershell_table_formatting(monkeypatch):
+    monkeypatch.setattr(setup.subprocess, "run", Mock(return_value=SimpleNamespace(
+        returncode=0, stdout="MODULE_AVAILABLE\n", stderr="")))
+    assert setup._is_module_installed("Microsoft.Graph.Identity.DirectoryManagement")
+
+
 def test_sdk_ready_check_loads_every_module_in_the_same_process(monkeypatch):
     run = Mock(return_value=SimpleNamespace(returncode=0, stdout="", stderr=""))
     monkeypatch.setattr(setup.subprocess, "run", run)

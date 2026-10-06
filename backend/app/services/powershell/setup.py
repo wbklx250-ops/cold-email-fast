@@ -111,7 +111,12 @@ def _is_module_installed(module_name: str) -> bool:
         f" | Where-Object {{ $_.Version -eq [version]'{GRAPH_MODULE_VERSION}' }}"
         if module_name.startswith("Microsoft.Graph.") else ""
     )
-    script = f'Get-Module -ListAvailable -Name {module_name}{version_filter} | Select-Object -First 1'
+    # Emit a stable marker: PowerShell's formatted tables truncate long names
+    # such as Microsoft.Graph.Identity.DirectoryManagement in captured stdout.
+    script = (
+        f'$module = Get-Module -ListAvailable -Name {module_name}{version_filter} | Select-Object -First 1; '
+        'if ($module) { Write-Output "MODULE_AVAILABLE" }'
+    )
     
     try:
         result = subprocess.run(
@@ -124,7 +129,7 @@ def _is_module_installed(module_name: str) -> bool:
         )
         
         # Module is installed if its name appears in the output
-        return result.returncode == 0 and module_name.lower() in result.stdout.lower()
+        return result.returncode == 0 and "MODULE_AVAILABLE" in result.stdout
         
     except subprocess.TimeoutExpired:
         logger.warning(f"Timeout checking module {module_name}")
