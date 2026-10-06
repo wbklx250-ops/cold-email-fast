@@ -188,3 +188,44 @@ async def test_pending_dkim_retry_rejects_mx_from_another_domain(monkeypatch):
         {"type": "TXT", "name": "example.com", "content": "spf"},
     ])))
     assert await m365_setup._pending_dkim_retry_result(data) is None
+
+
+@pytest.mark.asyncio
+async def test_focused_dkim_retry_waits_for_exchange_dns_propagation(monkeypatch):
+    readback = AsyncMock(side_effect=[
+        {"success": False, "enabled": False, "error": "CNAME record does not exist"},
+        {"success": True, "enabled": False},
+        {"success": True, "enabled": True},
+    ])
+    monkeypatch.setattr(objective_reconciliation, "_read_dkim_truth", readback)
+    sleep = AsyncMock()
+    monkeypatch.setattr(m365_setup.asyncio, "sleep", sleep)
+    result = await m365_setup._enable_domain_dkim("example.com", {
+        "dkim_only_retry": True, "admin_email": "admin@tenant", "admin_password": "password"})
+    assert result["enabled"]
+    assert [call.args[0] for call in sleep.await_args_list] == [30, 60]
+    assert readback.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_dkim_retry_does_not_repeat_authentication_errors(monkeypatch):
+    readback = AsyncMock(return_value={"success": False, "enabled": False, "error": "Authentication failed"})
+    monkeypatch.setattr(objective_reconciliation, "_read_dkim_truth", readback)
+    sleep = AsyncMock()
+    monkeypatch.setattr(m365_setup.asyncio, "sleep", sleep)
+    assert not (await m365_setup._enable_domain_dkim("example.com", {
+        "dkim_only_retry": True, "admin_email": "admin@tenant", "admin_password": "password"}))["enabled"]
+    readback.assert_awaited_once()
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dkim_propagation_wait_is_bounded(monkeypatch):
+    readback = AsyncMock(return_value={"success": True, "enabled": False})
+    monkeypatch.setattr(objective_reconciliation, "_read_dkim_truth", readback)
+    sleep = AsyncMock()
+    monkeypatch.setattr(m365_setup.asyncio, "sleep", sleep)
+    assert not (await m365_setup._enable_domain_dkim("example.com", {
+        "dkim_only_retry": True, "admin_email": "admin@tenant", "admin_password": "password"}))["enabled"]
+    assert readback.await_count == 5
+    assert sum(call.args[0] for call in sleep.await_args_list) == 300

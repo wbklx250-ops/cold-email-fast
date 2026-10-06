@@ -397,6 +397,29 @@ async def _run_domain_setup(domain_data: dict) -> dict:
     return await asyncio.to_thread(_sync_setup_domain, domain_data)
 
 
+async def _enable_domain_dkim(domain_name: str, domain_data: dict) -> dict:
+    """Allow DNS propagation time on a focused retry, without rewriting DNS."""
+    from app.services.objective_reconciliation import _read_dkim_truth
+
+    retry_delays = (30, 60, 90, 120) if domain_data.get("dkim_only_retry") else ()
+    for attempt in range(len(retry_delays) + 1):
+        truth = await _read_dkim_truth(
+            {"name": domain_name, "tenant": {
+                "admin_email": domain_data["admin_email"],
+                "admin_password": domain_data["admin_password"],
+            }}, enable=True,
+        )
+        if truth.get("enabled"):
+            return truth
+        # Authentication/module errors need a fix; DNS propagation needs time.
+        propagation_pending = truth.get("success") or "cname" in str(truth.get("error") or "").lower()
+        if not propagation_pending or attempt == len(retry_delays):
+            return truth
+        delay = retry_delays[attempt]
+        logger.info("[%s] Exchange DKIM is still pending; rechecking in %ss without DNS writes", domain_name, delay)
+        await asyncio.sleep(delay)
+
+
 async def _save_step6_result(domain_data: dict, selenium_result: dict) -> dict:
     """
     Save Selenium result using a FRESH database session (BackgroundSessionLocal).
@@ -457,18 +480,7 @@ async def _save_step6_result(domain_data: dict, selenium_result: dict) -> dict:
                     else:
                         # The wizard completion screen does not prove Exchange
                         # is actually signing for this custom domain.
-                        from app.services.objective_reconciliation import _read_dkim_truth
-
-                        dkim_truth = await _read_dkim_truth(
-                            {
-                                "name": domain_name,
-                                "tenant": {
-                                    "admin_email": domain_data["admin_email"],
-                                    "admin_password": domain_data["admin_password"],
-                                },
-                            },
-                            enable=True,
-                        )
+                        dkim_truth = await _enable_domain_dkim(domain_name, domain_data)
                         if not dkim_truth.get("enabled"):
                             selenium_result = {
                                 **selenium_result,
