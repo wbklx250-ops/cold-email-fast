@@ -30,6 +30,15 @@ for five minutes after an accepted or recovered send; it does not independently 
 Microsoft provisioning, trial eligibility, existing MFA and billing requirements still apply.
 Trials must show zero due today; the shortest offered term is selected and renewal stays unchanged.
 
+Microsoft sometimes requires a separate recurring-payment authorization checkbox before its final
+trial order button is enabled. The operator explicitly authorized accepting that required consent
+for these tenant trials on 2026-11-04. `READINESS_ACCEPT_TRIAL_RECURRING_PAYMENTS=true` and
+`READINESS_TRIAL_CONSENT_TENANT_IDS` (a JSON list of the 34 supplied tenant GUIDs) enable
+that behavior for this batch; new tenants are not automatically included. The code default is
+false. Only the specifically labeled payment-consent checkbox
+is accepted, after verifying the free checkout and selecting the shortest term. Other renewal
+controls retain their defaults. Unconfirmed final orders remain protected from automatic repetition.
+
 The local `tenant-readiness/migrate_to_cloud.py` transfers existing results and DPAPI-protected
 authentication checkpoints directly over TLS after the local runner has stopped. It never writes
 plaintext credential exports. Do not run the local runner again against a tenant being checked

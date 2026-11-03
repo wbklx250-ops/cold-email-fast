@@ -572,10 +572,33 @@ class Browser:
                     raise
             time.sleep(1)
 
-    def shortest_terms(self):
+    def checkout_scope(self):
+        # Some MCA checkout panels have a heading but no ARIA dialog role.
+        # Find their nearest shared container with the corresponding action.
+        for title, actions in [
+            (r'^Trial renewal settings$', ['Place order', 'Start trial']),
+            (r'^Checkout$', ['Next', 'Continue']),
+        ]:
+            headings = self.page.get_by_role('heading', name=re.compile(title, re.I))
+            for heading in headings.all():
+                if not heading.is_visible():
+                    continue
+                condition = ' or '.join(f'normalize-space(.)="{action}"' for action in actions)
+                panel = heading.locator('xpath=ancestor::*[.//button[' + condition + ']][1]')
+                if panel.count() and panel.is_visible():
+                    return panel
+        dialogs = self.page.get_by_role('dialog')
+        return dialogs.last if dialogs.count() and dialogs.last.is_visible() else self.page.locator('body')
+
+    def shortest_terms(self, scope=None):
+        # Fluent's checkout overlays leave the product page in the DOM. A
+        # background control can report visible while the dialog blocks clicks.
+        # Only change terms in the active dialog when checkout is open.
+        if scope is None:
+            scope = self.checkout_scope()
         selected = []
-        for i in range(self.page.locator("select").count()):
-            control = self.page.locator("select").nth(i)
+        for i in range(scope.locator("select").count()):
+            control = scope.locator("select").nth(i)
             if not control.is_visible():
                 continue
             labels = control.locator("option").all_text_contents()
@@ -583,8 +606,8 @@ class Browser:
             if index is not None:
                 control.select_option(index=index)
                 selected.append(labels[index].strip())
-        for i in range(min(self.page.get_by_role("combobox").count(), 15)):
-            control = self.page.get_by_role("combobox").nth(i)
+        for i in range(min(scope.get_by_role("combobox").count(), 15)):
+            control = scope.get_by_role("combobox").nth(i)
             if not control.is_visible() or control.evaluate("el => el.tagName") == "SELECT":
                 continue
             label = (control.get_attribute("aria-label") or "") + " " + control.inner_text()
@@ -592,6 +615,7 @@ class Browser:
                 continue
             control.click()
             options = self.page.get_by_role("option")
+            options.first.wait_for(state='visible', timeout=15000)
             labels = options.all_text_contents()
             index = shortest_option(labels)
             if index is not None:
@@ -601,7 +625,7 @@ class Browser:
                 self.page.keyboard.press("Escape")
         # Fluent radio inputs get their accessible names from <label for=id>.
         groups = {}
-        for radio in self.page.locator('input[type=radio]').all():
+        for radio in scope.locator('input[type=radio]').all():
             radio_id = radio.get_attribute('id') or ''
             if radio_id:
                 group_name = radio.get_attribute('name') or radio_id.rsplit('-', 1)[0]
@@ -609,8 +633,8 @@ class Browser:
         for radio_ids in groups.values():
             choices = []
             for radio_id in radio_ids:
-                radio = self.page.locator(f'input[id="{radio_id}"]')
-                label = self.page.locator(f'label[for="{radio_id}"]')
+                radio = scope.locator(f'input[id="{radio_id}"]')
+                label = scope.locator(f'label[for="{radio_id}"]')
                 if not radio.count() or not radio.is_enabled() or not label.count() or not label.is_visible():
                     continue
                 text = radio.get_attribute('aria-label') or label.inner_text()
@@ -619,9 +643,9 @@ class Browser:
                     choices.append((days, radio_id, text))
             if choices:
                 _, radio_id, text = min(choices)
-                radio = self.page.locator(f'input[id="{radio_id}"]')
+                radio = scope.locator(f'input[id="{radio_id}"]')
                 if not radio.is_checked():
-                    self.page.locator(f'label[for="{radio_id}"]').click()
+                    scope.locator(f'label[for="{radio_id}"]').click()
                 selected.append(text)
         return selected
 
@@ -725,6 +749,8 @@ class Browser:
             alternative(str(exc))
         card_prompted = False
         last_license_poll = 0
+        checkout_step = 'opening the trial product'
+        last_ui_timeout = ''
         while time.monotonic() < deadline:
             try:
                 if time.monotonic() - last_license_poll > 8:
@@ -733,21 +759,18 @@ class Browser:
                         return True
                 if submitted:
                     self.process_operator_action()
-                    dialogs = self.page.get_by_role('dialog')
-                    if dialogs.count():
-                        response_text = dialogs.last.inner_text(timeout=10000)
-                        if re.search(r'maximum number of subscriptions.*already been redeemed|trial.*already (?:been )?(?:used|redeemed)', response_text, re.I):
-                            alternative('Microsoft rejected this product trial because its redemption limit was already reached.')
-                            continue
+                    response_scope = self.checkout_scope()
+                    response_text = response_scope.inner_text(timeout=10000)
+                    if re.search(r'maximum number of subscriptions.*already been redeemed|trial.*already (?:been )?(?:used|redeemed)', response_text, re.I):
+                        alternative('Microsoft rejected this product trial because its redemption limit was already reached.')
+                        continue
                     # Some MCA checkouts first show "Start trial" while loading
                     # the renewal options, then require the final "Place order".
                     if last_submit_kind == 'Start trial':
-                        dialogs = self.page.get_by_role('dialog')
-                        if dialogs.count():
-                            place_order = dialogs.last.get_by_role('button', name='Place order', exact=True)
-                            if place_order.count() and place_order.is_enabled():
-                                submitted = False
-                                continue
+                        place_order = response_scope.get_by_role('button', name='Place order', exact=True)
+                        if place_order.count() and place_order.is_enabled():
+                            submitted = False
+                            continue
                     time.sleep(3)
                     continue
                 self.advance_login()
@@ -759,8 +782,7 @@ class Browser:
                     time.sleep(2)
                     continue
                 self.click(r'^Close this coachmark$')
-                dialogs = self.page.get_by_role('dialog')
-                scope = dialogs.last if dialogs.count() and dialogs.last.is_visible() else self.page.locator('body')
+                scope = self.checkout_scope()
                 text = re.sub(r'[\u200b-\u200f\u2060-\u206f\ufeff]', '', scope.inner_text(timeout=10000))
                 if re.search(r'placing your order|loading checkout page|checking if you own this product', text, re.I):
                     time.sleep(2)
@@ -772,7 +794,25 @@ class Browser:
                 if 'Trial renewal settings' in text:
                     if not zero_checkout:
                         raise NeedsHuman('Trial renewal checkout appeared without a verified zero-due trial checkout; manual review is required.')
-                    self.shortest_terms()
+                    checkout_step = 'selecting the shortest term in the renewal dialog'
+                    on_stage('trial_renewal_settings')
+                    self.shortest_terms(scope)
+                    consent = scope.get_by_role('checkbox', name=re.compile(r'authorize\s+recurring\s+payments', re.I))
+                    if consent.count() and not consent.first.is_checked():
+                        if not getattr(self, 'accept_trial_recurring_payments', False):
+                            on_stage('needs_renewal_authorization')
+                            raise NeedsHuman('Microsoft requires explicit recurring-payment consent before activating this free trial. Place order remains disabled until that consent is authorized; no order was submitted.')
+                        checkout_step = 'accepting the explicitly authorized recurring-payment consent'
+                        checkbox_id = consent.first.get_attribute('id')
+                        label = scope.locator(f'label[for="{checkbox_id}"]') if checkbox_id else None
+                        if label is not None and label.count() and label.first.is_visible():
+                            label.first.click()
+                        else:
+                            consent.first.check()
+                        if not consent.first.is_checked():
+                            raise GraphError('Microsoft did not accept the authorized recurring-payment consent; the order was not submitted.')
+                        on_stage('trial_recurring_payment_consent_accepted')
+                    checkout_step = 'locating the final free-trial order button'
                     final = scope.get_by_role('button', name=re.compile(r'^(Place order|Start trial)$'))
                     if final.count() and final.last.is_enabled():
                         # Persist the submission stage before clicking; never repeat an uncertain order.
@@ -784,6 +824,7 @@ class Browser:
                     time.sleep(2)
                     continue
                 if re.search(r'\bCheckout\b', text) and selected_trial:
+                    checkout_step = 'checking the saved billing profile'
                     profile = scope.get_by_role('combobox', name=re.compile(r'Choose billing profile', re.I))
                     saved_profile = bool(profile.count() and profile.first.inner_text().strip() and 'Choose a billing profile' not in profile.first.inner_text())
                     requires_card = bool(re.search(r'no payment methods|payment method is required', text, re.I)) or (scope.get_by_role('button', name='Add a new payment method', exact=True).count() and not saved_profile)
@@ -796,9 +837,12 @@ class Browser:
                     if re.search(r'Total due\s*:?\s*(?:[A-Z]{0,3}\s*)?[$€£]?\s*0[.,]00\b', text, re.I):
                         zero_checkout = True
                         on_stage('trial_zero_due_verified')
+                        checkout_step = 'continuing from the zero-due checkout to renewal settings'
                         next_button = scope.get_by_role('button', name=re.compile(r'^(Next|Continue)$'))
                         if next_button.count() and next_button.first.is_enabled():
                             next_button.first.click()
+                        elif next_button.count():
+                            checkout_step = 'waiting for Microsoft to enable the checkout Next button'
                     time.sleep(2)
                     continue
                 plan = self.page.get_by_role('combobox', name='Select a plan', exact=True)
@@ -817,10 +861,14 @@ class Browser:
                 if isinstance(exc, TrialUnavailable):
                     alternative(str(exc))
                     continue
+                if type(exc).__name__ == 'TimeoutError':
+                    last_ui_timeout = checkout_step
                 if type(exc).__name__ != 'TimeoutError' and 'Execution context was destroyed' not in str(exc):
                     raise
             time.sleep(2)
-        raise NeedsHuman('Trial checkout did not produce an available Exchange license within ten minutes. The order was not repeated.')
+        if submitted:
+            raise NeedsHuman('A trial order was submitted, but an available Exchange license did not appear within ten minutes. Verify its outcome in Microsoft Billing; the order was not repeated.')
+        raise GraphError('Trial checkout automation timed out before an order was submitted. Last step: ' + (last_ui_timeout or checkout_step) + '. This is an incomplete checkout, not a confirmed Microsoft trial rejection.')
 
     def close(self):
         if self.context:

@@ -38,6 +38,12 @@ def now():
     return datetime.now(timezone.utc)
 
 
+def recurring_consent_authorized(tenant_id):
+    settings = get_settings()
+    return settings.readiness_accept_trial_recurring_payments and str(tenant_id).lower() in {
+        value.lower() for value in settings.readiness_trial_consent_tenant_ids}
+
+
 class LeaseLost(RuntimeError):
     pass
 
@@ -56,6 +62,7 @@ def cloud_secret(path, value=None):
 
 class CloudBrowser(engine.Browser):
     def open(self, url=None):
+        self.accept_trial_recurring_payments = recurring_consent_authorized(self.tenant['id'])
         self.context = self.playwright.chromium.launch_persistent_context(
             str(self.directory.resolve()), executable_path=os.getenv('CHROME_PATH', '/usr/bin/chromium'),
             headless=True, ignore_default_args=['--headless=old', '--headless'],
@@ -77,6 +84,20 @@ class CloudBrowser(engine.Browser):
         self.live['waiting'] = True
 
     def process_operator_action(self):
+        if self.live.pop('inspect_checkout', False):
+            try:
+                dialogs = self.page.get_by_role('dialog')
+                scope = dialogs.last if dialogs.count() and dialogs.last.is_visible() else self.page.locator('body')
+                self.live['checkout_inspection'] = {
+                    'captured_at': engine.utcnow(),
+                    'controls': scope.locator('h1,h2,button,select,[role=combobox],input[type=radio],input[type=checkbox],label').evaluate_all('''els => els.filter(e => e.offsetWidth || e.offsetHeight).slice(0,120).map(e => ({
+                        tag:e.tagName, role:e.getAttribute('role'), label:e.getAttribute('aria-label'),
+                        id:e.id, name:e.getAttribute('name'), type:e.type,
+                        disabled:e.disabled || e.getAttribute('aria-disabled') === 'true',
+                        checked:e.checked, text:e.tagName === 'INPUT' ? '' : (e.innerText || '').slice(0,200)
+                    }))''')}
+            except Exception as exc:
+                self.live['checkout_inspection'] = {'captured_at':engine.utcnow(), 'error_type':type(exc).__name__}
         while True:
             try:
                 action = self.live['actions'].get_nowait()

@@ -185,6 +185,21 @@ class BrowserAction(BaseModel):
     key: str = Field(default='', max_length=30)
 
 
+@router.get('/{tenant_id}/checkout-diagnostic', dependencies=[Depends(authorized)])
+def checkout_diagnostic(tenant_id: UUID, request: Request):
+    # This header is never forwarded by the frontend proxy. Live billing
+    # diagnostics require direct operator authentication, not ordinary app access.
+    expected = hmac.new(get_settings().readiness_operator_key.encode(), b'checkout-diagnostic', hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(request.headers.get('x-readiness-diagnostic', ''), expected):
+        raise HTTPException(403, 'Direct operator authentication is required for diagnostics.')
+    live = LIVE.get(str(tenant_id))
+    if not live:
+        raise HTTPException(409, 'This check has no active browser.')
+    live['inspect_checkout'] = True
+    return Response(json.dumps(live.get('checkout_inspection', {'pending':True})), media_type='application/json',
+                    headers={'Cache-Control':'no-store'})
+
+
 @router.get('/{tenant_id}/browser', dependencies=[Depends(authorized)])
 def browser_image(tenant_id: UUID):
     live = LIVE.get(str(tenant_id))

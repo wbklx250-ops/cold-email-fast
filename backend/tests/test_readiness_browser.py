@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 import pyotp
 from playwright.sync_api import sync_playwright
 from app.services.readiness_worker import CloudBrowser as Browser, cloud_secret as protect_password
-from app.services.readiness_engine import MFASetupError, ROOT
+from app.services.readiness_engine import MFASetupError, NeedsHuman, ROOT
 
 TEST_SEED = 'JBSWY3DPEHPK3PXP'
 
@@ -93,6 +93,93 @@ class EnrollmentBrowserTests(unittest.TestCase):
         self.browser.page.set_content('''<style>@keyframes move {from {transform:translateX(0)} to {transform:translateX(8px)}} [role=option] {animation:move .3s infinite alternate}</style><button role="combobox" aria-label="Select a plan">Choose one</button><button role="option" onclick="window.trialChosen=true">Basic (Trial)</button>''')
         self.assertEqual(self.browser.select_trial_plan(), 'Basic (Trial)')
         self.assertTrue(self.browser.page.evaluate('Boolean(window.trialChosen)'))
+
+    def test_renewal_terms_ignore_controls_behind_the_checkout_dialog(self):
+        self.browser.page.set_content('''<html><body>
+        <button role="combobox" aria-label="Billing frequency" onclick="window.backgroundTouched=true">Pay monthly</button>
+        <div role="dialog" style="position:fixed;inset:0;background:white;z-index:100">
+          <h2>Trial renewal settings</h2>
+          <input type="radio" name="term" id="term-year" checked><label for="term-year">1 year</label>
+          <input type="radio" name="term" id="term-month"><label for="term-month">1 month</label>
+          <input type="radio" name="frequency" id="freq-year" checked><label for="freq-year">Pay yearly</label>
+          <input type="radio" name="frequency" id="freq-month"><label for="freq-month">Pay monthly</label>
+          <input type="checkbox" id="renew" checked><label for="renew">Recurring billing</label>
+        </div></body></html>''')
+        self.browser.shortest_terms()
+        self.assertFalse(self.browser.page.evaluate('Boolean(window.backgroundTouched)'))
+        self.assertTrue(self.browser.page.locator('#term-month').is_checked())
+        self.assertTrue(self.browser.page.locator('#freq-month').is_checked())
+        self.assertTrue(self.browser.page.locator('#renew').is_checked())
+
+    def _exercise_checkout(self, authorized):
+        self.browser.accept_trial_recurring_payments = authorized
+        checkout = '<h2>Checkout</h2><p>Total due: NZ$0.00</p><button onclick="renewal()">Next</button>'
+        renewal = '''<h2>Trial renewal settings</h2>
+          <input type="radio" name="term" id="year" checked><label for="year">1 year</label>
+          <input type="radio" name="term" id="month"><label for="month">1 month</label>
+          <input type="radio" name="freq" id="annual" checked><label for="annual">Pay yearly</label>
+          <input type="radio" name="freq" id="monthly"><label for="monthly">Pay monthly</label>
+          <input type="checkbox" id="renew" checked><label for="renew">Recurring billing</label>
+          <input type="checkbox" id="consent" onchange="document.getElementById('place-order').disabled=!this.checked"><label for="consent">By checking the box, you authorize recurring payments that will continue unless canceled.</label>
+          <button id="place-order" disabled onclick="order()">Place order</button>'''
+        self.browser.page.set_content('<html><body><button role="combobox" aria-label="Select a plan">Basic (Trial)</button><button onclick="checkout()">Start free trial</button><script>const checkoutHTML=' + json.dumps(checkout) + ';const renewalHTML=' + json.dumps(renewal) + ';' + r'''
+          function checkout() {
+            const background = document.createElement('button');
+            background.setAttribute('role','combobox');background.setAttribute('aria-label','Billing frequency');
+            background.textContent='Pay monthly';background.onclick=()=>window.backgroundTouched=true;
+            document.body.append(background);
+            const panel=document.createElement('div');panel.id='checkout';
+            panel.style='position:fixed;inset:0;background:white;z-index:100';panel.innerHTML=checkoutHTML;document.body.append(panel);
+          }
+          function renewal(){document.getElementById('checkout').innerHTML=renewalHTML}
+          function order(){window.ordered=document.getElementById('month').checked && document.getElementById('monthly').checked && document.getElementById('renew').checked && document.getElementById('consent').checked}
+        </script></body></html>''')
+        graph = Mock()
+        sku = {'skuId':'synthetic', 'skuPartNumber':'O365_BUSINESS_ESSENTIALS', 'capabilityStatus':'Enabled',
+               'prepaidUnits':{'enabled':25}, 'consumedUnits':0,
+               'servicePlans':[{'servicePlanId':'exchange','servicePlanName':'EXCHANGE_S_STANDARD','provisioningStatus':'Success'}]}
+        graph.request.side_effect = lambda *args: {'value':[sku] if self.browser.page.evaluate('Boolean(window.ordered)') else []}
+        stages = []
+        def progress(stage):
+            stages.append(stage)
+            if stage == 'trial_order_submitted':
+                self.assertTrue((Path(self.temp.name) / 'trial-order-pending.json').exists())
+                self.assertFalse(self.browser.page.evaluate('Boolean(window.ordered)'))
+        with patch.object(self.browser, 'portal'), patch.object(self.browser, 'navigate'), patch.object(self.browser, 'advance_login'):
+            if authorized:
+                self.assertTrue(self.browser.start_trial(graph, progress))
+            else:
+                with self.assertRaises(NeedsHuman):
+                    self.browser.start_trial(graph, progress)
+        if not authorized:
+            self.assertFalse(self.browser.page.locator('#consent').is_checked())
+            self.assertFalse(self.browser.page.evaluate('Boolean(window.ordered)'))
+            self.assertFalse((Path(self.temp.name) / 'trial-order-pending.json').exists())
+            self.assertIn('needs_renewal_authorization', stages)
+            return
+        self.assertTrue(self.browser.page.evaluate('Boolean(window.ordered)'))
+        self.assertFalse(self.browser.page.evaluate('Boolean(window.backgroundTouched)'))
+        self.assertEqual(stages.count('trial_order_submitted'), 1)
+        self.assertIn('trial_zero_due_verified', stages)
+        self.assertIn('trial_renewal_settings', stages)
+        self.assertIn('trial_recurring_payment_consent_accepted', stages)
+        self.assertTrue(self.browser.page.locator('#renew').is_checked())
+
+    def test_zero_due_checkout_completes_with_authorized_consent_in_a_panel_without_dialog_role(self):
+        self._exercise_checkout(True)
+
+    def test_recurring_payment_consent_is_never_assumed(self):
+        self._exercise_checkout(False)
+
+    def test_renewal_dialog_cannot_submit_without_a_verified_zero_due_checkout(self):
+        self.browser.page.set_content('<div role="dialog"><h2>Trial renewal settings</h2><button onclick="window.ordered=true">Place order</button></div>')
+        graph = Mock()
+        graph.request.return_value = {'value':[]}
+        with patch.object(self.browser, 'portal'), patch.object(self.browser, 'navigate'), patch.object(self.browser, 'advance_login'):
+            with self.assertRaises(NeedsHuman):
+                self.browser.start_trial(graph, Mock())
+        self.assertFalse(self.browser.page.evaluate('Boolean(window.ordered)'))
+        self.assertFalse((Path(self.temp.name) / 'trial-order-pending.json').exists())
 
     def test_enrollment_timeout_never_becomes_a_manual_setup_prompt(self):
         self.browser.enrolling = True

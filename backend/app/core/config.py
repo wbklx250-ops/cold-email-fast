@@ -1,5 +1,6 @@
 from functools import lru_cache
 import json
+from pydantic import Field
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -33,6 +34,8 @@ class Settings(BaseSettings):
     encryption_key: str = ""  # For encrypting sensitive data
     readiness_operator_key: str = ""
     readiness_parallel_browsers: int = 4
+    readiness_accept_trial_recurring_payments: bool = False
+    readiness_trial_consent_tenant_ids: list[str] = Field(default_factory=list)
     
     # Selenium
     screenshot_dir: str = "/tmp/screenshots"  # Directory for browser screenshots

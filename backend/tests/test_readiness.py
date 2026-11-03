@@ -134,6 +134,31 @@ def test_live_browser_input_is_memory_only_and_restricted(monkeypatch):
     assert live['continue']
 
 
+def test_checkout_diagnostic_requires_direct_operator_signature(monkeypatch):
+    monkeypatch.setattr(api, 'get_settings', lambda: SimpleNamespace(readiness_operator_key='test-access-key'))
+    tenant_id = uuid4()
+    monkeypatch.setitem(api.LIVE, str(tenant_id), {})
+    with pytest.raises(api.HTTPException) as denied:
+        api.checkout_diagnostic(tenant_id, Mock(headers={'x-readiness-key':'test-access-key'}))
+    assert denied.value.status_code == 403
+    signature = api.hmac.new(b'test-access-key', b'checkout-diagnostic', api.hashlib.sha256).hexdigest()
+    api.LIVE[str(tenant_id)]['waiting'] = False
+    reply = api.checkout_diagnostic(tenant_id, Mock(headers={'x-readiness-diagnostic':signature}))
+    assert json.loads(reply.body) == {'pending':True}
+    assert api.LIVE[str(tenant_id)]['inspect_checkout']
+
+
+def test_recurring_payment_authorization_is_limited_to_the_approved_tenants(monkeypatch):
+    approved, unapproved = str(uuid4()), str(uuid4())
+    settings = SimpleNamespace(readiness_accept_trial_recurring_payments=True,
+                              readiness_trial_consent_tenant_ids=[approved])
+    monkeypatch.setattr(worker, 'get_settings', lambda: settings)
+    assert worker.recurring_consent_authorized(approved)
+    assert not worker.recurring_consent_authorized(unapproved)
+    settings.readiness_accept_trial_recurring_payments = False
+    assert not worker.recurring_consent_authorized(approved)
+
+
 def test_public_report_never_exposes_authentication_checkpoint(database):
     row = record(database, state={'password':'must-not-appear', 'admin-tokens.dpapi':'private', 'sent_at':'preserved'})
     public = api.view(row)
