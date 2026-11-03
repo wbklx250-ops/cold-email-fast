@@ -31,6 +31,8 @@ class Settings(BaseSettings):
 
     # Security
     encryption_key: str = ""  # For encrypting sensitive data
+    readiness_operator_key: str = ""
+    readiness_parallel_browsers: int = 4
     
     # Selenium
     screenshot_dir: str = "/tmp/screenshots"  # Directory for browser screenshots

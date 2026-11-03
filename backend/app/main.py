@@ -99,7 +99,14 @@ async def lifespan(app: FastAPI):
     from app.api.routes.pipeline import resume_interrupted_pipelines
     await resume_interrupted_pipelines()
 
+    from app.services.readiness_worker import start_worker, stop_worker
+    readiness_task = start_worker()
+
     yield
+
+    stop_worker()
+    if readiness_task:
+        readiness_task.cancel()
 
     # Shutdown: Stop background scheduler
     logger.info("Stopping background job scheduler...")
@@ -163,6 +170,8 @@ app.include_router(step8_endpoints_router)
 app.include_router(domain_checker_router)
 app.include_router(reconciliation_router)
 app.include_router(licensed_user_repair_router)
+from app.api.routes.readiness import router as readiness_router
+app.include_router(readiness_router)
 
 
 @app.get("/", tags=["root"])

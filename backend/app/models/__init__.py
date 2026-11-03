@@ -1,4 +1,5 @@
 from app.models.base import Base, TimestampUUIDMixin
+from app.models.readiness import ReadinessCheck
 from app.models.batch import BatchStatus, SetupBatch
 from app.models.domain import Domain, DomainStatus
 from app.models.instantly_account import InstantlyAccount

@@ -88,6 +88,11 @@ RUN mkdir -p /tmp/screenshots /app/logs
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Decode Microsoft's authenticator setup QR without downloading another browser.
+# Playwright uses the existing pinned Chromium via CHROME_PATH.
+RUN apt-get update && apt-get install -y --no-install-recommends libzbar0 \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY . .
 
 ENV SCREENSHOT_DIR=/tmp/screenshots

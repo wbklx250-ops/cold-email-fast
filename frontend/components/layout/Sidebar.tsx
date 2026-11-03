@@ -22,6 +22,7 @@ const navigation: NavItem[] = [
   { name: "Sequencer Upload", href: "/instantly", icon: "📤" },
   { name: "Upload Manager", href: "/upload", icon: "📋" },
   { name: "Tenant Inventory", href: "/tools/domain-checker", icon: "🔎" },
+  { name: "Tenant Readiness", href: "/tools/tenant-readiness", icon: "✉️" },
 ];
 
 interface SidebarProps {
