@@ -50,7 +50,10 @@ An unknown result from the new attempt remains protected from repetition.
 Readiness checkpoints synchronize passwords and captured administrator TOTP keys to the encrypted
 tenant inventory. Domain Lookup can retrieve those accounts by exact admin email or Microsoft
 tenant ID and generate a live code without returning the seed. Existing pipeline tenants are
-updated only for an exact Microsoft tenant ID/admin match; pipeline state is preserved and a
+updated for an exact Microsoft tenant ID/admin match, or an import's valid `PENDING-<UUID>`
+identity with the exact admin and verified initial domain. Imports and first-login retries also
+hydrate missing keys from confirmed readiness checkpoints. Pipeline state is preserved, passwords
+changed by a later batch are retained, and a
 pending setup key cannot replace an existing verified key. `/sync-credentials` backfills this batch
 with direct operator authentication. Future checkpoint saves keep the inventory synchronized.
 

@@ -10,9 +10,11 @@ from sqlalchemy import select
 from app.api.routes import domain_lookup, readiness
 from app.models.readiness import ReadinessCheck
 from app.models.tenant import Tenant, TenantStatus
+from app.models.batch import SetupBatch
+from app.models.domain import Domain, DomainStatus
 from app.models.tenant_audit import TenantAudit, TenantAuditCredential
 from app.services.inventory_credentials import encrypt_inventory_value, decrypt_inventory_value
-from app.services.readiness_credentials import sync_credentials
+from app.services.readiness_credentials import sync_credentials, restore_tenant_totp
 
 SEED = 'JBSWY3DPEHPK3PXP'
 OTHER_SEED = 'KRSXG5DSNFXGOIDB'
@@ -96,3 +98,83 @@ async def test_authorized_fresh_attempt_archives_old_order_and_can_only_be_used_
     result = await readiness.reconcile_unconfirmed(body, request, test_session)
     assert result['queued'] == []
     assert result['held'] == [str(tenant_id)]
+
+
+@pytest.mark.asyncio
+async def test_placeholder_batch_tenant_inherits_key_without_changing_password_or_progress(test_session):
+    record = checkpoint(uuid4())
+    placeholder = 'PENDING-' + str(uuid4())
+    tenant = Tenant(microsoft_tenant_id=placeholder, name='Imported', onmicrosoft_domain='example.onmicrosoft.com',
+        provider='import', admin_email='ADMIN@EXAMPLE.onmicrosoft.com', admin_password='new-working-password',
+        initial_password='original', password_changed=True, first_login_completed=False, status=TenantStatus.IMPORTED)
+    test_session.add_all([record,tenant])
+    await test_session.commit()
+    result = await test_session.run_sync(lambda db: sync_credentials(db, record,
+        {'password':'earlier-readiness-password'}, {'admin-totp.dpapi':SEED}))
+    await test_session.commit()
+    assert result['existing_tenant_updated'] == 1
+    assert tenant.totp_secret == SEED
+    assert tenant.microsoft_tenant_id == placeholder
+    assert tenant.admin_password == 'new-working-password'
+    assert tenant.initial_password == 'original'
+    assert tenant.first_login_completed is False
+    assert tenant.status == TenantStatus.IMPORTED
+
+
+@pytest.mark.asyncio
+async def test_retry_hydrates_missing_placeholder_key_and_preserves_existing_key(test_session):
+    record = checkpoint(uuid4())
+    tenant = Tenant(microsoft_tenant_id='PENDING-'+str(uuid4()), name='Imported',
+        onmicrosoft_domain='example.onmicrosoft.com', provider='import', admin_email='admin@example.onmicrosoft.com',
+        admin_password='working', first_login_completed=False, status=TenantStatus.IMPORTED)
+    test_session.add_all([record,tenant])
+    await test_session.commit()
+    assert await test_session.run_sync(lambda db: restore_tenant_totp(db, tenant))
+    assert tenant.totp_secret == SEED
+    assert tenant.first_login_completed is False
+    tenant.totp_secret = OTHER_SEED
+    assert not await test_session.run_sync(lambda db: restore_tenant_totp(db, tenant))
+    assert tenant.totp_secret == OTHER_SEED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('identity,domain,stage', [
+    (str(uuid4()), 'example.onmicrosoft.com', 'complete'),
+    ('PENDING-'+str(uuid4()), 'different.onmicrosoft.com', 'complete'),
+    ('PENDING-'+str(uuid4()), 'example.onmicrosoft.com', 'totp_registration'),
+])
+async def test_key_recovery_rejects_conflicting_identity_domain_or_unfinished_setup(test_session,identity,domain,stage):
+    record = checkpoint(uuid4(), {'sender':'admin@example.onmicrosoft.com','stage':stage})
+    tenant = Tenant(microsoft_tenant_id=identity, name='Imported',onmicrosoft_domain=domain,
+        provider='import',admin_email='admin@example.onmicrosoft.com',admin_password='working',status=TenantStatus.IMPORTED)
+    test_session.add_all([record,tenant])
+    await test_session.commit()
+    assert not await test_session.run_sync(lambda db: restore_tenant_totp(db, tenant))
+    assert tenant.totp_secret is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('existing_batch', ['new', 'same', 'different'])
+async def test_csv_import_reuses_saved_key_without_claiming_first_login_complete(test_session,existing_batch):
+    from app.services.tenant_import import TenantImportService
+    batch = SetupBatch(name='New batch')
+    old_batch = SetupBatch(name='Earlier batch')
+    test_session.add_all([batch,old_batch])
+    await test_session.flush()
+    test_session.add(Domain(name='example.test',tld='test',status=DomainStatus.PURCHASED,
+        cloudflare_zone_status='pending',batch_id=batch.id))
+    test_session.add(checkpoint(uuid4()))
+    if existing_batch != 'new':
+        test_session.add(Tenant(microsoft_tenant_id='PENDING-'+str(uuid4()),name='Imported',
+            onmicrosoft_domain='example.onmicrosoft.com',provider='import',admin_email='admin@example.onmicrosoft.com',
+            admin_password='earlier-password',status=TenantStatus.IMPORTED,
+            batch_id=batch.id if existing_batch=='same' else old_batch.id))
+    await test_session.commit()
+    await TenantImportService().import_tenants(test_session,batch.id,
+        'Company Name,onmicrosoft\nExample,example\n','admin@example.onmicrosoft.com\nsynthetic-current-password\n')
+    tenant = await test_session.scalar(select(Tenant).where(Tenant.batch_id==batch.id))
+    assert tenant.totp_secret == SEED
+    assert tenant.admin_password == 'synthetic-current-password'
+    assert tenant.first_login_completed is False
+    assert tenant.password_changed is False
+    assert tenant.status == TenantStatus.IMPORTED

@@ -1,10 +1,12 @@
 """Keep readiness credentials available to the app's existing tenant inventory."""
 import json
+from uuid import UUID
 
 import pyotp
 from sqlalchemy import func, select
 
 from app.models.tenant import Tenant
+from app.models.readiness import ReadinessCheck
 from app.models.tenant_audit import TenantAudit, TenantAuditCredential
 from app.services.inventory_credentials import encrypt_inventory_value, decrypt_inventory_value
 
@@ -14,6 +16,42 @@ def setup_confirmed(state):
         return True
     return bool(state.get('sender')) and state.get('stage') not in {
         'totp_registration', 'totp_seed_saved', 'totp_verifying', 'admin_authentication'}
+
+
+def matches_tenant(tenant, record):
+    """Bind a known admin to its real ID or a matching import placeholder."""
+    if tenant.admin_email.strip().lower() != record.admin_email.strip().lower():
+        return False
+    identity = (tenant.microsoft_tenant_id or '').strip()
+    if identity.lower() == str(record.tenant_id).lower():
+        return True
+    if not identity.startswith('PENDING-') or not record.state.get('sender'):
+        return False
+    try:
+        UUID(identity.removeprefix('PENDING-'))
+    except ValueError:
+        return False
+    initial = record.state['sender'].rsplit('@', 1)[-1].lower()
+    return initial.endswith('.onmicrosoft.com') and tenant.onmicrosoft_domain.strip().lower() == initial
+
+
+def restore_tenant_totp(db, tenant):
+    """Hydrate a missing pipeline key without changing identity or step flags."""
+    if tenant.totp_secret:
+        return False
+    records = list(db.scalars(select(ReadinessCheck).where(
+        func.lower(ReadinessCheck.admin_email) == tenant.admin_email.strip().lower()).limit(2)))
+    if len(records) != 1:
+        return False
+    record = records[0]
+    if not matches_tenant(tenant, record) or not setup_confirmed(record.state):
+        return False
+    seed = json.loads(decrypt_inventory_value(record.artifacts_ciphertext)).get('admin-totp.dpapi')
+    if not seed:
+        return False
+    pyotp.TOTP(seed).now()
+    tenant.totp_secret = seed
+    return True
 
 
 def sync_credentials(db, record, credentials, artifacts, state=None):
@@ -41,16 +79,18 @@ def sync_credentials(db, record, credentials, artifacts, state=None):
         if not old or old == seed or confirmed:
             if old != seed:
                 saved.totp_ciphertext = encrypt_inventory_value(seed)
-    # Update only an exact tenant/admin match; preserve pipeline status and
-    # other administrators, and do not replace a working seed with pending setup.
-    tenant = db.scalar(select(Tenant).where(
-        func.lower(Tenant.microsoft_tenant_id) == str(record.tenant_id).lower(),
-        func.lower(Tenant.admin_email) == email))
-    main_updated = False
-    if tenant is not None and state.get('sender'):
-        tenant.admin_password = credentials['password']
+    # Imported accounts retain PENDING IDs until their first-login step. Match
+    # those by exact admin plus verified initial domain, preserving step flags.
+    tenants = db.scalars(select(Tenant).where(func.lower(Tenant.admin_email) == email)).all()
+    main_updated = 0
+    for tenant in tenants:
+        if not matches_tenant(tenant, record) or not state.get('sender'):
+            continue
+        # A later batch may already have changed the password successfully.
+        if not tenant.password_changed or not tenant.admin_password:
+            tenant.admin_password = credentials['password']
         if seed and confirmed:
             tenant.totp_secret = seed
-        main_updated = True
+        main_updated += 1
     return {'inventory_saved':1, 'totp_available':int(bool(saved.totp_ciphertext)),
-            'existing_tenant_updated':int(main_updated)}
+            'existing_tenant_updated':main_updated}

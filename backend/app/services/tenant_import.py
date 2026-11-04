@@ -25,6 +25,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from urllib.parse import unquote
 from uuid import UUID
 from dataclasses import dataclass
+from app.services.readiness_credentials import restore_tenant_totp
 
 logger = logging.getLogger(__name__)
 
@@ -655,6 +656,7 @@ class TenantImportService:
                         existing.setup_error = None
                         existing.status = TenantStatus.FIRST_LOGIN_COMPLETE
                         preconfigured_totp_saved += 1
+                    await db.run_sync(lambda session: restore_tenant_totp(session, existing))
                     skipped += 1
                     continue
                 else:
@@ -743,6 +745,7 @@ class TenantImportService:
                             old_domain.tenant_id = None
                     existing.domain_id = None
                     existing.custom_domain = None
+                    await db.run_sync(lambda session: restore_tenant_totp(session, existing))
                     reassigned += 1
                     imported += 1
                     if has_preconfigured_mfa:
@@ -777,6 +780,7 @@ class TenantImportService:
                     else TenantStatus.IMPORTED
                 )
             )
+            await db.run_sync(lambda session: restore_tenant_totp(session, tenant))
             db.add(tenant)
             imported += 1
             if has_preconfigured_mfa:

@@ -1646,6 +1646,9 @@ class BrowserWorker:
                 from app.models.tenant import Tenant as TenantModel
                 existing = check_db.get(TenantModel, UUID(tenant_id))
                 if existing:
+                    from app.services.readiness_credentials import restore_tenant_totp
+                    if restore_tenant_totp(check_db, existing):
+                        check_db.commit()
                     existing_totp_secret = existing.totp_secret
                     result.totp_secret = existing_totp_secret
                     if existing.password_changed and existing.totp_secret:
@@ -2598,6 +2601,10 @@ async def process_tenant(tenant, db, worker_id: int = 0) -> dict:
     Main entry point - process a tenant through login, password change, and MFA.
     Handles all partial states. Uses state machine approach.
     """
+    if not tenant.totp_secret:
+        from app.services.readiness_credentials import restore_tenant_totp
+        if await db.run_sync(lambda session: restore_tenant_totp(session, tenant)):
+            await db.commit()
     logger.info(f"[W{worker_id}] ========== STARTING {tenant.id} ==========")
     logger.info(f"[W{worker_id}] Email: {tenant.admin_email}")
     logger.info(f"[W{worker_id}] Password Changed: {tenant.password_changed}")
