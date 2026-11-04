@@ -76,6 +76,55 @@ def test_complete_batch_has_no_blocker():
     assert readiness.first_blocker(*ready_batch()) is None
 
 
+@pytest.mark.asyncio
+async def test_exhausted_first_login_retries_stay_incomplete_and_block_m365_setup(test_session,monkeypatch):
+    from contextlib import asynccontextmanager
+    from app.api.routes import pipeline
+    from app.models import SetupBatch, Tenant, TenantStatus, Domain, DomainStatus
+    from app.services import tenant_automation
+
+    batch=SetupBatch(name='Failed login must block',domains_per_tenant=1,total_domains=1,total_tenants=1,
+        ns_confirmed_at=datetime.now(timezone.utc))
+    test_session.add(batch)
+    await test_session.flush()
+    tenant=Tenant(name='Synthetic',provider='test',onmicrosoft_domain='synthetic.onmicrosoft.com',
+        microsoft_tenant_id=str(uuid4()),admin_email='admin@synthetic.onmicrosoft.com',
+        admin_password='synthetic-only',status=TenantStatus.IMPORTED,batch_id=batch.id,first_login_completed=False)
+    test_session.add(tenant)
+    await test_session.flush()
+    test_session.add(Domain(name='synthetic.example',tld='example',status=DomainStatus.TENANT_LINKED,
+        cloudflare_zone_status='active',cloudflare_zone_id='synthetic-zone',ns_propagated_at=datetime.now(timezone.utc),
+        batch_id=batch.id,tenant_id=tenant.id))
+    await test_session.commit()
+
+    @asynccontextmanager
+    async def session():
+        yield test_session
+
+    monkeypatch.setattr(pipeline,'SessionLocal',session)
+    monkeypatch.setattr(readiness,'SessionLocal',session)
+    monkeypatch.setattr(pipeline,'refresh_nameservers',AsyncMock())
+    monkeypatch.setattr(pipeline,'refresh_counters',AsyncMock())
+    monkeypatch.setattr(pipeline,'log_activity',AsyncMock())
+    monkeypatch.setattr(pipeline,'kill_all_browsers',lambda:None)
+    monkeypatch.setattr(pipeline,'MAX_PIPELINE_RETRIES',0)
+    monkeypatch.setattr(pipeline.asyncio,'sleep',AsyncMock())
+    process=AsyncMock(return_value=[{'tenant_id':str(tenant.id),'success':False,'error':'Synthetic MFA failure'}])
+    monkeypatch.setattr(tenant_automation,'process_tenants_parallel',process)
+    try:
+        await pipeline.run_pipeline(batch.id,5)
+        await test_session.refresh(tenant)
+        await test_session.refresh(batch)
+        assert process.await_count==1
+        assert tenant.first_login_completed is False
+        assert tenant.setup_error.startswith('Failed after')
+        assert batch.first_login_completed_count==0
+        assert batch.pipeline_status=='error'
+        assert batch.pipeline_step==5
+    finally:
+        pipeline.pipeline_jobs.pop(str(batch.id),None)
+
+
 class FakeSession:
     def __init__(self, rows):
         self.rows = rows

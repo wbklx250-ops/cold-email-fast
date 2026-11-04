@@ -1992,10 +1992,10 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                                         t.step4_retry_count = (t.step4_retry_count or 0) + 1
                                         t.setup_error = r.get("error", "Unknown")
                                         if t.step4_retry_count > MAX_PIPELINE_RETRIES:
-                                            t.first_login_completed = True
-                                            t.setup_error = f"SKIPPED after {MAX_PIPELINE_RETRIES} retries: {r.get('error')}"
+                                            t.first_login_completed = False
+                                            t.setup_error = f"Failed after {MAX_PIPELINE_RETRIES} retries: {r.get('error')}"
                                             await log_activity(batch_id, 5, STEP_NAMES[5], "tenant", str(t.id),
-                                                t.custom_domain or t.name, "skipped", t.setup_error)
+                                                t.custom_domain or t.name, "failed", t.setup_error)
                                         else:
                                             await log_activity(batch_id, 5, STEP_NAMES[5], "tenant", str(t.id),
                                                 t.custom_domain or t.name, "failed", r.get("error"))
@@ -2030,6 +2030,7 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                     batch.first_login_completed_count = login_ok
                     await db.commit()
 
+            await require_ready(batch_id, before_step=6)
             if job_id in pipeline_jobs:
                 pipeline_jobs[job_id]["steps"]["5"]["completed"] = login_ok
                 pipeline_jobs[job_id]["steps"]["5"]["status"] = "completed"
