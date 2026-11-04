@@ -207,6 +207,7 @@ def get_token(admin_email, admin_password, totp_secret=None, *, resource='exchan
                 answers.put({})
         threading.Thread(target=receive, daemon=True).start()
         original_window = None
+        original_implicit_wait = None
         own_driver = driver is None
         try:
             if own_driver:
@@ -214,7 +215,9 @@ def get_token(admin_email, admin_password, totp_secret=None, *, resource='exchan
                 driver = _create_step6_admin_center_driver(headless=True)
             else:
                 original_window = driver.current_window_handle
+                original_implicit_wait = driver.timeouts.implicit_wait
                 driver.switch_to.new_window('tab')
+            driver.implicitly_wait(0)
             _drive_signin(driver, admin_email, admin_password, seed, flow['user_code'], lambda:not answers.empty())
             try:
                 result = answers.get(timeout=35)
@@ -238,6 +241,8 @@ def get_token(admin_email, admin_password, totp_secret=None, *, resource='exchan
                         driver.close()
                     finally:
                         driver.switch_to.window(original_window)
+                        if isinstance(original_implicit_wait,(int,float)):
+                            driver.implicitly_wait(original_implicit_wait)
 
 
 def read_dkim(admin_email, admin_password, domain, totp_secret=None, *, create=False, enable=False, driver=None):

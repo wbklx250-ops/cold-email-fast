@@ -2235,7 +2235,11 @@ def setup_domain_complete_via_admin_portal(
         try:
             driver = _create_step6_admin_center_driver(headless=headless)
             _remember_active_driver(driver)
-            driver.implicitly_wait(15)  # Increased from 10
+            # Optional controls are probed throughout the wizard. A global
+            # implicit wait charged 15 seconds for every absent selector,
+            # compounding into minutes at each page. Required controls already
+            # use explicit WebDriverWait, so optional checks must return at once.
+            driver.implicitly_wait(0)
             driver.set_page_load_timeout(60)  # Add page load timeout
             try:
                 driver.set_script_timeout(20)

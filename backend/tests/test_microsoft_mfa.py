@@ -29,11 +29,13 @@ def test_device_auth_restores_the_existing_wizard_tab(application,monkeypatch):
     complete=Mock()
     monkeypatch.setattr(auth,'_drive_signin',complete)
     driver=Mock(current_window_handle='wizard')
+    driver.timeouts=SimpleNamespace(implicit_wait=15)
     assert auth.get_token('admin@example.onmicrosoft.com','synthetic-password',driver=driver)=='synthetic-access-token'
     assert complete.call_args.args[4]=='TESTONLY1'
     driver.switch_to.new_window.assert_called_once_with('tab')
     driver.close.assert_called_once()
     driver.switch_to.window.assert_called_once_with('wizard')
+    assert [call.args[0] for call in driver.implicitly_wait.call_args_list]==[0,15]
 
 
 def test_wrong_tenant_cannot_reuse_a_cached_token(application):
@@ -47,10 +49,12 @@ def test_wrong_tenant_cannot_reuse_a_cached_token(application):
 def test_failed_device_auth_still_restores_wizard(application,monkeypatch):
     monkeypatch.setattr(auth,'_drive_signin',Mock(side_effect=auth.MicrosoftAuthenticationError('Synthetic sign-in failure')))
     driver=Mock(current_window_handle='wizard')
+    driver.timeouts=SimpleNamespace(implicit_wait=15)
     with pytest.raises(auth.MicrosoftAuthenticationError):
         auth.get_token('admin@example.onmicrosoft.com','synthetic-password',driver=driver)
     driver.close.assert_called_once()
     driver.switch_to.window.assert_called_once_with('wizard')
+    assert [call.args[0] for call in driver.implicitly_wait.call_args_list]==[0,15]
 
 
 def test_msal_cache_hit_without_id_claims_reuses_only_verified_account(application,monkeypatch):
