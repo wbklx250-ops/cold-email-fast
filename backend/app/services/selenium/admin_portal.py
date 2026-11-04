@@ -1076,9 +1076,47 @@ def _recover_from_admin_center_error(driver, domain: str, context: str) -> bool:
         return False
 
 
+def _recover_domain_connect_provider_error(driver, domain: str, context: str) -> bool:
+    """Resubmit a wizard stalled by Microsoft's DNS-provider lookup error."""
+    if "domain connect uri" not in _safe_page_text(driver).lower():
+        return False
+
+    retries = getattr(driver, "_domain_connect_retries", {})
+    count = retries.get(domain, 0)
+    if count >= 3:
+        raise RuntimeError("Microsoft DNS-provider lookup failed after 3 wizard resubmissions")
+
+    domain_input, _ = _find_first_visible(driver, DOMAIN_NAME_INPUT_SELECTORS, timeout=3)
+    if domain_input is None:
+        raise RuntimeError("Microsoft DNS-provider lookup failed without a domain-entry form")
+    entered_domain = (domain_input.get_attribute("value") or "").strip()
+    if entered_domain.lower() != domain.lower():
+        raise RuntimeError("Microsoft DNS-provider recovery found an unexpected domain-entry value")
+
+    screenshot(driver, f"domain_connect_provider_error_{count + 1}", domain)
+    if not _click_first_visible(
+        driver, domain, ((By.XPATH, "//button[normalize-space()='Dismiss']"),),
+        "DNS-provider error Dismiss", timeout=3,
+    ):
+        raise RuntimeError("Could not dismiss Microsoft DNS-provider lookup error")
+
+    time.sleep(1)
+    retries[domain] = count + 1
+    driver._domain_connect_retries = retries
+    if not _click_first_visible(
+        driver, domain, DOMAIN_USE_BUTTON_SELECTORS,
+        "Use this domain after DNS-provider lookup error", timeout=5,
+    ):
+        raise RuntimeError("Could not resubmit domain after Microsoft DNS-provider lookup error")
+    logger.info("[%s] Retrying DNS-provider lookup (%s/3) during %s", domain, count + 1, context)
+    time.sleep(5)
+    return True
+
+
 def _clear_admin_center_interrupts(driver, domain: str, context: str, recover_errors: bool = False) -> bool:
     changed = _dismiss_microsoft_feedback_prompt(driver, domain, context)
     if recover_errors:
+        changed = _recover_domain_connect_provider_error(driver, domain, context) or changed
         changed = _recover_from_admin_center_error(driver, domain, context) or changed
     return changed
 
