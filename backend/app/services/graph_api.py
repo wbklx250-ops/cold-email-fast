@@ -7,6 +7,7 @@ Direct API calls for user operations - no Selenium UI needed.
 import aiohttp
 import logging
 from typing import Dict, List, Optional, Any
+from app.services.mailbox_licenses import BUSINESS_BASIC_SKUS, ALLOWED_MAILBOX_SKUS
 
 logger = logging.getLogger(__name__)
 
@@ -161,23 +162,14 @@ class GraphAPIService:
         if not user_id:
             return {"success": False, "error": "No user ID returned"}
 
-        # Step 2: Get available license — ONLY use Microsoft 365 Business Basic
-        # variants or Exchange Online Plan 1 (EXCHANGESTANDARD).
+        # Step 2: Use an existing supported Exchange-capable business-plan seat.
         # Tenants from our provider may include trial SKUs and unrelated paid
         # subs (E3/E5, Defender, Teams Essentials, etc.) — we must skip those.
         # Prefer Business Basic over Exchange Online Plan 1 when both have a
         # free seat available.
-        BUSINESS_BASIC_SKUS = (
-            "O365_BUSINESS_ESSENTIALS",
-            "SMB_BUSINESS_ESSENTIALS",
-            "MICROSOFT_365_BUSINESS_BASIC_(NO TEAMS)",
-            "MICROSOFT_365_BUSINESS_BASIC_(NO_TEAMS)",
-            "MICROSOFT_365_BUSINESS_BASIC_EEA_(NO_TEAMS)",
-            "MICROSOFT_365_BUSINESS_BASIC_EEA_(NO TEAMS)",
-        )
-        ALLOWED_SKUS = (*BUSINESS_BASIC_SKUS, "EXCHANGESTANDARD")
+        ALLOWED_SKUS = ALLOWED_MAILBOX_SKUS
         SKU_PREFERENCE = {sku: 0 for sku in BUSINESS_BASIC_SKUS}
-        SKU_PREFERENCE["EXCHANGESTANDARD"] = 1
+        SKU_PREFERENCE.update({sku:1 for sku in ALLOWED_SKUS if sku not in SKU_PREFERENCE})
 
         licenses = await self.get_available_licenses()
         candidates = []
@@ -211,9 +203,8 @@ class GraphAPIService:
                 "user_id": user_id,
                 "license_assigned": False,
                 "error": (
-                    "No available 'Microsoft 365 Business Basic' "
-                    f"(accepted SKUs: {', '.join(BUSINESS_BASIC_SKUS)}) or "
-                    "'Exchange Online Plan 1' (EXCHANGESTANDARD) license with "
+                    "No available supported Business Basic, Standard, Premium or "
+                    "Exchange Online Plan 1 license with "
                     "a free seat in this tenant. Seen SKUs consumed/enabled: "
                     f"{', '.join(seen_skus) or 'none'}"
                 ),

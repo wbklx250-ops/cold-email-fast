@@ -10,6 +10,7 @@ setup wizard; this reconciliation pass does not write MX/SPF/DKIM records.
 from __future__ import annotations
 
 import asyncio
+from app.services.mailbox_licenses import powershell_sku_list
 import logging
 import re
 from datetime import datetime
@@ -760,13 +761,7 @@ try {
     if ($licensed) {
         $out.licensed_user_exists = $true
         $allowedSkuPartNumbers = @(
-            "O365_BUSINESS_ESSENTIALS",
-            "SMB_BUSINESS_ESSENTIALS",
-            "Microsoft_365_Business_Basic_(no Teams)",
-            "Microsoft_365_Business_Basic_(no_Teams)",
-            "Microsoft_365_Business_Basic_EEA_(no_Teams)",
-            "Microsoft_365_Business_Basic_EEA_(no Teams)",
-            "EXCHANGESTANDARD"
+            __MAILBOX_ALLOWED_SKUS__
         )
         $allSkus = Get-MgSubscribedSku -ErrorAction SilentlyContinue
         $assignedSkuIds = @($licensed.AssignedLicenses | ForEach-Object { [string]$_.SkuId })
@@ -877,6 +872,7 @@ $out | ConvertTo-Json -Depth 6 -Compress
         .replace("__PASSWORD_DOUBLE__", _ps_escape(admin_password))
         .replace("__DOMAIN__", _ps_escape(domain))
         .replace("__MAILBOX_ARRAY__", mailbox_array)
+        .replace("__MAILBOX_ALLOWED_SKUS__", powershell_sku_list())
     )
 
 

@@ -30,6 +30,7 @@ from app.models.batch import SetupBatch
 from app.services.email_generator import generate_emails_for_domain, MAILBOX_PASSWORD
 from app.services.azure_step6 import save_to_db_with_retry, _format_error
 from app.core.config import get_settings
+from app.services.mailbox_licenses import BUSINESS_BASIC_SKUS, OTHER_BUSINESS_MAILBOX_SKUS, powershell_sku_list
 
 logger = logging.getLogger(__name__)
 
@@ -340,23 +341,15 @@ try {{
     }}
 
     $businessBasicSkuPartNumbers = @(
-        "O365_BUSINESS_ESSENTIALS",
-        "SMB_BUSINESS_ESSENTIALS",
-        "Microsoft_365_Business_Basic_(no Teams)",
-        "Microsoft_365_Business_Basic_(no_Teams)",
-        "Microsoft_365_Business_Basic_EEA_(no_Teams)",
-        "Microsoft_365_Business_Basic_EEA_(no Teams)"
+        {powershell_sku_list(BUSINESS_BASIC_SKUS)}
     )
-    # SPB is Microsoft 365 Business Premium, including trial subscriptions. It
-    # provides the Exchange mailbox required by this workflow and is commonly
-    # the only available SKU on newly provisioned reseller tenants.
-    $businessPremiumSkuPartNumbers = @(
-        "SPB",
-        "O365_BUSINESS_PREMIUM"
+    # Standard and Premium trials provide the Exchange mailbox too.
+    $otherBusinessSkuPartNumbers = @(
+        {powershell_sku_list(OTHER_BUSINESS_MAILBOX_SKUS)}
     )
     $allowedSkuPartNumbers = @(
         $businessBasicSkuPartNumbers +
-        $businessPremiumSkuPartNumbers +
+        $otherBusinessSkuPartNumbers +
         @("EXCHANGESTANDARD")
     )
     $allSkus = Get-MgSubscribedSku -ErrorAction Stop
@@ -420,7 +413,7 @@ try {{
             $seenSkus = @($allSkus | ForEach-Object {{
                 "$($_.SkuPartNumber):$($_.ConsumedUnits)/$($_.PrepaidUnits.Enabled)"
             }}) -join ", "
-            throw "No available Business Basic, Business Premium (SPB, including trial), or Exchange Online Plan 1 license with a free seat in this tenant. Seen SKUs consumed/enabled: $seenSkus"
+            throw "No available Business Basic, Business Standard (including no Teams), Business Premium (SPB, including trial), or Exchange Online Plan 1 license with a free seat in this tenant. Seen SKUs consumed/enabled: $seenSkus"
         }}
     }}
 
