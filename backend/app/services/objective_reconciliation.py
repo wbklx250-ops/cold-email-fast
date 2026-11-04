@@ -510,6 +510,13 @@ async def _read_dkim_truth(
     enable: bool = False,
 ) -> Dict[str, Any]:
     tenant = domain_data["tenant"]
+    if tenant.get('totp_secret'):
+        from app.services.microsoft_mfa import read_dkim
+        try:
+            return await asyncio.to_thread(read_dkim, tenant['admin_email'], tenant['admin_password'],
+                domain_data['name'], tenant['totp_secret'], create=create, enable=enable)
+        except Exception as exc:
+            return {'success':False, 'enabled':False, 'error':f'MFA Exchange readback failed ({type(exc).__name__})'}
     script = _build_dkim_script(
         admin_email=tenant["admin_email"],
         admin_password=tenant["admin_password"],

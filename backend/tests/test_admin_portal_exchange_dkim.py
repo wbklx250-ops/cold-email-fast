@@ -26,6 +26,20 @@ def test_exchange_fallback_accepts_exact_new_format_targets(monkeypatch):
     lookup.assert_awaited_once_with("admin@tenant", "password", "example.com")
 
 
+def test_exchange_fallback_uses_saved_mfa_key_and_preserves_wizard(monkeypatch):
+    from app.services import microsoft_mfa
+    from unittest.mock import Mock
+    lookup=Mock(return_value={'success':True,'selector1':'selector1-example-com._domainkey.tenant.onmicrosoft.com',
+        'selector2':'selector2-example-com._domainkey.tenant.onmicrosoft.com'})
+    monkeypatch.setattr(microsoft_mfa,'read_dkim',lookup)
+    legacy=AsyncMock(side_effect=AssertionError('MFA accounts must not use password-only Exchange authentication'))
+    monkeypatch.setattr(powershell,'get_dkim_config_with_credentials',legacy)
+    driver=object()
+    assert _get_exchange_dkim_targets('example.com','admin@tenant','synthetic-password','synthetic-seed',driver)
+    lookup.assert_called_once_with('admin@tenant','synthetic-password','example.com','synthetic-seed',create=True,driver=driver)
+    legacy.assert_not_awaited()
+
+
 def test_exchange_fallback_accepts_microsoft_assigned_selector_suffix(monkeypatch):
     selector1 = "selector1-vesselbridgenyc-com03b._domainkey.Tenant.q-v1.dkim.mail.microsoft"
     selector2 = "selector2-vesselbridgenyc-com03b._domainkey.Tenant.q-v1.dkim.mail.microsoft"

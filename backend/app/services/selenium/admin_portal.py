@@ -1449,7 +1449,7 @@ def screenshot(driver, name, domain):
         pass
 
 
-def _get_exchange_dkim_targets(domain: str, admin_email: str, admin_password: str):
+def _get_exchange_dkim_targets(domain: str, admin_email: str, admin_password: str, totp_secret=None, driver=None):
     """Get the two exact DKIM targets from Exchange when the wizard omits them.
 
     This runs in the dedicated Selenium worker thread. Exchange creates a
@@ -1461,11 +1461,16 @@ def _get_exchange_dkim_targets(domain: str, admin_email: str, admin_password: st
     from app.services.powershell.runner import powershell
 
     try:
-        ok, selector1, selector2 = asyncio.run(
-            powershell.get_dkim_config_with_credentials(
-                admin_email, admin_password, domain
+        if totp_secret:
+            from app.services.microsoft_mfa import read_dkim
+            truth = read_dkim(admin_email, admin_password, domain, totp_secret, create=True, driver=driver)
+            ok, selector1, selector2 = truth.get('success'), truth.get('selector1'), truth.get('selector2')
+        else:
+            ok, selector1, selector2 = asyncio.run(
+                powershell.get_dkim_config_with_credentials(
+                    admin_email, admin_password, domain
+                )
             )
-        )
     except Exception as exc:
         logger.warning("[%s] Exchange DKIM lookup failed: %s", domain, exc)
         return None
@@ -1495,18 +1500,21 @@ def _get_exchange_dkim_targets(domain: str, admin_email: str, admin_password: st
     return targets
 
 
-def _graph_confirms_email_service(domain: str, admin_email: str, admin_password: str) -> bool:
+def _graph_confirms_email_service(domain: str, admin_email: str, admin_password: str, totp_secret=None) -> bool:
     """Check live Microsoft tenant truth after the Admin Center DNS wizard runs."""
     import asyncio
 
     from app.services.m365_setup import _read_post_wizard_domain_truth
 
     try:
+        credentials = {"admin_email":admin_email, "admin_password":admin_password}
+        if totp_secret:
+            credentials['totp_secret'] = totp_secret
         truth = asyncio.run(
             _read_post_wizard_domain_truth(
                 domain,
                 None,
-                {"admin_email": admin_email, "admin_password": admin_password},
+                credentials,
             )
         )
     except Exception as exc:
@@ -2964,7 +2972,7 @@ def setup_domain_complete_via_admin_portal(
     sel2_target = sel2_match.group(1) if sel2_match else None
     if not (sel1_target and sel2_target):
         logger.info(f"[{domain}] Admin Center omitted DKIM targets; checking Exchange Online")
-        exchange_targets = _get_exchange_dkim_targets(domain, admin_email, admin_password)
+        exchange_targets = _get_exchange_dkim_targets(domain, admin_email, admin_password, totp_secret, driver)
         if exchange_targets:
             sel1_target, sel2_target = exchange_targets
 
@@ -3131,7 +3139,7 @@ def setup_domain_complete_via_admin_portal(
         # The DNS values above came from Microsoft and all six Cloudflare
         # writes succeeded. Confirm the verified Email service through Graph;
         # _save_step6_result independently checks Graph and Exchange DKIM.
-        if _graph_confirms_email_service(domain, admin_email, admin_password):
+        if _graph_confirms_email_service(domain, admin_email, admin_password, totp_secret):
             logger.info("[%s] Graph confirms verified Email service after wizard DNS setup", domain)
             result["success"] = True
             result["verified"] = True

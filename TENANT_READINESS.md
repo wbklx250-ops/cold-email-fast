@@ -60,6 +60,16 @@ with direct operator authentication. Future checkpoint saves keep the inventory 
 Startup refuses to rewind unknown migration revisions automatically. Repairing a stale marker
 requires inspecting the actual schema first; never stamp a populated database back to `010`.
 
+First-login automation distinguishes an existing code challenge from new authenticator enrollment,
+including challenges that appear after the stay-signed-in prompt. Failed retries remain incomplete
+and block later pipeline steps. An authenticated page is required before reporting login success.
+
+For MFA-enabled batch accounts, Exchange DKIM lookup/signing uses delegated device authentication
+and `Connect-ExchangeOnline -AccessToken`. Microsoft tenant and administrator identities are checked
+before accepting a token. Exact Microsoft-issued CNAME targets are retained; the runner never guesses
+their tenant-specific suffix. Domain readback uses delegated Graph read scopes. Token caches stay
+in server memory; authentication tabs close and restore the domain wizard when a flow finishes.
+
 The local `tenant-readiness/migrate_to_cloud.py` transfers existing results and DPAPI-protected
 authentication checkpoints directly over TLS after the local runner has stopped. It never writes
 plaintext credential exports. Do not run the local runner again against a tenant being checked

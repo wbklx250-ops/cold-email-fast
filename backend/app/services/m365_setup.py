@@ -231,11 +231,22 @@ async def _read_post_wizard_domain_truth(
     tenant_obj: Tenant | None,
     domain_data: dict,
 ) -> Dict[str, Any]:
-    token = await _get_readonly_graph_token(
-        tenant_domain=_tenant_token_domain(tenant_obj, domain_data),
-        admin_email=domain_data.get("admin_email") or (tenant_obj.admin_email if tenant_obj else ""),
-        admin_password=domain_data.get("admin_password") or (tenant_obj.admin_password if tenant_obj else ""),
-    )
+    from app.services.microsoft_mfa import get_token
+    email = domain_data.get('admin_email') or (tenant_obj.admin_email if tenant_obj else '')
+    password = domain_data.get('admin_password') or (tenant_obj.admin_password if tenant_obj else '')
+    seed = domain_data.get('totp_secret') or (getattr(tenant_obj,'totp_secret',None) if tenant_obj else None)
+    token = None
+    if seed:
+        try:
+            token = await asyncio.to_thread(get_token, email, password, seed, resource='graph')
+        except Exception as exc:
+            logger.warning('MFA Graph domain readback could not authenticate (%s)', type(exc).__name__)
+    else:
+        token = await _get_readonly_graph_token(
+            tenant_domain=_tenant_token_domain(tenant_obj, domain_data),
+            admin_email=domain_data.get("admin_email") or (tenant_obj.admin_email if tenant_obj else ""),
+            admin_password=domain_data.get("admin_password") or (tenant_obj.admin_password if tenant_obj else ""),
+        )
     if not token:
         return {
             "ok": False,
@@ -407,6 +418,7 @@ async def _enable_domain_dkim(domain_name: str, domain_data: dict) -> dict:
             {"name": domain_name, "tenant": {
                 "admin_email": domain_data["admin_email"],
                 "admin_password": domain_data["admin_password"],
+                "totp_secret": domain_data.get('totp_secret'),
             }}, enable=True,
         )
         if truth.get("enabled"):

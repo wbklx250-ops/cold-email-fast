@@ -125,14 +125,14 @@ Write-Output "CONNECTED_SUCCESS"
             code_match = re.search(r"enter the code\s+([A-Z0-9]{8,})", line, re.IGNORECASE)
             if code_match:
                 device_code = code_match.group(1)
-                logger.info("Got device code: %s", device_code)
+                logger.info("Received Microsoft device sign-in challenge")
                 break
 
             # Alternative pattern
             code_match2 = re.search(r"code[:\s]+([A-Z0-9]{8,})", line, re.IGNORECASE)
             if code_match2:
                 device_code = code_match2.group(1)
-                logger.info("Got device code (alt): %s", device_code)
+                logger.info("Received Microsoft device sign-in challenge")
                 break
 
             if "MODULE_LOADED" in line:
@@ -179,7 +179,7 @@ Write-Output "CONNECTED_SUCCESS"
     async def _complete_device_login(self, device_code: str) -> bool:
         """Complete device code login using Selenium, handling all Microsoft screens."""
 
-        logger.info("Completing device login with code: %s", device_code)
+        logger.info("Completing Microsoft device sign-in")
 
         try:
             preferred_text = (self.admin_email or "").lower()
