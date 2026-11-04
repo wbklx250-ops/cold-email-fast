@@ -46,10 +46,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ARG CHROMIUM_VERSION=149.0.7827.196-1~deb12u1
 ARG CHROMIUM_DEB_BASE=https://snapshot.debian.org/archive/debian-security/20260626T014759Z/pool/updates/main/c/chromium
 RUN set -eux; \
-    wget -O /tmp/chromium-common.deb "$CHROMIUM_DEB_BASE/chromium-common_${CHROMIUM_VERSION}_amd64.deb"; \
-    wget -O /tmp/chromium-sandbox.deb "$CHROMIUM_DEB_BASE/chromium-sandbox_${CHROMIUM_VERSION}_amd64.deb"; \
-    wget -O /tmp/chromium.deb "$CHROMIUM_DEB_BASE/chromium_${CHROMIUM_VERSION}_amd64.deb"; \
-    wget -O /tmp/chromium-driver.deb "$CHROMIUM_DEB_BASE/chromium-driver_${CHROMIUM_VERSION}_amd64.deb"; \
+    wget --retry-on-http-error=429,500,502,503,504 --tries=5 --waitretry=5 --timeout=60 -O /tmp/chromium-common.deb "$CHROMIUM_DEB_BASE/chromium-common_${CHROMIUM_VERSION}_amd64.deb"; \
+    wget --retry-on-http-error=429,500,502,503,504 --tries=5 --waitretry=5 --timeout=60 -O /tmp/chromium-sandbox.deb "$CHROMIUM_DEB_BASE/chromium-sandbox_${CHROMIUM_VERSION}_amd64.deb"; \
+    wget --retry-on-http-error=429,500,502,503,504 --tries=5 --waitretry=5 --timeout=60 -O /tmp/chromium.deb "$CHROMIUM_DEB_BASE/chromium_${CHROMIUM_VERSION}_amd64.deb"; \
+    wget --retry-on-http-error=429,500,502,503,504 --tries=5 --waitretry=5 --timeout=60 -O /tmp/chromium-driver.deb "$CHROMIUM_DEB_BASE/chromium-driver_${CHROMIUM_VERSION}_amd64.deb"; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         /tmp/chromium-common.deb \
