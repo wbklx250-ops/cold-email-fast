@@ -85,7 +85,7 @@ CANT_SCAN_WAIT = 5  # seconds to wait after clicking "Can't scan" for secret to 
 
 MFA_ENROLLMENT_KEYWORDS = [
     "action required",
-    "authenticator",
+    "install microsoft authenticator",
     "protect your account",
     "more information required",
     "keep your account secure",
@@ -687,10 +687,12 @@ class BrowserWorker:
         return "\n".join(chunks).lower()
 
     def _find_mfa_enrollment_keywords(self) -> List[str]:
-        page = self._combined_page_text_lower()
+        # Login scripts and an existing "Enter code" challenge both mention
+        # Authenticator. Only visible, explicit enrollment instructions count.
+        page = self.driver.find_element(By.TAG_NAME, "body").text.lower()
         return [keyword for keyword in MFA_ENROLLMENT_KEYWORDS if keyword in page]
 
-    def _wait_for_mfa_enrollment_decision(self, timeout: int = 45) -> List[str]:
+    def _wait_for_mfa_enrollment_decision(self, timeout: int = 45, existing_totp_secret: Optional[str] = None) -> List[str]:
         """
         Wait until post-login prompts settle enough to decide whether MFA enrollment is required.
 
@@ -700,25 +702,41 @@ class BrowserWorker:
         """
         worker_id = getattr(self, 'worker_id', 0)
         last_state = LoginState.UNKNOWN
+        last_code_window = None
+        code_attempts = 0
 
         for second in range(timeout):
-            keywords = self._find_mfa_enrollment_keywords()
-            if keywords:
-                logger.info(f"[W{worker_id}] MFA enrollment keywords detected after {second}s: {keywords}")
-                return keywords
-
             state = self._detect_login_state()
             last_state = state
 
-            if state == LoginState.NEEDS_MFA_SETUP:
-                logger.info(f"[W{worker_id}] Login state indicates MFA enrollment after {second}s")
-                return ["login_state_needs_mfa_setup"]
+            if state == LoginState.NEEDS_MFA_CODE:
+                if not existing_totp_secret:
+                    raise RuntimeError("Microsoft requires an existing authenticator code, but no saved TOTP key is available")
+                window = int(time.time() // 30)
+                if window != last_code_window and code_attempts < 3:
+                    if not self._submit_existing_mfa_code(existing_totp_secret):
+                        raise RuntimeError("Could not submit the saved authenticator code")
+                    last_code_window = window
+                    code_attempts += 1
+                time.sleep(1)
+                continue
 
             if state == LoginState.NEEDS_STAY_SIGNED_IN:
                 logger.info(f"[W{worker_id}] Stay signed-in prompt appeared before MFA decision; dismissing it")
                 self._handle_stay_signed_in()
                 time.sleep(2)
                 continue
+
+            if state in {LoginState.ACCOUNT_LOCKED, LoginState.WRONG_PASSWORD, LoginState.ERROR}:
+                raise RuntimeError(f"Microsoft sign-in did not succeed: {state.value}")
+
+            keywords = self._find_mfa_enrollment_keywords()
+            if keywords:
+                logger.info(f"[W{worker_id}] MFA enrollment instructions detected after {second}s: {keywords}")
+                return keywords
+
+            if state == LoginState.NEEDS_MFA_SETUP:
+                return ["login_state_needs_mfa_setup"]
 
             if state == LoginState.NEEDS_PASSWORD_CHANGE:
                 logger.info(f"[W{worker_id}] Still on password-change page while checking MFA")
@@ -731,12 +749,17 @@ class BrowserWorker:
 
             time.sleep(1)
 
+        last_state = self._detect_login_state()
+        if last_state == LoginState.NEEDS_MFA_CODE:
+            raise RuntimeError("Microsoft did not accept the saved authenticator code before the sign-in timeout")
         keywords = self._find_mfa_enrollment_keywords()
         if keywords:
             logger.info(f"[W{worker_id}] MFA enrollment keywords detected after final wait: {keywords}")
             return keywords
 
-        logger.info(f"[W{worker_id}] No MFA enrollment prompt after {timeout}s (last_state={last_state.value})")
+        if last_state != LoginState.LOGGED_IN:
+            raise RuntimeError(f"Microsoft sign-in has not reached an authenticated page: {last_state.value}")
+        logger.info(f"[W{worker_id}] Authenticated page confirmed after {timeout}s")
         return []
 
     def _submit_existing_mfa_code(self, totp_secret: str) -> bool:
@@ -748,7 +771,7 @@ class BrowserWorker:
 
         try:
             code = pyotp.TOTP(totp_secret.upper()).now()
-            logger.info(f"[W{worker_id}] Existing MFA challenge detected; entering TOTP code: {code[:2]}****")
+            logger.info(f"[W{worker_id}] Existing MFA challenge detected; entering saved authenticator code")
 
             code_input = self._find_element([
                 (By.CSS_SELECTOR, "input[name='otc']"),
@@ -931,6 +954,15 @@ class BrowserWorker:
         if "passwordchange" in url:
             return LoginState.NEEDS_PASSWORD_CHANGE
         
+        # Existing code entry takes precedence over generic security headings.
+        code_input = self._find_element([
+            (By.ID, "idTxtBx_SAOTCC_OTC"),
+            (By.CSS_SELECTOR, "input[name='otc']"),
+            (By.CSS_SELECTOR, "input[type='tel'][maxlength='6']"),
+        ], timeout=1)
+        if code_input:
+            return LoginState.NEEDS_MFA_CODE
+
         # MFA / Security Defaults
         if "action required" in page_text or "more information required" in page_text:
             return LoginState.NEEDS_MFA_SETUP
@@ -949,14 +981,6 @@ class BrowserWorker:
             return LoginState.NEEDS_MFA_SETUP
         if "set up your account" in page_text and "authenticator" in page_text:
             return LoginState.NEEDS_MFA_SETUP
-        
-        # MFA code entry
-        code_input = self._find_element([
-            (By.CSS_SELECTOR, "input[name='otc']"),
-            (By.CSS_SELECTOR, "input[type='tel'][maxlength='6']"),
-        ], timeout=1)
-        if code_input:
-            return LoginState.NEEDS_MFA_CODE
         
         # Email entry
         email_input = self._find_element([
@@ -2085,7 +2109,7 @@ class BrowserWorker:
             
             # MFA ENROLLMENT - Check if required
             logger.info(f"[W{self.worker_id}] 🔐 Checking if MFA enrollment is required...")
-            found_mfa_keywords = self._wait_for_mfa_enrollment_decision(timeout=45)
+            found_mfa_keywords = self._wait_for_mfa_enrollment_decision(timeout=45, existing_totp_secret=existing_totp_secret)
             
             if found_mfa_keywords:
                 logger.info(f"[W{self.worker_id}] ✓ MFA enrollment DETECTED! Keywords: {found_mfa_keywords}")
