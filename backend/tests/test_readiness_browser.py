@@ -79,6 +79,23 @@ class EnrollmentBrowserTests(unittest.TestCase):
         self.assertTrue(self.browser.page.evaluate('Boolean(window.accountSelected)'))
         self.browser.human.assert_not_called()
 
+    def test_username_login_accepts_microsoft_text_loginfmt_input(self):
+        html='<h1>Sign in</h1><form onsubmit="event.preventDefault();window.submitted=true"><input name="loginfmt" type="text" autocomplete="username"><button type="submit">Next</button></form>'
+        self.browser.page.route('https://login.microsoftonline.com/readiness-login', lambda route: route.fulfill(status=200,content_type='text/html',body=html))
+        self.browser.page.goto('https://login.microsoftonline.com/readiness-login')
+        self.browser.advance_login()
+        self.assertEqual(self.browser.page.locator('input[name=loginfmt]').input_value(), 'test@example.invalid')
+        self.assertTrue(self.browser.page.evaluate('Boolean(window.submitted)'))
+
+    def test_password_step_preserves_readonly_username(self):
+        html='<h1>Enter password</h1><form onsubmit="event.preventDefault();window.submitted=true"><input name="loginfmt" type="email" value="test@example.invalid" readonly><input name="passwd" type="password"><button type="submit">Sign in</button></form>'
+        self.browser.page.route('https://login.microsoftonline.com/readiness-password', lambda route: route.fulfill(status=200,content_type='text/html',body=html))
+        self.browser.page.goto('https://login.microsoftonline.com/readiness-password')
+        self.browser.advance_login()
+        self.assertEqual(self.browser.page.locator('input[name=passwd]').input_value(), 'synthetic-only')
+        self.assertEqual(self.browser.page.locator('input[name=loginfmt]').input_value(), 'test@example.invalid')
+        self.assertTrue(self.browser.page.evaluate('Boolean(window.submitted)'))
+
     def test_trial_selection_waits_for_async_dropdown_items(self):
         self.browser.page.set_content('''<button role="combobox" aria-label="Select a plan" onclick="setTimeout(()=>{document.getElementById('options').innerHTML='<button role=option onclick=window.trialChosen=true>Microsoft 365 Business Basic (Trial)</button>'},200)">Choose one from below</button><div id="options"></div>''')
         self.assertIn('(Trial)', self.browser.select_trial_plan())
@@ -111,7 +128,7 @@ class EnrollmentBrowserTests(unittest.TestCase):
         self.assertTrue(self.browser.page.locator('#freq-month').is_checked())
         self.assertTrue(self.browser.page.locator('#renew').is_checked())
 
-    def _exercise_checkout(self, authorized):
+    def _exercise_checkout(self, authorized, intermediate=False):
         self.browser.accept_trial_recurring_payments = authorized
         checkout = '<h2>Checkout</h2><p>Total due: NZ$0.00</p><button onclick="renewal()">Next</button>'
         renewal = '''<h2>Trial renewal settings</h2>
@@ -122,7 +139,8 @@ class EnrollmentBrowserTests(unittest.TestCase):
           <input type="checkbox" id="renew" checked><label for="renew">Recurring billing</label>
           <input type="checkbox" id="consent" onchange="document.getElementById('place-order').disabled=!this.checked"><label for="consent">By checking the box, you authorize recurring payments that will continue unless canceled.</label>
           <button id="place-order" disabled onclick="order()">Place order</button>'''
-        self.browser.page.set_content('<html><body><button role="combobox" aria-label="Select a plan">Basic (Trial)</button><button onclick="checkout()">Start free trial</button><script>const checkoutHTML=' + json.dumps(checkout) + ';const renewalHTML=' + json.dumps(renewal) + ';' + r'''
+        first_renewal = '<h2>Trial renewal settings</h2><button onclick="showConsent()">Start trial</button>' if intermediate else renewal
+        self.browser.page.set_content('<html><body><button role="combobox" aria-label="Select a plan">Basic (Trial)</button><button onclick="checkout()">Start free trial</button><script>const checkoutHTML=' + json.dumps(checkout) + ';const renewalHTML=' + json.dumps(renewal) + ';const firstRenewalHTML=' + json.dumps(first_renewal) + ';' + r'''
           function checkout() {
             const background = document.createElement('button');
             background.setAttribute('role','combobox');background.setAttribute('aria-label','Billing frequency');
@@ -131,18 +149,23 @@ class EnrollmentBrowserTests(unittest.TestCase):
             const panel=document.createElement('div');panel.id='checkout';
             panel.style='position:fixed;inset:0;background:white;z-index:100';panel.innerHTML=checkoutHTML;document.body.append(panel);
           }
-          function renewal(){document.getElementById('checkout').innerHTML=renewalHTML}
-          function order(){window.ordered=document.getElementById('month').checked && document.getElementById('monthly').checked && document.getElementById('renew').checked && document.getElementById('consent').checked}
+          function renewal(){document.getElementById('checkout').innerHTML=firstRenewalHTML}
+          function showConsent(){document.getElementById('checkout').innerHTML=renewalHTML}
+          function order(){window.orderClickCount=(window.orderClickCount||0)+1;window.ordered=document.getElementById('month').checked && document.getElementById('monthly').checked && document.getElementById('renew').checked && document.getElementById('consent').checked}
         </script></body></html>''')
         graph = Mock()
         sku = {'skuId':'synthetic', 'skuPartNumber':'O365_BUSINESS_ESSENTIALS', 'capabilityStatus':'Enabled',
                'prepaidUnits':{'enabled':25}, 'consumedUnits':0,
                'servicePlans':[{'servicePlanId':'exchange','servicePlanName':'EXCHANGE_S_STANDARD','provisioningStatus':'Success'}]}
-        graph.request.side_effect = lambda *args: {'value':[sku] if self.browser.page.evaluate('Boolean(window.ordered)') else []}
+        def poll(*args):
+            if graph.request.call_count > 5:
+                raise AssertionError('The checkout fixture did not reach its final order button.')
+            return {'value':[sku] if self.browser.page.evaluate('Boolean(window.ordered)') else []}
+        graph.request.side_effect = poll
         stages = []
         def progress(stage):
             stages.append(stage)
-            if stage == 'trial_order_submitted':
+            if stage == 'trial_order_submitting':
                 self.assertTrue((Path(self.temp.name) / 'trial-order-pending.json').exists())
                 self.assertFalse(self.browser.page.evaluate('Boolean(window.ordered)'))
         with patch.object(self.browser, 'portal'), patch.object(self.browser, 'navigate'), patch.object(self.browser, 'advance_login'):
@@ -159,7 +182,9 @@ class EnrollmentBrowserTests(unittest.TestCase):
             return
         self.assertTrue(self.browser.page.evaluate('Boolean(window.ordered)'))
         self.assertFalse(self.browser.page.evaluate('Boolean(window.backgroundTouched)'))
-        self.assertEqual(stages.count('trial_order_submitted'), 1)
+        self.assertEqual(stages.count('trial_order_submitting'), 2 if intermediate else 1)
+        self.assertEqual(stages.count('trial_order_awaiting_confirmation'), 2 if intermediate else 1)
+        self.assertEqual(self.browser.page.evaluate('window.orderClickCount'), 1)
         self.assertIn('trial_zero_due_verified', stages)
         self.assertIn('trial_renewal_settings', stages)
         self.assertIn('trial_recurring_payment_consent_accepted', stages)
@@ -170,6 +195,16 @@ class EnrollmentBrowserTests(unittest.TestCase):
 
     def test_recurring_payment_consent_is_never_assumed(self):
         self._exercise_checkout(False)
+
+    def test_intermediate_start_trial_returns_to_the_required_consent_step(self):
+        self._exercise_checkout(True, intermediate=True)
+
+    def test_order_rejection_outside_the_checkout_panel_is_visible_to_the_runner(self):
+        self.browser.page.set_content('''<div role="alert">The maximum number of subscriptions to this product have already been redeemed.</div><section>
+          <h2>Trial renewal settings</h2><button>Place order</button>
+        </section>''')
+        self.assertNotIn('already been redeemed', self.browser.checkout_scope().inner_text())
+        self.assertIn('already been redeemed', self.browser.checkout_feedback())
 
     def test_renewal_dialog_cannot_submit_without_a_verified_zero_due_checkout(self):
         self.browser.page.set_content('<div role="dialog"><h2>Trial renewal settings</h2><button onclick="window.ordered=true">Place order</button></div>')

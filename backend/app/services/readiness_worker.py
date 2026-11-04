@@ -5,6 +5,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import json
+import hashlib
 import logging
 import os
 from pathlib import Path
@@ -22,11 +23,12 @@ from app.db.session import SyncSessionLocal
 from app.models.readiness import ReadinessCheck
 from app.services.inventory_credentials import decrypt_inventory_value, encrypt_inventory_value
 from app.services import readiness_engine as engine
+from app.services.readiness_credentials import sync_credentials, setup_confirmed
 
 logger = logging.getLogger(__name__)
 ARTIFACTS = {'admin-totp.dpapi', 'admin-tokens.dpapi', 'mailbox-totp.dpapi',
              'mailbox-tokens.dpapi', 'mailbox-password.dpapi',
-             'trial-rejections.json', 'trial-order-pending.json'}
+             'trial-rejections.json', 'trial-order-pending.json', 'trial-order-history.json'}
 ACTIVE_STATUSES = {'running', 'monitoring', 'awaiting_user'}
 LIVE: dict[str, dict] = {}
 STORES: dict[str, 'DatabaseStore'] = {}
@@ -53,8 +55,13 @@ def cloud_secret(path, value=None):
     path = Path(path)
     if value is None:
         return decrypt_inventory_value(path.read_text(encoding='utf-8'))
-    path.write_text(encrypt_inventory_value(value), encoding='utf-8')
     store = STORES.get(str(path.parent))
+    if store and path.name == 'admin-totp.dpapi':
+        previous = cloud_secret(path) if path.exists() else None
+        if previous != value:
+            with store.lock:
+                store.state[store.tenant_id].update(admin_totp_verified=False, stage='totp_seed_saved')
+    path.write_text(encrypt_inventory_value(value), encoding='utf-8')
     if store:
         store.persist()
     return value
@@ -86,14 +93,15 @@ class CloudBrowser(engine.Browser):
     def process_operator_action(self):
         if self.live.pop('inspect_checkout', False):
             try:
-                dialogs = self.page.get_by_role('dialog')
-                scope = dialogs.last if dialogs.count() and dialogs.last.is_visible() else self.page.locator('body')
+                scope = self.checkout_scope()
                 self.live['checkout_inspection'] = {
                     'captured_at': engine.utcnow(),
-                    'controls': scope.locator('h1,h2,button,select,[role=combobox],input[type=radio],input[type=checkbox],label').evaluate_all('''els => els.filter(e => e.offsetWidth || e.offsetHeight).slice(0,120).map(e => ({
+                    'messages': [message.inner_text(timeout=2500)[:2000] for message in self.page.locator('[role=alert], [role=status], .ms-MessageBar').all() if message.is_visible()],
+                    'controls': scope.locator('h1,h2,button,select,[role=combobox],input,label').evaluate_all('''els => els.filter(e => e.offsetWidth || e.offsetHeight).slice(0,120).map(e => ({
                         tag:e.tagName, role:e.getAttribute('role'), label:e.getAttribute('aria-label'),
                         id:e.id, name:e.getAttribute('name'), type:e.type,
                         disabled:e.disabled || e.getAttribute('aria-disabled') === 'true',
+                        readOnly:e.readOnly, autocomplete:e.getAttribute('autocomplete'),
                         checked:e.checked, text:e.tagName === 'INPUT' ? '' : (e.innerText || '').slice(0,200)
                     }))''')}
             except Exception as exc:
@@ -154,6 +162,7 @@ class DatabaseStore:
         self.private = self.directory / 'private' / self.tenant_id
         self.private.mkdir(parents=True)
         self.lock = threading.RLock()
+        self.credentials_sync_fingerprint = None
         self.state = {self.tenant_id: dict(record.state)}
         self.credentials = json.loads(decrypt_inventory_value(record.credentials_ciphertext))
         self.artifacts = json.loads(decrypt_inventory_value(record.artifacts_ciphertext))
@@ -187,11 +196,28 @@ class DatabaseStore:
                          artifacts_ciphertext=encrypt_inventory_value(json.dumps(artifacts))))
                 if result.rowcount != 1:
                     raise LeaseLost('This check belongs to another worker; this worker stopped before changing the tenant.')
+                fingerprint = hashlib.sha256(json.dumps([self.credentials['password'],
+                    artifacts.get('admin-totp.dpapi'), setup_confirmed(state)], sort_keys=True).encode()).hexdigest()
+                synced = False
+                if fingerprint != self.credentials_sync_fingerprint:
+                    try:
+                        with db.begin_nested():
+                            record = db.get(ReadinessCheck, self.id)
+                            sync_credentials(db, record, self.credentials, artifacts, state)
+                        synced = True
+                    except Exception as exc:
+                        # Keep the durable checkpoint even if inventory sync
+                        # needs a retry. Never log SQL parameters containing keys.
+                        logger.warning('Readiness credential sync needs retry for %s (%s)', self.id, type(exc).__name__)
                 db.commit()
+                if synced:
+                    self.credentials_sync_fingerprint = fingerprint
             previous.clear()
             previous.update(state)
 
     def update(self, tenant, **changes):
+        if changes.get('stage') == 'totp_enrolled':
+            changes['admin_totp_verified'] = True
         # Exceptions from Microsoft may quote submitted data. Never persist it
         # in the public report, even when the credential submission failed.
         if 'detail' in changes:

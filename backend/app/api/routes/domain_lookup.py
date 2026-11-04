@@ -19,6 +19,7 @@ import logging
 import re
 import time
 from typing import Optional
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel
@@ -29,6 +30,9 @@ import pyotp
 from app.api.deps import get_db
 from app.models.domain import Domain
 from app.models.tenant import Tenant
+from app.models.tenant_audit import TenantAudit, TenantAuditCredential
+from app.models.readiness import ReadinessCheck
+from app.services.inventory_credentials import decrypt_inventory_value
 from app.services.domain_lookup import DomainLookupService
 
 logger = logging.getLogger(__name__)
@@ -197,6 +201,47 @@ def credential_error_for_tenant(tenant: Tenant) -> Optional[str]:
 
     return None
 
+
+async def inventory_login_details(db, *, email=None, microsoft_tenant_id=None, domain=None):
+    query = select(TenantAudit, TenantAuditCredential, ReadinessCheck).join(
+        TenantAuditCredential, TenantAuditCredential.audit_id == TenantAudit.id).outerjoin(
+        ReadinessCheck, func.lower(ReadinessCheck.admin_email) == func.lower(TenantAudit.admin_email))
+    if email:
+        query = query.where(func.lower(TenantAudit.admin_email) == email.lower())
+    elif microsoft_tenant_id:
+        try:
+            query = query.where(ReadinessCheck.tenant_id == UUID(microsoft_tenant_id))
+        except ValueError:
+            return None
+    elif domain and domain.endswith('.onmicrosoft.com'):
+        query = query.where(func.lower(TenantAudit.admin_email).endswith('@' + domain.lower(), autoescape=True))
+    else:
+        return None
+    rows = (await db.execute(query.limit(2))).all()
+    if len(rows) != 1:
+        return None
+    audit, saved, check = rows[0]
+    password = decrypt_inventory_value(saved.password_ciphertext)
+    seed = decrypt_inventory_value(saved.totp_ciphertext) if saved.totp_ciphertext else ''
+    code = None
+    remaining = None
+    error = None
+    if seed:
+        try:
+            generator = pyotp.TOTP(seed)
+            stamp = time.time()
+            code = generator.at(int(stamp))
+            remaining = max(0, int(generator.interval - stamp % generator.interval))
+        except Exception:
+            error = 'The saved authenticator key could not generate a code.'
+    state = check.state if check else {}
+    sender_domain = (state.get('sender') or audit.admin_email).split('@')[-1]
+    initial = sender_domain if sender_domain.endswith('.onmicrosoft.com') else ''
+    return TenantLoginDetails(tenant_id=str(audit.id), tenant_name=audit.tenant_name,
+        microsoft_tenant_id=str(check.tenant_id) if check else '', onmicrosoft_domain=initial,
+        provider='Tenant inventory', admin_email=audit.admin_email, admin_password=password,
+        has_totp_secret=bool(seed), totp_code=code, totp_seconds_remaining=remaining, totp_error=error)
+
 async def find_tenant_multi_strategy(
     db: AsyncSession,
     domain_name: str,
@@ -284,6 +329,9 @@ async def tenant_credentials_by_email(
     )
     tenants = result.scalars().all()
     if not tenants:
+        inventory = await inventory_login_details(db, email=email)
+        if inventory:
+            return inventory
         raise HTTPException(status_code=404, detail="No tenant found for this admin email")
     if len(tenants) > 1:
         raise HTTPException(status_code=409, detail="Multiple tenants have this admin email")
@@ -361,6 +409,7 @@ async def bulk_domain_lookup(
 @router.post("/credentials", response_model=BulkCredentialLookupResponse)
 async def bulk_domain_credentials_lookup(
     request: BulkLookupRequest,
+    response: Response = None,
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -368,6 +417,8 @@ async def bulk_domain_credentials_lookup(
     access that tenant, including a live TOTP code when a TOTP secret is stored.
     Supports single-domain and batch inputs using the same request format.
     """
+    if response is not None:
+        response.headers['Cache-Control'] = 'no-store'
     service = DomainLookupService()
     clean_domains = clean_domain_list(request.domains)
 
@@ -406,12 +457,20 @@ async def bulk_domain_credentials_lookup(
                 enriched.credential_error = credential_error
             else:
                 enriched.credentials = build_tenant_login_details(db_tenant)
-        elif db_domain:
-            enriched.credential_error = "Domain exists in DB but is not linked to a tenant"
-        elif ms_result.is_connected:
-            enriched.credential_error = "Domain is connected to Microsoft but no local tenant match was found"
         else:
-            enriched.credential_error = "Domain is not connected to a Microsoft tenant"
+            inventory = await inventory_login_details(db, microsoft_tenant_id=ms_result.microsoft_tenant_id, domain=ms_result.domain)
+            if inventory:
+                enriched.credentials = inventory
+                enriched.found_in_db = True
+                enriched.db_tenant_id = inventory.tenant_id
+                enriched.db_tenant_name = inventory.tenant_name
+                enriched.match_method = 'inventory_tenant_id'
+            elif db_domain:
+                enriched.credential_error = "Domain exists in DB but is not linked to a tenant"
+            elif ms_result.is_connected:
+                enriched.credential_error = "Domain is connected to Microsoft but no local tenant match was found"
+            else:
+                enriched.credential_error = "Domain is not connected to a Microsoft tenant"
 
         enriched_results.append(enriched)
 

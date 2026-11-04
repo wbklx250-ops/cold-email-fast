@@ -2,6 +2,7 @@
 import asyncio
 from datetime import timedelta
 import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -166,3 +167,15 @@ def test_public_report_never_exposes_authentication_checkpoint(database):
     assert 'password' not in public
     assert 'admin-tokens.dpapi' not in public
     assert 'credentials_ciphertext' not in public
+
+
+def test_newly_captured_seed_does_not_inherit_the_previous_seeds_verified_state(tmp_path, monkeypatch):
+    path = tmp_path / 'admin-totp.dpapi'
+    path.write_text(encrypt_inventory_value('KRSXG5DSNFXGOIDB'))
+    store = SimpleNamespace(lock=threading.RLock(), tenant_id='synthetic',
+        state={'synthetic':{'admin_totp_verified':True,'stage':'totp_enrolled'}}, persist=Mock())
+    monkeypatch.setitem(worker.STORES, str(tmp_path), store)
+    worker.cloud_secret(path, 'JBSWY3DPEHPK3PXP')
+    assert not store.state['synthetic']['admin_totp_verified']
+    assert store.state['synthetic']['stage'] == 'totp_seed_saved'
+    store.persist.assert_called_once()

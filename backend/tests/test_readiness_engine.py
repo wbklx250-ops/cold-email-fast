@@ -17,6 +17,25 @@ def sku(sku_id="one", seats=1, used=0, plan="EXCHANGE_S_STANDARD"):
 
 
 class ReadinessTests(unittest.TestCase):
+    def test_confirmed_rejection_can_resume_without_repeating_the_rejected_product(self):
+        import json
+        with tempfile.TemporaryDirectory() as temp:
+            Path(temp, 'trial-order-pending.json').write_text(json.dumps({
+                'product':'Microsoft 365 Business Basic', 'phase':'rejected',
+                'reason':'Microsoft explicitly rejected the product trial redemption.'}))
+            browser = object.__new__(Browser)
+            browser.directory = Path(temp, 'admin-profile')
+            browser.portal = Mock()
+            browser.open_trial_product = Mock()
+            graph = Mock()
+            graph.request.return_value = {'value':[sku()]}
+            progress = Mock()
+            self.assertTrue(browser.start_trial(graph, progress))
+            browser.open_trial_product.assert_called_once_with('Microsoft 365 Business Standard')
+            self.assertFalse(Path(temp, 'trial-order-pending.json').exists())
+            self.assertIn('Microsoft 365 Business Basic', json.loads(Path(temp, 'trial-rejections.json').read_text()))
+            progress.assert_any_call('trial_rejection_reconciled')
+
     def test_uncertain_trial_order_is_checked_without_opening_another_checkout(self):
         with tempfile.TemporaryDirectory() as temp:
             Path(temp, 'trial-order-pending.json').write_text('{}')

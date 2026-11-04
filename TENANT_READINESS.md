@@ -39,10 +39,28 @@ false. Only the specifically labeled payment-consent checkbox
 is accepted, after verifying the free checkout and selecting the shortest term. Other renewal
 controls retain their defaults. Unconfirmed final orders remain protected from automatic repetition.
 
+After a read-only subscription check, the operator also authorized one fresh zero-due attempt
+for ten unconfirmed earlier orders, including the possible duplicate-subscription renewal risk.
+The direct-operator `/reconcile-unconfirmed` endpoint archives the old checkpoint, records this
+authorization once per tenant, and queues a fresh attempt. It excludes accepted orders, completed
+or skipped checks, active leases, and any tenant with a saved send timestamp. Explicit Microsoft
+trial-redemption rejections can move to another offered Business Basic, Standard, or Premium trial.
+An unknown result from the new attempt remains protected from repetition.
+
+Readiness checkpoints synchronize passwords and captured administrator TOTP keys to the encrypted
+tenant inventory. Domain Lookup can retrieve those accounts by exact admin email or Microsoft
+tenant ID and generate a live code without returning the seed. Existing pipeline tenants are
+updated only for an exact Microsoft tenant ID/admin match; pipeline state is preserved and a
+pending setup key cannot replace an existing verified key. `/sync-credentials` backfills this batch
+with direct operator authentication. Future checkpoint saves keep the inventory synchronized.
+
+Startup refuses to rewind unknown migration revisions automatically. Repairing a stale marker
+requires inspecting the actual schema first; never stamp a populated database back to `010`.
+
 The local `tenant-readiness/migrate_to_cloud.py` transfers existing results and DPAPI-protected
 authentication checkpoints directly over TLS after the local runner has stopped. It never writes
 plaintext credential exports. Do not run the local runner again against a tenant being checked
 by the server.
 
-Validation: `python -m pytest tests/test_readiness.py tests/test_readiness_engine.py` in
+Validation: `python -m pytest tests/test_readiness.py tests/test_readiness_engine.py tests/test_readiness_browser.py tests/test_readiness_credentials.py tests/test_domain_lookup_credentials.py` in
 `backend`, and `npm run build` in `frontend`. The backend migration is `032_tenant_readiness`.

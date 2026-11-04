@@ -372,19 +372,23 @@ class Browser:
             raise GraphError("Microsoft rejected the supplied sign-in credentials or locked the account.")
         # Microsoft's password step retains a hidden/read-only loginfmt text
         # control. Never submit that as if it were the username-entry screen.
-        for selector, value in [("input[type=email]", self.account), ("input[name=passwd], input[type=password]", self.password)]:
-            field = self.page.locator(selector)
-            if field.count() and field.first.is_visible():
-                if "passwd" in selector:
+        for selector, value, password_step in [
+            ("input[name=passwd], input[type=password]", self.password, True),
+            ("input[type=email], input[name=loginfmt], input[autocomplete=username]", self.account, False),
+        ]:
+            for field in self.page.locator(selector).all():
+                if not field.is_visible() or not field.is_editable():
+                    continue
+                if password_step:
                     if time.monotonic() - self.last_password_submit < 15:
                         return False
                     self.last_password_submit = time.monotonic()
-                field.first.fill(value)
+                field.fill(value)
                 submit = self.page.locator("#idSIButton9, button[type='submit'], input[type='submit'], button[data-testid='reskin-step-next-button']")
                 if submit.count() and submit.first.is_visible():
                     submit.first.click()
                 else:
-                    field.first.press("Enter")
+                    field.press("Enter")
                 return True
         # The requested Graph permissions are explicit in graph_bridge.ps1.
         if self.click(r"^(Accept|Yes|Continue)$"):
@@ -649,6 +653,15 @@ class Browser:
                 selected.append(text)
         return selected
 
+    def checkout_feedback(self):
+        # MCA can render rejection banners outside the checkout panel. They
+        # still belong to this page and must be checked after an order attempt.
+        parts = [self.checkout_scope().inner_text(timeout=10000)]
+        for message in self.page.locator('[role=alert], [role=status], .ms-MessageBar').all():
+            if message.is_visible():
+                parts.append(message.inner_text(timeout=2500))
+        return '\n'.join(parts)
+
     def select_trial_plan(self):
         plan = self.page.get_by_role('combobox', name='Select a plan', exact=True)
         plan.first.click()
@@ -696,6 +709,15 @@ class Browser:
 
     def start_trial(self, graph, on_stage):
         order_path = self.directory.parent / 'trial-order-pending.json'
+        rejection_path = self.directory.parent / 'trial-rejections.json'
+        if order_path.exists():
+            prior = json.loads(order_path.read_text(encoding='utf-8-sig'))
+            if prior.get('phase') == 'rejected' and prior.get('reason'):
+                rejected = json.loads(rejection_path.read_text(encoding='utf-8-sig')) if rejection_path.exists() else {}
+                rejected[prior['product']] = prior['reason']
+                rejection_path.write_text(json.dumps(rejected, indent=2), encoding='utf-8')
+                order_path.unlink()
+                on_stage('trial_rejection_reconciled')
         if order_path.exists():
             # A previous process may have died after clicking the final order.
             # Verify its outcome instead of submitting the same order again.
@@ -705,8 +727,7 @@ class Browser:
                 time.sleep(10)
             raise NeedsHuman('A previous trial order has an unconfirmed outcome. No order was repeated; verify that order in Microsoft Billing before retrying activation.')
         self.portal()
-        products = ['Microsoft 365 Business Basic', 'Microsoft 365 Business Standard', 'Microsoft 365 Business Premium', 'Microsoft 365 E5']
-        rejection_path = self.directory.parent / 'trial-rejections.json'
+        products = ['Microsoft 365 Business Basic', 'Microsoft 365 Business Standard', 'Microsoft 365 Business Premium']
         rejected = json.loads(rejection_path.read_text(encoding='utf-8-sig')) if rejection_path.exists() else {}
         remaining = [p for p in products if p not in rejected]
         if not remaining:
@@ -760,15 +781,30 @@ class Browser:
                 if submitted:
                     self.process_operator_action()
                     response_scope = self.checkout_scope()
-                    response_text = response_scope.inner_text(timeout=10000)
+                    response_text = self.checkout_feedback()
                     if re.search(r'maximum number of subscriptions.*already been redeemed|trial.*already (?:been )?(?:used|redeemed)', response_text, re.I):
-                        alternative('Microsoft rejected this product trial because its redemption limit was already reached.')
+                        reason = 'Microsoft rejected this product trial because its redemption limit was already reached.'
+                        order = json.loads(order_path.read_text(encoding='utf-8')) if order_path.exists() else {'product':product}
+                        order.update(phase='rejected', reason=reason, rejected_at=utcnow())
+                        order_path.write_text(json.dumps(order), encoding='utf-8')
+                        on_stage('trial_order_rejected')
+                        alternative(reason)
                         continue
+                    if re.search(r"(?:you['’]ve|you have) added", response_text, re.I) and 'trial' in response_text.lower():
+                        order = json.loads(order_path.read_text(encoding='utf-8')) if order_path.exists() else {'product':product}
+                        if order.get('phase') != 'accepted':
+                            order.update(phase='accepted', accepted_at=utcnow())
+                            order_path.write_text(json.dumps(order), encoding='utf-8')
+                            on_stage('trial_order_accepted_waiting_license')
                     # Some MCA checkouts first show "Start trial" while loading
                     # the renewal options, then require the final "Place order".
                     if last_submit_kind == 'Start trial':
                         place_order = response_scope.get_by_role('button', name='Place order', exact=True)
-                        if place_order.count() and place_order.is_enabled():
+                        # The intermediate Start trial action can reveal an
+                        # unchecked consent box. Return to the renewal handler
+                        # even while Place order is disabled so it can finish
+                        # the authorized settings for this same checkout.
+                        if place_order.count():
                             submitted = False
                             continue
                     time.sleep(3)
@@ -818,9 +854,13 @@ class Browser:
                         # Persist the submission stage before clicking; never repeat an uncertain order.
                         submitted = True
                         last_submit_kind = final.last.inner_text().strip()
-                        order_path.write_text(json.dumps({'product': product, 'button': last_submit_kind, 'submitted_at': utcnow()}), encoding='utf-8')
-                        on_stage('trial_order_submitted')
+                        order = {'product':product, 'button':last_submit_kind, 'attempted_at':utcnow(), 'phase':'prepared'}
+                        order_path.write_text(json.dumps(order), encoding='utf-8')
+                        on_stage('trial_order_submitting')
                         final.last.click(timeout=15000)
+                        order.update(phase='clicked', clicked_at=utcnow())
+                        order_path.write_text(json.dumps(order), encoding='utf-8')
+                        on_stage('trial_order_awaiting_confirmation')
                     time.sleep(2)
                     continue
                 if re.search(r'\bCheckout\b', text) and selected_trial:
@@ -867,7 +907,7 @@ class Browser:
                     raise
             time.sleep(2)
         if submitted:
-            raise NeedsHuman('A trial order was submitted, but an available Exchange license did not appear within ten minutes. Verify its outcome in Microsoft Billing; the order was not repeated.')
+            raise NeedsHuman('A trial order was attempted, but Microsoft acceptance and an available Exchange license could not be confirmed within ten minutes. The pending order checkpoint was retained; no repeat order was placed.')
         raise GraphError('Trial checkout automation timed out before an order was submitted. Last step: ' + (last_ui_timeout or checkout_step) + '. This is an incomplete checkout, not a confirmed Microsoft trial rejection.')
 
     def close(self):

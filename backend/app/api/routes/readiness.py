@@ -8,6 +8,7 @@ import io
 import json
 import queue
 import time
+import asyncio
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, UploadFile
@@ -19,6 +20,9 @@ from app.api.deps import get_db
 from app.core.config import get_settings
 from app.models.readiness import ReadinessCheck
 from app.services.inventory_credentials import encrypt_inventory_value
+from app.services.inventory_credentials import decrypt_inventory_value
+from app.services.readiness_credentials import sync_credentials
+from app.db.session import SyncSessionLocal
 from app.services import readiness_engine as engine
 from app.services.readiness_worker import ARTIFACTS, LIVE, now
 from app.services import readiness_worker
@@ -45,6 +49,85 @@ def authorized(request: Request):
     if stamp.isdigit() and 0 <= time.time() - int(stamp) < 86400 and hmac.compare_digest(token, session_token(stamp)):
         return
     raise HTTPException(401, 'Sign in to tenant readiness with your access key.')
+
+
+def direct_operator(request):
+    expected = hmac.new(get_settings().readiness_operator_key.encode(), b'checkout-diagnostic', hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(request.headers.get('x-readiness-diagnostic', ''), expected):
+        raise HTTPException(403, 'Direct operator authentication is required for this operation.')
+
+
+class OperatorTenants(BaseModel):
+    tenant_ids: list[UUID] = Field(min_length=1, max_length=34)
+
+
+class FreshCheckoutRequest(OperatorTenants):
+    confirm_duplicate_subscription_risk: bool = False
+
+
+@router.post('/reconcile-unconfirmed', dependencies=[Depends(authorized)])
+async def reconcile_unconfirmed(body: FreshCheckoutRequest, request: Request, db: AsyncSession = Depends(get_db)):
+    direct_operator(request)
+    if not body.confirm_duplicate_subscription_risk:
+        raise HTTPException(422, 'Explicit authorization is required for a fresh unconfirmed-order attempt.')
+    allowed = {value.lower() for value in get_settings().readiness_trial_consent_tenant_ids}
+    if any(str(tid).lower() not in allowed for tid in body.tenant_ids):
+        raise HTTPException(403, 'This operation is limited to the approved imported tenant batch.')
+    rows = (await db.scalars(select(ReadinessCheck).where(ReadinessCheck.tenant_id.in_(body.tenant_ids)).with_for_update())).all()
+    queued = []
+    held = []
+    for row in rows:
+        if row.status in engine.TERMINAL or row.state.get('sent_at') or row.status in {'running','monitoring','awaiting_user'}:
+            held.append(str(row.tenant_id)); continue
+        if row.lease_owner and row.lease_until and row.lease_until > now():
+            held.append(str(row.tenant_id)); continue
+        artifacts = json.loads(decrypt_inventory_value(row.artifacts_ciphertext))
+        pending = json.loads(artifacts.get('trial-order-pending.json', 'null'))
+        history = json.loads(artifacts.get('trial-order-history.json', '[]'))
+        if not pending or pending.get('phase') == 'accepted' or any(item.get('authorized_fresh_attempt') for item in history):
+            held.append(str(row.tenant_id)); continue
+        history.append({'prior_attempt':pending, 'authorized_fresh_attempt':True, 'authorized_at':now().isoformat()})
+        artifacts['trial-order-history.json'] = json.dumps(history)
+        artifacts.pop('trial-order-pending.json', None)
+        row.artifacts_ciphertext = encrypt_inventory_value(json.dumps(artifacts))
+        row.status = 'queued'
+        row.state = {**row.state, 'status':'queued', 'stage':'fresh_checkout_authorized',
+                     'detail':'The operator authorized one fresh zero-due attempt. The previous order checkpoint is preserved in history.'}
+        row.lease_owner = None
+        row.lease_until = None
+        queued.append(str(row.tenant_id))
+    await db.commit()
+    return {'queued':queued, 'held':held}
+
+
+@router.post('/sync-credentials', dependencies=[Depends(authorized)])
+async def sync_saved_credentials(body: OperatorTenants, request: Request):
+    direct_operator(request)
+    allowed = {value.lower() for value in get_settings().readiness_trial_consent_tenant_ids}
+    if any(str(tid).lower() not in allowed for tid in body.tenant_ids):
+        raise HTTPException(403, 'Credential synchronization is limited to the imported tenant batch.')
+    def synchronize():
+        totals = {'inventory_saved':0, 'totp_available':0, 'existing_tenant_updated':0, 'failed':0}
+        for tenant_id in body.tenant_ids:
+            try:
+                with SyncSessionLocal() as session:
+                    record = session.scalar(select(ReadinessCheck).where(ReadinessCheck.tenant_id == tenant_id).with_for_update())
+                    if record is None:
+                        continue
+                    result = sync_credentials(session, record,
+                        json.loads(decrypt_inventory_value(record.credentials_ciphertext)),
+                        json.loads(decrypt_inventory_value(record.artifacts_ciphertext)))
+                    session.commit()
+                    for key,value in result.items():
+                        totals[key] += value
+            except Exception:
+                # Report counts rather than SQL exception parameters, which can
+                # contain credentials in the legacy tenant table.
+                totals['failed'] += 1
+        return totals
+    return await asyncio.to_thread(synchronize)
+
+
 
 
 class Login(BaseModel):
@@ -189,9 +272,7 @@ class BrowserAction(BaseModel):
 def checkout_diagnostic(tenant_id: UUID, request: Request):
     # This header is never forwarded by the frontend proxy. Live billing
     # diagnostics require direct operator authentication, not ordinary app access.
-    expected = hmac.new(get_settings().readiness_operator_key.encode(), b'checkout-diagnostic', hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(request.headers.get('x-readiness-diagnostic', ''), expected):
-        raise HTTPException(403, 'Direct operator authentication is required for diagnostics.')
+    direct_operator(request)
     live = LIVE.get(str(tenant_id))
     if not live:
         raise HTTPException(409, 'This check has no active browser.')
