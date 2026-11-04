@@ -56,6 +56,7 @@ Thumbs.db
 
 # Generated incident reports (may contain customer/domain operational data)
 backend/logs/incident_step5_repair/
+backend/app/services/runtime/
 
 # Database
 *.db
