@@ -96,6 +96,28 @@ class EnrollmentBrowserTests(unittest.TestCase):
         self.assertEqual(self.browser.page.locator('input[name=loginfmt]').input_value(), 'test@example.invalid')
         self.assertTrue(self.browser.page.evaluate('Boolean(window.submitted)'))
 
+    def test_username_step_ignores_microsoft_transparent_password_autofill_field(self):
+        html='''<h1>Sign in</h1><form onsubmit="event.preventDefault();window.submitted=true">
+          <input name="loginfmt" type="email"><div aria-hidden="true" style="opacity:0">
+          <input name="passwd" type="password"></div><button type="submit">Next</button></form>'''
+        self.browser.page.route('https://login.microsoftonline.com/readiness-login', lambda route: route.fulfill(status=200,content_type='text/html',body=html))
+        self.browser.page.goto('https://login.microsoftonline.com/readiness-login')
+        self.assertTrue(self.browser.page.locator('input[name=passwd]').is_visible())
+        self.browser.advance_login()
+        self.assertEqual(self.browser.page.locator('input[name=loginfmt]').input_value(), 'test@example.invalid')
+        self.assertEqual(self.browser.page.locator('input[name=passwd]').input_value(), '')
+        self.assertTrue(self.browser.page.evaluate('Boolean(window.submitted)'))
+
+    def test_transparent_autofill_field_is_ignored_without_aria_hidden(self):
+        html='''<form onsubmit="event.preventDefault();window.submitted=true">
+          <input name="loginfmt" type="email"><input name="passwd" type="password" style="opacity:0">
+          <button type="submit">Next</button></form>'''
+        self.browser.page.route('https://login.microsoftonline.com/readiness-login', lambda route: route.fulfill(status=200,content_type='text/html',body=html))
+        self.browser.page.goto('https://login.microsoftonline.com/readiness-login')
+        self.browser.advance_login()
+        self.assertEqual(self.browser.page.locator('input[name=loginfmt]').input_value(), 'test@example.invalid')
+        self.assertEqual(self.browser.page.locator('input[name=passwd]').input_value(), '')
+
     def test_trial_selection_waits_for_async_dropdown_items(self):
         self.browser.page.set_content('''<button role="combobox" aria-label="Select a plan" onclick="setTimeout(()=>{document.getElementById('options').innerHTML='<button role=option onclick=window.trialChosen=true>Microsoft 365 Business Basic (Trial)</button>'},200)">Choose one from below</button><div id="options"></div>''')
         self.assertIn('(Trial)', self.browser.select_trial_plan())

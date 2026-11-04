@@ -379,6 +379,17 @@ class Browser:
             for field in self.page.locator(selector).all():
                 if not field.is_visible() or not field.is_editable():
                     continue
+                # Microsoft's username screen includes a transparent, editable
+                # password autofill field. Playwright considers opacity:0
+                # visible, so checking visibility alone submits the wrong step.
+                if not field.evaluate('''el => {
+                    for (let node = el; node; node = node.parentElement) {
+                        if (node.getAttribute('aria-hidden') === 'true' || node.inert ||
+                            Number(getComputedStyle(node).opacity) === 0) return false;
+                    }
+                    return true;
+                }'''):
+                    continue
                 if password_step:
                     if time.monotonic() - self.last_password_submit < 15:
                         return False
