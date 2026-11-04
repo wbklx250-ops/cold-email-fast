@@ -14,6 +14,7 @@ from app.db.session import SyncSessionLocal
 from app.models import Tenant, ReadinessCheck
 
 _apps = {}
+_verified_apps = {}
 _locks = {}
 _guard = threading.Lock()
 
@@ -177,8 +178,24 @@ def get_token(admin_email, admin_password, totp_secret=None, *, resource='exchan
         accounts = app.get_accounts(username=admin_email)
         result = app.acquire_token_silent(scopes, account=accounts[0]) if accounts else None
         if result and result.get('access_token'):
-            _validate_identity(result, admin_email, expected)
-            return result['access_token']
+            if result.get('id_token_claims'):
+                _validate_identity(result, admin_email, expected)
+                _verified_apps[key] = (app, result['id_token_claims'].copy())
+                return result['access_token']
+            # MSAL's access-token cache hits deliberately omit ID-token claims.
+            # Reuse only the same in-memory client whose device/refresh response
+            # we already validated, and check its cached account on every use.
+            verified = _verified_apps.get(key)
+            if verified and verified[0] is app:
+                claims = verified[1]
+                _validate_identity({'id_token_claims':claims}, admin_email, expected)
+                account = accounts[0]
+                if (str(account.get('username','')).lower() != admin_email.lower()
+                        or str(account.get('realm','')).lower() != str(claims.get('tid','')).lower()):
+                    raise MicrosoftAuthenticationError('Microsoft cached a different administrator or tenant')
+                return result['access_token']
+            # A cache without a previously validated identity must authenticate
+            # again; never infer identity from the access token's mere presence.
         flow = app.initiate_device_flow(scopes=scopes)
         if not flow.get('user_code'):
             raise MicrosoftAuthenticationError('Microsoft could not start delegated device authentication')
@@ -208,6 +225,7 @@ def get_token(admin_email, admin_password, totp_secret=None, *, resource='exchan
                 code = code if re.fullmatch(r'[a-z_]+',code) else 'unknown_error'
                 raise MicrosoftAuthenticationError(f'Microsoft rejected delegated authentication ({code})')
             _validate_identity(result, admin_email, expected)
+            _verified_apps[key] = (app, result['id_token_claims'].copy())
             return result['access_token']
         finally:
             # Cancel only this device flow if the browser could not finish it.
