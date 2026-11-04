@@ -289,7 +289,7 @@ def _safe_page_text(driver) -> str:
     except Exception as e:
         logger.debug(f"Could not read page text via JavaScript: {e}")
     try:
-        driver.implicitly_wait(1)
+        driver.implicitly_wait(0)
     except Exception:
         pass
     try:
@@ -299,7 +299,7 @@ def _safe_page_text(driver) -> str:
         return ""
     finally:
         try:
-            driver.implicitly_wait(15)
+            driver.implicitly_wait(0)
         except Exception:
             pass
 
@@ -350,7 +350,7 @@ def _find_first_visible(driver, selectors, timeout: int = 0):
     """Return the first displayed and enabled element matching any selector."""
     deadline = time.time() + max(timeout, 0)
     try:
-        driver.implicitly_wait(1)
+        driver.implicitly_wait(0)
     except Exception:
         pass
 
@@ -372,7 +372,7 @@ def _find_first_visible(driver, selectors, timeout: int = 0):
             time.sleep(0.5)
     finally:
         try:
-            driver.implicitly_wait(15)
+            driver.implicitly_wait(0)
         except Exception:
             pass
 
@@ -921,7 +921,7 @@ def _dismiss_microsoft_feedback_prompt(
     dismissed = False
 
     try:
-        driver.implicitly_wait(1)
+        driver.implicitly_wait(0)
     except Exception:
         pass
 
@@ -1020,7 +1020,7 @@ def _dismiss_microsoft_feedback_prompt(
         return dismissed
     finally:
         try:
-            driver.implicitly_wait(15)
+            driver.implicitly_wait(0)
         except Exception:
             pass
 
@@ -1331,7 +1331,7 @@ def dismiss_mfa_setup_interrupt(driver, domain: str = "unknown", max_attempts: i
     import time
 
     try:
-        driver.implicitly_wait(1)
+        driver.implicitly_wait(0)
     except Exception:
         pass
 
@@ -1347,13 +1347,13 @@ def dismiss_mfa_setup_interrupt(driver, domain: str = "unknown", max_attempts: i
                 page_text = _safe_page_text(driver).lower()
                 on_mfa_setup = any(marker in page_text for marker in MFA_SETUP_TEXT_MARKERS)
                 try:
-                    driver.implicitly_wait(1)
+                    driver.implicitly_wait(0)
                 except Exception:
                     pass
 
             if not on_mfa_setup:
                 try:
-                    driver.implicitly_wait(15)
+                    driver.implicitly_wait(0)
                 except Exception:
                     pass
                 return False
@@ -1385,7 +1385,7 @@ def dismiss_mfa_setup_interrupt(driver, domain: str = "unknown", max_attempts: i
                             if "mfasetup" not in new_url:
                                 logger.info(f"[{domain}] MFA setup interrupt dismissed")
                                 try:
-                                    driver.implicitly_wait(15)
+                                    driver.implicitly_wait(0)
                                 except Exception:
                                     pass
                                 return True
@@ -1409,7 +1409,7 @@ def dismiss_mfa_setup_interrupt(driver, domain: str = "unknown", max_attempts: i
         final_url = _safe_current_url(driver).lower()
         if "mfasetup" not in final_url:
             try:
-                driver.implicitly_wait(15)
+                driver.implicitly_wait(0)
             except Exception:
                 pass
             return True
@@ -1417,7 +1417,7 @@ def dismiss_mfa_setup_interrupt(driver, domain: str = "unknown", max_attempts: i
         logger.error(f"[{domain}] Fallback navigation failed: {e}")
 
     try:
-        driver.implicitly_wait(15)
+        driver.implicitly_wait(0)
     except Exception:
         pass
     return False

@@ -243,3 +243,20 @@ async def test_dkim_propagation_wait_is_bounded(monkeypatch):
         "dkim_only_retry": True, "admin_email": "admin@tenant", "admin_password": "password"}))["enabled"]
     assert readback.await_count == 5
     assert sum(call.args[0] for call in sleep.await_args_list) == 300
+
+def test_optional_controls_do_not_reintroduce_slow_implicit_waits():
+    from app.services.selenium import admin_portal
+    class Driver:
+        wait=0
+        def implicitly_wait(self,value):
+            assert value==0, 'Optional probes must not enable blocking implicit waits'
+            self.wait=value
+        def find_elements(self,*args):
+            assert self.wait==0
+            return []
+        def execute_script(self,*args):return 'Microsoft 365 admin center'
+    driver=Driver()
+    assert admin_portal._find_first_visible(driver,[('css selector','#optional-'+str(i)) for i in range(10)])==(None,None)
+    assert admin_portal._dismiss_microsoft_feedback_prompt(driver) is False
+    assert admin_portal.dismiss_mfa_setup_interrupt(driver) is False
+    assert driver.wait==0
