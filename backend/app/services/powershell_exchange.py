@@ -71,6 +71,8 @@ class PowerShellExchangeService:
         Connect to Exchange Online using device code flow.
         Selenium handles the interactive login.
         """
+        if self.totp_secret:
+            return await self._connect_with_saved_mfa()
         logger.info("Starting PowerShell Exchange connection with device code...")
 
         # HEALTH CHECK: Verify browser is alive before attempting device code auth
@@ -174,6 +176,50 @@ Write-Output "CONNECTED_SUCCESS"
                 return True
 
         logger.error("Failed to complete device code authentication")
+        return False
+
+    async def _connect_with_saved_mfa(self) -> bool:
+        """Use the verified delegated session for mailbox operations as well as DKIM."""
+        from app.services.microsoft_mfa import get_token
+        self.connected = False
+        try:
+            token = await asyncio.to_thread(get_token, self.admin_email, self.admin_password,
+                self.totp_secret, driver=self.driver)
+            quote = lambda value: "'" + value.replace("'", "''") + "'"
+            self.ps_process = subprocess.Popen(
+                ['pwsh','-NoProfile','-NonInteractive','-Command','-'],
+                stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                text=True,bufsize=1,
+            )
+            command = (
+                "$ErrorActionPreference='Stop'\n"
+                "try { Import-Module ExchangeOnlineManagement -ErrorAction Stop; "
+                f"Connect-ExchangeOnline -AccessToken {quote(token)} -UserPrincipalName {quote(self.admin_email)} -ShowBanner:$false -ErrorAction Stop; "
+                f"$identity=Get-ConnectionInformation | Where-Object {{$_.UserPrincipalName -ieq {quote(self.admin_email)}}} | Select-Object -First 1; "
+                "if (-not $identity) {throw 'Exchange connection identity did not match'}; "
+                "Write-Output 'MFA_CONNECTED_SUCCESS' } catch {Write-Output 'MFA_CONNECTION_FAILED'}\n\n"
+            )
+            self.ps_process.stdin.write(command)
+            self.ps_process.stdin.flush()
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline:
+                line = await asyncio.wait_for(asyncio.to_thread(self.ps_process.stdout.readline),
+                    timeout=max(.1,deadline-time.monotonic()))
+                if not line and self.ps_process.poll() is not None:
+                    break
+                line = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', line).strip()
+                if line == 'MFA_CONNECTED_SUCCESS':
+                    self.connected = True
+                    logger.info('Exchange mailbox connection confirmed with saved MFA and administrator identity')
+                    return True
+                if line == 'MFA_CONNECTION_FAILED':
+                    break
+                if not line:
+                    await asyncio.sleep(.1)
+        except Exception as exc:
+            logger.error('Exchange mailbox connection failed (%s)',type(exc).__name__)
+        if self.ps_process:
+            self.ps_process.terminate()
         return False
 
     async def _complete_device_login(self, device_code: str) -> bool:
