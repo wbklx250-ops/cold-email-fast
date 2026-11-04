@@ -281,6 +281,27 @@ def test_dashboard_does_not_infer_success_from_current_step():
 
 
 @pytest.mark.asyncio
+async def test_running_dashboard_retains_persisted_domain_totals_after_resume(monkeypatch):
+    from app.api.routes import pipeline
+    batch_id=uuid4()
+    batch=SimpleNamespace(id=batch_id,pipeline_step=7,pipeline_status='running',total_domains=15,domains_per_tenant=3,
+        total_tenants=5,m365_completed=15,first_login_completed_count=5)
+    session=FakeSession({batch_id:batch})
+    monkeypatch.setattr(pipeline,'SessionLocal',lambda:session)
+    job={'status':'running','steps':{str(i):{'status':'pending','completed':0,'failed':0,'total':0} for i in range(1,12)},
+        'errors':[],'activity_log':[],'nameserver_groups':[{'nameservers':['ns.example']} ]}
+    pipeline.pipeline_jobs[str(batch_id)]=job
+    try:
+        await pipeline._update_pipeline(batch_id,7,'running','Creating mailboxes')
+        result=await pipeline.get_pipeline_status(batch_id,db=session)
+        assert result['steps']['6']['completed']==15 and result['steps']['6']['total']==15
+        assert result['steps']['5']['completed']==5 and result['steps']['5']['total']==5
+        assert result['steps']['7']['status']=='running' and result['steps']['7']['total']==15
+        assert job['steps']['6']['completed']==0  # GET does not overwrite worker-owned state.
+    finally:pipeline.pipeline_jobs.pop(str(batch_id),None)
+
+
+@pytest.mark.asyncio
 async def test_manual_setup_requires_live_verification_before_saving(monkeypatch):
     from app.services import objective_reconciliation as objective
     domains, tenants = ready_batch()

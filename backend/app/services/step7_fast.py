@@ -31,6 +31,7 @@ from app.services.email_generator import generate_emails_for_domain, MAILBOX_PAS
 from app.services.azure_step6 import save_to_db_with_retry, _format_error
 from app.core.config import get_settings
 from app.services.mailbox_licenses import BUSINESS_BASIC_SKUS, OTHER_BUSINESS_MAILBOX_SKUS, powershell_sku_list
+from app.services.pipeline_readiness import refresh_counters
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +137,7 @@ def _is_transient_license_error(error: str) -> bool:
         "throttl",
         "connection",
         "invalid usage location",
+        "409 (conflict)",
     )
     return any(marker in normalized for marker in transient_markers)
 
@@ -1398,6 +1400,10 @@ async def run_step7_fast(batch_id: UUID, display_name: str) -> Dict[str, Any]:
                 successful += 1
             else:
                 failed += 1
+            try:
+                await refresh_counters(batch_id)
+            except Exception as exc:
+                logger.warning('Could not refresh mailbox dashboard counters (%s)',type(exc).__name__)
             return result
 
     tasks = [_process_one(i, item) for i, item in enumerate(domain_work_items, 1)]

@@ -82,3 +82,20 @@ def test_transient_license_errors_are_retryable():
     )
     assert _is_transient_license_error("PowerShell script timed out after 300 seconds")
     assert not _is_transient_license_error("No available Business Basic license")
+    assert _is_transient_license_error('Response status code does not indicate success: 409 (Conflict).')
+
+
+async def test_license_conflict_retries_the_same_idempotent_provisioning_request(monkeypatch):
+    from unittest.mock import AsyncMock
+    from uuid import uuid4
+    from app.services import step7_fast
+    run=AsyncMock(side_effect=[{'success':False,'error':'409 (Conflict)'},
+        {'success':True,'email':'me1@example.com','has_license':True}])
+    sleep=AsyncMock()
+    monkeypatch.setattr(step7_fast,'_run_powershell',run)
+    monkeypatch.setattr(step7_fast.asyncio,'sleep',sleep)
+    result=await step7_fast.ensure_licensed_user_for_domain('example.com',uuid4(),'admin@tenant','synthetic-password',save_to_domain=False)
+    assert result['success'] and result['has_license']
+    assert run.await_count==2
+    assert run.call_args_list[0].args[0]==run.call_args_list[1].args[0]
+    sleep.assert_awaited_once_with(15)

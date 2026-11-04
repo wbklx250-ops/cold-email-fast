@@ -150,6 +150,7 @@ async def refresh_counters(batch_id):
         if batch:
             batch.zones_completed = sum(bool(d.cloudflare_zone_id) for d in domains)
             batch.ns_propagated_count = sum(d.cloudflare_zone_status == "active" and bool(d.ns_propagated_at) for d in domains)
+            batch.dns_completed = sum(bool(getattr(d,'dns_records_created',False)) for d in domains)
             batch.first_login_completed_count = sum(bool(t.first_login_completed) for t in tenants)
             batch.m365_completed = sum(m365_ready(d) for d in domains)
             batch.mailboxes_completed_count = sum(bool(d.step6_complete) for d in domains)

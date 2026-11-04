@@ -399,8 +399,8 @@ async def create_and_start(
 
 def _default_pipeline_steps(batch: SetupBatch) -> dict:
     """Build dashboard step state from persisted batch counters."""
-    current_step = batch.pipeline_step or 0
-    pipeline_status = batch.pipeline_status or "unknown"
+    current_step = getattr(batch,'pipeline_step',0) or 0
+    pipeline_status = getattr(batch,'pipeline_status',None) or "unknown"
     steps = {
         str(i): {"status": "pending", "completed": 0, "failed": 0, "total": 0}
         for i in range(1, 12)
@@ -420,14 +420,14 @@ def _default_pipeline_steps(batch: SetupBatch) -> dict:
 
     total_domains = batch.total_domains or 0
     total_tenants = batch.total_tenants or 0
-    steps["1"].update(completed=batch.zones_completed or 0, total=total_domains)
-    steps["3"].update(completed=batch.ns_propagated_count or 0, total=total_domains)
-    steps["4"].update(completed=batch.dns_completed or 0, total=total_domains)
-    steps["5"].update(completed=batch.first_login_completed_count or 0, total=total_tenants)
-    steps["6"].update(completed=batch.m365_completed or 0, total=total_domains)
-    steps["7"].update(completed=batch.mailboxes_completed_count or 0, total=total_domains)
-    steps["8"].update(completed=batch.smtp_completed or 0, total=total_tenants)
-    steps["10"].update(completed=batch.sequencer_uploaded_count or 0, total=total_domains)
+    steps["1"].update(completed=getattr(batch,'zones_completed',0) or 0, total=total_domains)
+    steps["3"].update(completed=getattr(batch,'ns_propagated_count',0) or 0, total=total_domains)
+    steps["4"].update(completed=getattr(batch,'dns_completed',0) or 0, total=total_domains)
+    steps["5"].update(completed=getattr(batch,'first_login_completed_count',0) or 0, total=total_tenants)
+    steps["6"].update(completed=getattr(batch,'m365_completed',0) or 0, total=total_domains)
+    steps["7"].update(completed=getattr(batch,'mailboxes_completed_count',0) or 0, total=total_domains)
+    steps["8"].update(completed=getattr(batch,'smtp_completed',0) or 0, total=total_tenants)
+    steps["10"].update(completed=getattr(batch,'sequencer_uploaded_count',0) or 0, total=total_domains)
 
     for number in ("1", "3", "4", "5", "6", "7", "8"):
         stage = steps[number]
@@ -559,10 +559,15 @@ async def get_pipeline_status(batch_id: UUID, db: AsyncSession = Depends(get_db)
         raise HTTPException(404, "Batch not found")
 
     if job_id in pipeline_jobs:
-        status = pipeline_jobs[job_id]
+        status = dict(pipeline_jobs[job_id])
         status.setdefault("message", _pipeline_message(batch))
         status.setdefault("domains_per_tenant", batch.domains_per_tenant or 1)
         status.setdefault("steps", _default_pipeline_steps(batch))
+        status['steps'] = {number:dict(stage) for number,stage in status['steps'].items()}
+        persisted = _default_pipeline_steps(batch)
+        for number in ('1','3','4','5','6','7','8','10'):
+            stage = status['steps'].setdefault(number,dict(persisted[number]))
+            stage.update(completed=persisted[number]['completed'],total=persisted[number]['total'])
         if "errors" not in status:
             status["errors"] = await _get_pipeline_errors(db, batch_id)
         if "activity_log" not in status:
@@ -1467,6 +1472,8 @@ async def _update_pipeline(batch_id: UUID, step: int, status: str, message: str)
         pipeline_jobs[job_id]["current_step_name"] = STEP_NAMES.get(step, "Unknown")
         pipeline_jobs[job_id]["status"] = status
         pipeline_jobs[job_id]["message"] = message
+        if status in ('running','paused','error','completed'):
+            pipeline_jobs[job_id].get('steps',{}).setdefault(str(step),{})['status'] = status
 
     try:
         async with SessionLocal() as db:
@@ -1532,7 +1539,7 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                 "message": f"Resuming from step {start_from_step}...",
                 "total_domains": batch.total_domains or 0,
                 "total_tenants": batch.total_tenants or 0,
-                "steps": {str(i): {"status": "pending", "completed": 0, "failed": 0, "total": 0} for i in range(1, 12)},
+                "steps": _default_pipeline_steps(batch),
                 "errors": [],
                 "activity_log": [],
             }
