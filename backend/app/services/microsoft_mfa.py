@@ -165,6 +165,11 @@ def get_token(admin_email, admin_password, totp_secret=None, *, resource='exchan
     elif resource == 'graph':
         client_id = '14d82eec-204b-4c2f-b7e8-296a70dab67e'
         scopes = ['https://graph.microsoft.com/Domain.Read.All', 'https://graph.microsoft.com/User.Read']
+    elif resource == 'graph_users':
+        client_id = '14d82eec-204b-4c2f-b7e8-296a70dab67e'
+        scopes = ['https://graph.microsoft.com/' + permission for permission in (
+            'User.ReadWrite.All', 'User.EnableDisableAccount.All',
+            'User-PasswordProfile.ReadWrite.All', 'User.Read')]
     else:
         raise ValueError('Unsupported Microsoft resource')
     key = (authority, admin_email.lower(), resource)

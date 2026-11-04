@@ -1,4 +1,5 @@
 from unittest.mock import Mock
+from unittest.mock import AsyncMock
 import pytest
 from app.services import microsoft_mfa
 from app.services import powershell_exchange
@@ -47,3 +48,21 @@ async def test_echoed_command_text_cannot_confirm_exchange_connection(monkeypatc
     service=powershell_exchange.PowerShellExchangeService(Mock(),'admin@example.onmicrosoft.com','synthetic-password','synthetic-seed')
     assert not await service.connect()
     assert service.connected is False
+
+
+@pytest.mark.asyncio
+async def test_graph_mailbox_setup_authenticates_with_mfa_and_checks_live_identity(monkeypatch):
+    acquire=Mock(return_value='synthetic-graph-token')
+    monkeypatch.setattr(microsoft_mfa,'get_token',acquire)
+    driver=Mock()
+    service=powershell_exchange.PowerShellExchangeService(driver,'admin@example.onmicrosoft.com','synthetic-password','synthetic-seed')
+    service.connected=True
+    command=AsyncMock(side_effect=['disconnected','\x1b[?1lMG_CONNECTED','disconnected'])
+    monkeypatch.setattr(service,'_run_command',command)
+    monkeypatch.setattr(powershell_exchange.asyncio,'sleep',AsyncMock())
+    result=await service.set_mailbox_passwords([],service.admin_email,service.admin_password)
+    assert result['updated']==[] and result['failed']==[]
+    acquire.assert_called_once_with(service.admin_email,service.admin_password,'synthetic-seed',resource='graph_users',driver=driver)
+    script=command.call_args_list[1].args[0]
+    assert '-AccessToken' in script and 'Invoke-MgGraphRequest' in script
+    assert '-Credential' not in script and 'synthetic-password' not in script

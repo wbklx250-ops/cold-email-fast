@@ -40,6 +40,34 @@ def test_exchange_fallback_uses_saved_mfa_key_and_preserves_wizard(monkeypatch):
     legacy.assert_not_awaited()
 
 
+def test_exchange_targets_wait_for_new_domain_provisioning_without_restarting_wizard(monkeypatch):
+    from app.services import microsoft_mfa
+    from app.services.selenium import admin_portal
+    from unittest.mock import Mock
+    targets={'success':True,'selector1':'selector1-example-com._domainkey.tenant.onmicrosoft.com',
+        'selector2':'selector2-example-com._domainkey.tenant.onmicrosoft.com'}
+    lookup=Mock(side_effect=[{'success':False,'error':"Object couldn't be found"},targets])
+    sleep=Mock()
+    monkeypatch.setattr(microsoft_mfa,'read_dkim',lookup)
+    monkeypatch.setattr(admin_portal.time,'sleep',sleep)
+    assert _get_exchange_dkim_targets('example.com','admin@tenant','synthetic-password','synthetic-seed')
+    assert lookup.call_count==2
+    sleep.assert_called_once_with(15)
+
+
+def test_exchange_targets_do_not_repeat_permanent_permission_failures(monkeypatch):
+    from app.services import microsoft_mfa
+    from app.services.selenium import admin_portal
+    from unittest.mock import Mock
+    lookup=Mock(return_value={'success':False,'error':'Access is denied'})
+    sleep=Mock()
+    monkeypatch.setattr(microsoft_mfa,'read_dkim',lookup)
+    monkeypatch.setattr(admin_portal.time,'sleep',sleep)
+    assert _get_exchange_dkim_targets('example.com','admin@tenant','synthetic-password','synthetic-seed') is None
+    assert lookup.call_count==1
+    sleep.assert_not_called()
+
+
 def test_exchange_fallback_accepts_microsoft_assigned_selector_suffix(monkeypatch):
     selector1 = "selector1-vesselbridgenyc-com03b._domainkey.Tenant.q-v1.dkim.mail.microsoft"
     selector2 = "selector2-vesselbridgenyc-com03b._domainkey.Tenant.q-v1.dkim.mail.microsoft"

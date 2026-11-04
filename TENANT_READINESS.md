@@ -69,6 +69,16 @@ and `Connect-ExchangeOnline -AccessToken`. Microsoft tenant and administrator id
 before accepting a token. Exact Microsoft-issued CNAME targets are retained; the runner never guesses
 their tenant-specific suffix. Domain readback uses delegated Graph read scopes. Token caches stay
 in server memory; authentication tabs close and restore the domain wizard when a flow finishes.
+MSAL cache hits omit ID-token claims, so reuse is bound to a previously validated client and its
+exact cached account/tenant. Optional portal probes remain nonblocking. Newly verified domains
+receive a bounded Exchange publication retry before restarting the wizard.
+
+Mailbox creation reuses the same validated Exchange authentication and verifies the connected UPN.
+Mailbox account updates use a separate delegated Graph session limited to user, account-enable,
+and password-profile permissions; the domain readback session remains read-only. Graph's live
+`/me` identity is checked before updates. Tokens travel to PowerShell over stdin, never process
+arguments. Microsoft documents `Connect-MgGraph -Credential` as application-secret authentication,
+so administrator passwords must not be used for that parameter.
 
 The local `tenant-readiness/migrate_to_cloud.py` transfers existing results and DPAPI-protected
 authentication checkpoints directly over TLS after the local runner has stopped. It never writes

@@ -1102,8 +1102,24 @@ try {{
 }}
 '''
 
+        if self.totp_secret:
+            from app.services.microsoft_mfa import get_token
+            if admin_email.lower() != self.admin_email.lower():
+                raise ValueError('Mailbox setup must use the authenticated administrator')
+            token = await asyncio.to_thread(get_token, admin_email, admin_password,
+                self.totp_secret, resource='graph_users', driver=self.driver)
+            quote = lambda value: "'" + value.replace("'", "''") + "'"
+            connect_graph_cmd = (
+                "try { Import-Module Microsoft.Graph.Users -RequiredVersion 2.41.0 -ErrorAction Stop; "
+                f"$secureToken=ConvertTo-SecureString {quote(token)} -AsPlainText -Force; "
+                "Connect-MgGraph -AccessToken $secureToken -NoWelcome -ErrorAction Stop; "
+                "$me=Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/me' -ErrorAction Stop; "
+                f"if ($me.userPrincipalName -ine {quote(admin_email)}) {{throw 'Graph administrator did not match'}}; "
+                "Write-Output 'MG_CONNECTED' } catch {Write-Output 'MG_CONNECT_FAILED'}\n"
+            )
         connect_output = await self._run_command(connect_graph_cmd)
-        if not connect_output or "MG_CONNECTED" not in connect_output:
+        graph_lines = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', connect_output or '').splitlines()
+        if not any(line.strip() == 'MG_CONNECTED' for line in graph_lines):
             raise Exception(f"Microsoft Graph connection failed: {connect_output}")
 
         results = []

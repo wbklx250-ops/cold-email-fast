@@ -98,6 +98,15 @@ def test_graph_readback_requests_only_delegated_read_scopes(application):
     assert set(scopes)=={'https://graph.microsoft.com/Domain.Read.All','https://graph.microsoft.com/User.Read'}
 
 
+def test_mailbox_user_permissions_are_separate_from_readonly_domain_permissions(application):
+    application.get_accounts.return_value=[{}]
+    application.acquire_token_silent.return_value=token()
+    assert auth.get_token('admin@example.onmicrosoft.com','synthetic-password',resource='graph_users')
+    assert set(application.acquire_token_silent.call_args.args[0])=={
+        'https://graph.microsoft.com/User.ReadWrite.All','https://graph.microsoft.com/User.EnableDisableAccount.All',
+        'https://graph.microsoft.com/User-PasswordProfile.ReadWrite.All','https://graph.microsoft.com/User.Read'}
+
+
 def test_exchange_uses_access_token_over_stdin_and_preserves_exact_targets(monkeypatch):
     monkeypatch.setattr(auth,'get_token',lambda *args,**kwargs:'synthetic-access-token')
     value={'success':True,'exists':True,'enabled':False,'selector1':'selector1-example-com._domainkey.tenant.p-v1.dkim.mail.microsoft',

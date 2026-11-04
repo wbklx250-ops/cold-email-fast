@@ -1463,8 +1463,20 @@ def _get_exchange_dkim_targets(domain: str, admin_email: str, admin_password: st
     try:
         if totp_secret:
             from app.services.microsoft_mfa import read_dkim
-            truth = read_dkim(admin_email, admin_password, domain, totp_secret, create=True, driver=driver)
-            ok, selector1, selector2 = truth.get('success'), truth.get('selector1'), truth.get('selector2')
+            for delay in (0,15,30,45):
+                if delay:
+                    logger.info('[%s] Waiting %ss for Exchange to publish DKIM targets',domain,delay)
+                    time.sleep(delay)
+                truth = read_dkim(admin_email, admin_password, domain, totp_secret, create=True, driver=driver)
+                ok, selector1, selector2 = truth.get('success'), truth.get('selector1'), truth.get('selector2')
+                if ok and selector1 and selector2:
+                    break
+                error = str(truth.get('error') or '')
+                pending = ok or any(marker in error.lower() for marker in (
+                    'not found',"couldn't be found",'cannot be found','not exist',"doesn't exist"))
+                if not pending:
+                    logger.warning('[%s] Exchange DKIM lookup did not complete: %s',domain,error or 'No response details')
+                    break
         else:
             ok, selector1, selector2 = asyncio.run(
                 powershell.get_dkim_config_with_credentials(
